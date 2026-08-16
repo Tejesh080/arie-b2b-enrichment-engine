@@ -30,10 +30,15 @@ def test_no_company_appears_in_both_splits(leads: list[EvalLead]) -> None:
 
 
 def test_split_sizes_are_exact(leads: list[EvalLead]) -> None:
+    from arie.evalgen.generator import DEFAULT_CALIBRATION_LEADS, DEFAULT_TEST_LEADS
+
     counts = {"calibration": 0, "test": 0}
     for lead in leads:
         counts[lead.split] += 1
-    assert counts == {"calibration": 150, "test": 300}
+    assert counts == {
+        "calibration": DEFAULT_CALIBRATION_LEADS,
+        "test": DEFAULT_TEST_LEADS,
+    }
 
 
 def test_every_band_appears_in_both_splits(leads: list[EvalLead]) -> None:
@@ -102,6 +107,40 @@ def test_contacts_per_company_is_not_confounded_with_difficulty(
         f"Contacts-per-company varies by difficulty band: {ratios}. "
         "Difficulty is confounded with caching opportunity."
     )
+
+
+def test_enlarging_calibration_leaves_the_test_split_untouched() -> None:
+    """The held-out data must not move when the calibration set grows.
+
+    Company indices, RNG namespaces, and name blocks restart per split, so the
+    test split is a pure function of (seed, test_leads). Under a shared counter
+    — the original design — adding calibration leads slid every test company's
+    index and silently regenerated the data the results are measured on, which
+    would make any before/after comparison meaningless.
+    """
+    from arie.evalgen.generator import generate_dataset
+
+    small, _ = generate_dataset(seed=42, calibration_leads=150, test_leads=300)
+    large, _ = generate_dataset(seed=42, calibration_leads=600, test_leads=300)
+
+    small_test = [x for x in small if x.split == "test"]
+    large_test = [x for x in large if x.split == "test"]
+
+    assert len(small_test) == len(large_test) == 300
+    for a, b in zip(small_test, large_test, strict=True):
+        assert a.eval_lead_id == b.eval_lead_id
+        assert a.company == b.company
+        assert a.person == b.person
+        assert a.observations == b.observations
+        assert a.oracle_decision == b.oracle_decision
+
+
+def test_split_namespaces_do_not_collide(leads: list[EvalLead]) -> None:
+    """Domains key the observation store, so a cross-split collision would merge
+    a calibration company into a test company."""
+    calibration_domains = {x.company.canonical_domain for x in leads if x.split == "calibration"}
+    test_domains = {x.company.canonical_domain for x in leads if x.split == "test"}
+    assert not (calibration_domains & test_domains)
 
 
 def test_ambiguous_identity_subset_exists(manifest: DatasetManifest) -> None:

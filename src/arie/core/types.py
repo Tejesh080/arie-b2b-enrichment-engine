@@ -133,7 +133,9 @@ class ScoreBreakdown:
 class VoIEvaluation:
     """One candidate provider's expected value of information.
 
-    EVoI = P(flips decision) * business_value - cost - latency_penalty
+    EVoI = P(flips decision) * business_value
+           + escalation_value
+           - cost - latency_penalty
 
     Every one of these is persisted (voi_decisions table), including the ones we
     *rejected*. The rejected rows are the audit trail for why the system stopped.
@@ -145,10 +147,23 @@ class VoIEvaluation:
     expected_cost: float
     latency_penalty: float
 
+    escalation_value: float = 0.0
+    """Expected human-review cost avoided by making this call.
+
+    Zero by default, which leaves the original API-cost-only policy exactly as
+    it was. Buying evidence has two payoffs — reaching the right decision, and
+    reaching it *confidently enough to act without a person*. Counting only the
+    first makes the policy stop precisely where one more call would have bought
+    autonomy, which is what the review-cost sweep exposed.
+    """
+
     @property
     def net_evoi(self) -> float:
         return (
-            self.p_flips_decision * self.business_value - self.expected_cost - self.latency_penalty
+            self.p_flips_decision * self.business_value
+            + self.escalation_value
+            - self.expected_cost
+            - self.latency_penalty
         )
 
 

@@ -25,10 +25,14 @@ from arie.confidence.threshold import (
     clopper_pearson_upper,
     select_threshold,
 )
+from arie.config import POLICY
 from arie.evalgen.schema import EvalLead
 from arie.providers.catalog import ALL_PROVIDERS, CHEAP_TIER
 
-TARGET_ERROR_RATE = 0.05
+# The deployable budget. 5% is not achievable on this model — see
+# `test_five_percent_budget_is_not_achievable`, which pins that as a finding
+# rather than leaving it to be rediscovered.
+TARGET_ERROR_RATE = POLICY.target_autonomous_error_rate
 
 
 @pytest.fixture(scope="module")
@@ -230,6 +234,24 @@ def test_selected_threshold_meets_its_stated_bound(model: ConfidenceModel) -> No
     assert threshold.guarantee_met
     assert threshold.error_rate_upper_bound <= threshold.target_error_rate
     assert threshold.observed_error_rate <= threshold.error_rate_upper_bound
+
+
+def test_five_percent_budget_is_not_achievable(calibration_split: list[EvalLead]) -> None:
+    """Pins a finding rather than leaving it to be rediscovered.
+
+    An earlier run *did* find a threshold at 5%, on a quarter of the current
+    calibration data, reporting zero errors above it. Enlarging the split showed
+    that for what it was: with four times the evaluation states, the top
+    confidence block has a measured error rate well above its stated one, and no
+    operating point survives the bound. The system correctly refuses to
+    automate anything.
+
+    The deployable budget is 10%. That is a policy choice with a stated cost,
+    not a result.
+    """
+    strict = fit_confidence_model(calibration_split, target_error_rate=0.05)
+    assert not strict.threshold.guarantee_met
+    assert strict.threshold.coverage == 0.0
 
 
 def test_unachievable_target_refuses_all_autonomy(

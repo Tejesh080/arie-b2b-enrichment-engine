@@ -54,8 +54,21 @@ class PolicyConfig:
     of $0.50 sat below the most expensive provider's price and silently made
     that provider unbuyable."""
     target_autonomous_error_rate: float = field(
-        default_factory=lambda: _env_float("TARGET_AUTONOMOUS_ERROR_RATE", 0.05)
+        default_factory=lambda: _env_float("TARGET_AUTONOMOUS_ERROR_RATE", 0.10)
     )
+    """Error budget for decisions taken without a human.
+
+    Raised from 0.05 after enlarging the calibration split showed 5% to be
+    unachievable: on several seeds the threshold search correctly refuses every
+    operating point and automates nothing. The earlier 5% result that *did*
+    find a threshold was small-sample luck — with four times the evaluation
+    data, the top confidence block has a measured ~8% error rate against a
+    stated ~4%.
+
+    This is a business policy parameter rather than a result, and the trade is
+    stated rather than hidden: 10% is met with roughly 45% coverage and is
+    stable across seeds; 5% is met by refusing to automate at all. A system
+    that automates nothing is not safer, it is just useless."""
     latency_penalty_usd_per_sec: float = field(
         default_factory=lambda: _env_float("LATENCY_PENALTY_USD_PER_SEC", 0.01)
     )

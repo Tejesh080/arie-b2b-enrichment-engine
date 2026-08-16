@@ -22,8 +22,10 @@ from arie.policy.baselines import (
     WaterfallTuning,
     tune_waterfall,
 )
+from arie.policy.escalation_aware import EscalationAwareVoI
 from arie.policy.runner import PolicySummary, evaluate_policy
 from arie.providers.simulated import CallLedger, build_from_leads
+from bench.cost_model import HUMAN_REVIEW_PRICES
 from bench.metrics import CounterfactualRegret, Verdict, counterfactual_regret, evaluate_verdict
 
 VALUE_SCALES: tuple[float, ...] = (0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 8.0)
@@ -51,11 +53,21 @@ class BenchmarkRun:
 
     verdict: Verdict
     regrets: tuple[CounterfactualRegret, ...]
+
+    escalation_aware: dict[float, PolicySummary] = field(default_factory=dict)
+    """One entry per review price, each fitted to assume that price."""
+
     tunings: dict[str, WaterfallTuning] = field(default_factory=dict)
 
     @property
     def all_summaries(self) -> list[PolicySummary]:
-        return [self.full, self.ablation, *self.waterfalls, *self.adaptives]
+        return [
+            self.full,
+            self.ablation,
+            *self.waterfalls,
+            *self.adaptives,
+            *self.escalation_aware.values(),
+        ]
 
     @property
     def cost_saving_vs_waterfall(self) -> float:
@@ -132,10 +144,30 @@ def run_once(seed: int, model: ConfidenceModel | None = None) -> BenchmarkRun:
         for scale in VALUE_SCALES
     ]
 
+    # One escalation-aware policy per review price, each told the price it will
+    # actually be judged at. That is the honest setting: a policy that must
+    # guess the cost of a human is solving a different problem.
+    escalation_aware = {
+        price: evaluate_policy(
+            EscalationAwareVoI(
+                model=model,
+                disqualifier_rate=disqualifier_rate,
+                budget_usd_cap=POLICY.lead_budget_usd_cap,
+                latency_penalty_usd_per_sec=POLICY.latency_penalty_usd_per_sec,
+                value_scale=1.0,
+                human_review_usd=price,
+            ),
+            test,
+            make_test_ctx,
+        )
+        for price in HUMAN_REVIEW_PRICES
+    }
+
     best_waterfall = _best(waterfalls)
     best_adaptive = _best(adaptives)
 
     return BenchmarkRun(
+        escalation_aware=escalation_aware,
         seed=seed,
         dataset_sha256=manifest.content_sha256,
         n_calibration=len(calibration),

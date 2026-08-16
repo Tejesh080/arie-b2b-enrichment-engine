@@ -85,6 +85,18 @@ def _spreads(runs: list[BenchmarkRun]) -> list[Spread]:
         Spread("waterfall autonomy rate", tuple(r.best_waterfall.autonomous_rate for r in runs)),
         Spread("confidence ECE", tuple(r.confidence_ece for r in runs)),
         Spread("tau", tuple(r.tau for r in runs)),
+        Spread(
+            "esc-aware autonomy @ $2.50",
+            tuple(r.escalation_aware[2.50].autonomous_rate for r in runs),
+        ),
+        Spread(
+            "esc-aware api cost/lead @ $2.50",
+            tuple(r.escalation_aware[2.50].mean_cost_usd for r in runs),
+        ),
+        Spread(
+            "esc-aware agreement @ $2.50",
+            tuple(r.escalation_aware[2.50].decision_agreement for r in runs),
+        ),
     ]
 
 
@@ -98,11 +110,16 @@ def _total_cost_table(runs: list[BenchmarkRun]) -> list[dict[str, Any]]:
             ("waterfall", lambda r: r.best_waterfall),
             ("bounds_only", lambda r: r.ablation),
             ("adaptive", lambda r: r.best_adaptive),
+            # Judged at the same price it was told to assume. `price` is bound
+            # as a default rather than captured, so the lambda cannot pick up a
+            # later loop value if this is ever evaluated lazily.
+            ("escalation_aware", lambda r, p=price: r.escalation_aware[p]),
         ):
             totals = [total_cost(pick(r), price).total_usd for r in runs]  # type: ignore[no-untyped-call]
             entry[label] = round(statistics.fmean(totals), 6)
         entry["cheapest"] = min(
-            ("full", "waterfall", "bounds_only", "adaptive"), key=lambda k: entry[k]
+            ("full", "waterfall", "bounds_only", "adaptive", "escalation_aware"),
+            key=lambda k: entry[k],
         )
         rows.append(entry)
     return rows
@@ -157,14 +174,15 @@ def main() -> int:
     print("=" * 84)
     header = (
         f"  {'review $':>9}  {'full':>9}  {'waterfall':>10}  {'bounds':>9}  "
-        f"{'adaptive':>9}   cheapest"
+        f"{'adaptive':>9}  {'esc_aware':>10}   cheapest"
     )
     print(header)
     print("  " + "-" * (len(header) - 2))
     for row in _total_cost_table(runs):
         print(
             f"  {row['human_review_usd']:>9.2f}  {row['full']:>9.5f}  {row['waterfall']:>10.5f}  "
-            f"{row['bounds_only']:>9.5f}  {row['adaptive']:>9.5f}   {row['cheapest']}"
+            f"{row['bounds_only']:>9.5f}  {row['adaptive']:>9.5f}  "
+            f"{row['escalation_aware']:>10.5f}   {row['cheapest']}"
         )
 
     break_evens = [

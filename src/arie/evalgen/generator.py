@@ -49,8 +49,19 @@ from arie.scoring.rules import (
 
 # --- generation targets ------------------------------------------------------
 
-DEFAULT_CALIBRATION_LEADS = 150
+# The calibration split feeds the confidence model, the conformal threshold, and
+# the waterfall gate. At 150 leads the threshold was badly under-determined —
+# tau ranged 0.77 to 1.01 across seeds, with one run degenerating to
+# accept-nothing. Enlarging it is the cheapest available fix: it costs
+# generation time only, and the test split is unaffected by construction.
+DEFAULT_CALIBRATION_LEADS = 600
 DEFAULT_TEST_LEADS = 300
+
+# Per-split namespaces. Company ids and name blocks must not overlap, or a
+# calibration company could collide with a test company on its domain — which
+# keys the observation store.
+SPLIT_ID_PREFIX: dict[str, str] = {"calibration": "k", "test": "t"}
+SPLIT_NAME_BLOCK: dict[str, int] = {"calibration": 0, "test": 500}
 
 BAND_WEIGHTS: dict[DifficultyBand, float] = {"easy": 0.40, "medium": 0.35, "hard": 0.25}
 VALUE_TIER_WEIGHTS: dict[ValueTier, float] = {
@@ -336,10 +347,15 @@ def _generate_company(
     band: DifficultyBand,
     cheap_misleads: bool,
     ambiguous_identity: bool,
+    split: Split = "calibration",
 ) -> LatentCompany:
     profile = _BAND_PROFILES[band]
     stem = _NAME_STEMS[company_index % len(_NAME_STEMS)]
-    suffix_n = company_index // len(_NAME_STEMS)
+    # Each split names companies from a disjoint block, so a calibration
+    # company and a test company can never land on the same domain. Domains key
+    # the observation store, so a collision would silently merge two companies
+    # across the split boundary — the exact leak the split exists to prevent.
+    suffix_n = company_index // len(_NAME_STEMS) + SPLIT_NAME_BLOCK[split]
     base_name = stem if suffix_n == 0 else f"{stem}{suffix_n}"
     domain = f"{base_name.lower()}.com"
 
@@ -382,7 +398,7 @@ def _generate_company(
         employee_count = rng.randint(60, 900)  # squarely in the ideal band
 
     return LatentCompany(
-        company_id=f"c{company_index:05d}",
+        company_id=f"{SPLIT_ID_PREFIX[split]}{company_index:05d}",
         canonical_domain=domain,
         legal_name=f"{base_name} {rng.choice(sorted(_LEGAL_SUFFIXES))}",
         employee_count=employee_count,
@@ -620,16 +636,26 @@ def generate_dataset(
     something to be checked for afterwards.
     """
     leads: list[EvalLead] = []
-    company_index = 0
 
-    for split, target in (("calibration", calibration_leads), ("test", test_leads)):
+    split_targets: tuple[tuple[Split, int], ...] = (
+        ("calibration", calibration_leads),
+        ("test", test_leads),
+    )
+    for split, target in split_targets:
         produced = 0
+        # Company indices, RNG namespaces, and name blocks all restart per
+        # split. That is what makes the test set a pure function of
+        # (seed, test_leads): enlarging the calibration set cannot shift a
+        # single test company. With a shared counter, adding calibration leads
+        # would slide every test company's index and silently regenerate the
+        # held-out data the results are measured on.
+        company_index = 0
         # Reset per split so each is independently stratified — otherwise the
         # calibration set could be balanced while the test set drifts.
         allocator = _BandAllocator(BAND_WEIGHTS)
 
         while produced < target:
-            company_id = f"c{company_index:05d}"
+            company_id = f"{SPLIT_ID_PREFIX[split]}{company_index:05d}"
 
             # Contact count is drawn from its own RNG stream and *before* the
             # band is chosen. Drawing it from the company RNG would make it
@@ -642,11 +668,11 @@ def generate_dataset(
 
             band: DifficultyBand = allocator.take()
 
-            crng = _child_rng(seed, "company", str(company_index))
+            crng = _child_rng(seed, "company", split, str(company_index))
             misleads = band != "easy" and crng.random() < CHEAP_MISLEADS_RATE
             ambiguous = crng.random() < AMBIGUOUS_IDENTITY_RATE
 
-            company = _generate_company(crng, company_index, band, misleads, ambiguous)
+            company = _generate_company(crng, company_index, band, misleads, ambiguous, split)
 
             # Scoped per company: contacts are disambiguated against their own
             # colleagues, and the sequence is deterministic because
@@ -675,7 +701,7 @@ def generate_dataset(
                         oracle_components={k: round(v, 4) for k, v in components.items()},
                         difficulty_band=band,
                         value_tier=_weighted_choice(prng, dict(VALUE_TIER_WEIGHTS)),
-                        split=split,  # type: ignore[arg-type]
+                        split=split,
                         cheap_misleads=cheap_decision is not decision,
                         constructed_adversarial=misleads,
                         seed=seed,
