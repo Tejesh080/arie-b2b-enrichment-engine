@@ -86,8 +86,18 @@ company-level evidence store.
 
 ## Schema already written
 
-`migrations/0001_init.sql` and `0002_metrics_views.sql` exist and have never been
-run against a live database. Expect to fix things.
+`migrations/0001_init.sql`, `0002_metrics_views.sql`, and
+`0003_identity_resolution.sql` exist and have been run against the live
+production Supabase database (Steps 6–7) — one real bug was found and fixed
+doing so: `evidence.expires_at` couldn't be a `GENERATED` column because
+`timestamptz + interval` is STABLE, not IMMUTABLE (see the migration's own
+comment). `migrations/` is the source of truth and the only path that touches
+production, via `scripts/migrate.py`. `supabase/migrations/` is a generated
+mirror kept in sync by `scripts/sync_supabase_migrations.py` and CI, added so
+Supabase's GitHub Branching provisions PR preview databases with the same
+schema — see [ADR 0005](adr/0005-migration-source-of-truth.md) for why both
+directories exist and why production deploys still go through neither
+Branching nor the Supabase CLI.
 
 Design notes worth honouring:
 

@@ -182,10 +182,15 @@ src/arie/
     adaptive.py          EVoI - negative result, retained
     escalation_aware.py  EVoI + human-review pricing - also negative
 bench/           harness, metrics, cost model, seed sweep
-migrations/      numbered SQL (M1)
-tests/           162 tests
+migrations/      numbered SQL (M1) - source of truth, applied via scripts/migrate.py
+supabase/        migrations/ mirror (generated) + config, for GitHub Branching PR previews
+scripts/         migrate.py, sync_supabase_migrations.py
+tests/           unit + integration (DB-backed, opt-in via `make test-all`)
 docs/            research, architecture, results, ADRs, handoff
 ```
+
+Two migration directories, one source of truth: see
+[ADR 0005](docs/adr/0005-migration-source-of-truth.md).
 
 ---
 

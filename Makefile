@@ -1,4 +1,4 @@
-.PHONY: help install dev-install lint fmt type test test-all dataset validate-dataset bench clean db-migrate serve worker
+.PHONY: help install dev-install lint fmt type test test-all dataset validate-dataset bench clean db-migrate serve worker sync-supabase-migrations check-supabase-migrations
 
 help:
 	@echo "Adaptive Revenue Intelligence Engine"
@@ -14,7 +14,9 @@ help:
 	@echo "  make validate-dataset  Assert the dataset is non-trivial (CI gate)"
 	@echo "  make bench           Run the full benchmark  [NO API KEYS NEEDED]"
 	@echo ""
-	@echo "  make db-migrate      Apply SQL migrations"
+	@echo "  make db-migrate      Apply SQL migrations (the only path that touches production)"
+	@echo "  make sync-supabase-migrations   Regenerate supabase/migrations/ from migrations/"
+	@echo "  make check-supabase-migrations  CI gate: fail if the mirror has drifted"
 	@echo "  make serve           Run the ingestion API"
 	@echo "  make worker          Run a queue worker"
 
@@ -56,6 +58,12 @@ bench:
 
 db-migrate:
 	python scripts/migrate.py
+
+sync-supabase-migrations:
+	python scripts/sync_supabase_migrations.py
+
+check-supabase-migrations:
+	python scripts/sync_supabase_migrations.py --check
 
 serve:
 	uvicorn arie.api.main:app --reload --port 8000

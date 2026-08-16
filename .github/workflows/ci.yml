@@ -21,6 +21,8 @@ jobs:
         run: ruff format --check src tests bench scripts
       - name: Type check
         run: mypy src tests scripts
+      - name: supabase/migrations/ is in sync with migrations/
+        run: make check-supabase-migrations
       - name: Fit confidence model (calibration split only)
         run: python -m arie.confidence.cli --seed 42
       - name: Unit tests
