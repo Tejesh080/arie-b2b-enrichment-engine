@@ -1,0 +1,51 @@
+{
+  "name": "ARIE - Mock CRM Sink (local helper)",
+  "nodes": [
+    {
+      "id": "e3c3c003-3333-4000-8000-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [220, 300],
+      "webhookId": "arie-mock-crm-sink",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "mock-crm-sink",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "e3c3c003-3333-4000-8000-000000000002",
+      "name": "Respond (Echo)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [460, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { received: true, echoed_payload: $json.body, received_at: $now.toISO() } }}",
+        "options": { "responseCode": 200 }
+      }
+    },
+    {
+      "id": "e3c3c003-3333-4000-8000-000000000003",
+      "name": "Scope Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [220, 60],
+      "parameters": {
+        "content": "## Not one of the two required edge workflows\nA minimal stand-in so `outcome-sync.json` has somewhere real to POST to without a real CRM dependency (task explicitly says not to introduce one unless already configured). It just echoes what it received back into n8n's execution log — that log entry is the \"proof of write\" for this demo.\n\nTo point at a real CRM later: change `MOCK_CRM_SINK_URL` (set on the n8n container) to the real endpoint and delete this workflow. Nothing in `outcome-sync.json` needs to change.",
+        "height": 220,
+        "width": 460
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Respond (Echo)", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

@@ -1,0 +1,190 @@
+{
+  "name": "ARIE - Lead Ingestion",
+  "nodes": [
+    {
+      "id": "e1a1c001-1111-4000-8000-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [220, 300],
+      "webhookId": "arie-lead-ingest",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-ingest",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "e1a1c001-1111-4000-8000-000000000002",
+      "name": "Has Email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [460, 300],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ Boolean($json.body && $json.body.email && String($json.body.email).trim().length > 0) }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ]
+        },
+        "looseTypeValidation": false,
+        "options": {}
+      }
+    },
+    {
+      "id": "e1a1c001-1111-4000-8000-000000000003",
+      "name": "Respond 400 (Missing Email)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [700, 460],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"error\": \"email is required\" } }}",
+        "options": { "responseCode": 400 }
+      }
+    },
+    {
+      "id": "e1a1c001-1111-4000-8000-000000000004",
+      "name": "Map to ARIE Lead Shape",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [700, 180],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f1000000-0000-4000-8000-000000000001",
+              "name": "source",
+              "type": "string",
+              "value": "={{ $json.body.source || 'n8n_webhook' }}"
+            },
+            {
+              "id": "f1000000-0000-4000-8000-000000000002",
+              "name": "email",
+              "type": "string",
+              "value": "={{ $json.body.email }}"
+            },
+            {
+              "id": "f1000000-0000-4000-8000-000000000003",
+              "name": "external_ref",
+              "type": "string",
+              "value": "={{ $json.body.external_ref || $json.body.externalRef || null }}"
+            },
+            {
+              "id": "f1000000-0000-4000-8000-000000000004",
+              "name": "company_domain",
+              "type": "string",
+              "value": "={{ $json.body.company_domain || $json.body.companyDomain || null }}"
+            },
+            {
+              "id": "f1000000-0000-4000-8000-000000000005",
+              "name": "company_name",
+              "type": "string",
+              "value": "={{ $json.body.company_name || $json.body.companyName || null }}"
+            },
+            {
+              "id": "f1000000-0000-4000-8000-000000000006",
+              "name": "full_name",
+              "type": "string",
+              "value": "={{ $json.body.full_name || $json.body.fullName || null }}"
+            },
+            {
+              "id": "f1000000-0000-4000-8000-000000000007",
+              "name": "title",
+              "type": "string",
+              "value": "={{ $json.body.title || null }}"
+            },
+            {
+              "id": "f1000000-0000-4000-8000-000000000008",
+              "name": "budget_usd_cap",
+              "type": "string",
+              "value": "={{ $json.body.budget_usd_cap || $json.body.budgetUsdCap || null }}"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      }
+    },
+    {
+      "id": "e1a1c001-1111-4000-8000-000000000005",
+      "name": "POST /leads",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [920, 180],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ARIE_API_BASE_URL }}/leads",
+        "authentication": "none",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { source: $json.source, email: $json.email, external_ref: $json.external_ref, company_domain: $json.company_domain, company_name: $json.company_name, full_name: $json.full_name, title: $json.title, budget_usd_cap: $json.budget_usd_cap } }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "e1a1c001-1111-4000-8000-000000000006",
+      "name": "Respond (ARIE Result)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1140, 180],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.body }}",
+        "options": { "responseCode": "={{ $json.statusCode }}" }
+      }
+    },
+    {
+      "id": "e1a1c001-1111-4000-8000-000000000007",
+      "name": "Scope Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [220, -40],
+      "parameters": {
+        "content": "## Transport only\nThis workflow does field presence checks and JSON reshaping — nothing else. Email format, domain resolvability, budget rules, identity resolution, and idempotency (`source`+`external_ref`) are all decided by ARIE's `POST /leads` and returned verbatim by the last node. Both snake_case and camelCase input keys are accepted since senders vary; that's mapping, not business logic.",
+        "height": 200,
+        "width": 460
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Has Email?", "type": "main", "index": 0 }]]
+    },
+    "Has Email?": {
+      "main": [
+        [{ "node": "Map to ARIE Lead Shape", "type": "main", "index": 0 }],
+        [{ "node": "Respond 400 (Missing Email)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Map to ARIE Lead Shape": {
+      "main": [[{ "node": "POST /leads", "type": "main", "index": 0 }]]
+    },
+    "POST /leads": {
+      "main": [[{ "node": "Respond (ARIE Result)", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

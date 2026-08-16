@@ -5,6 +5,10 @@
 # api/worker services will use it instead.
 #
 # The benchmark (M0) needs none of this. `make bench` runs standalone.
+#
+# `n8n` is opt-in via a Compose profile (`docker compose --profile n8n up`) —
+# plain `docker compose up` is unchanged. See README.md's "n8n edge workflows"
+# section for what it's for and how to import the workflows once it's running.
 
 services:
   db:
@@ -49,5 +53,26 @@ services:
     deploy:
       replicas: 2
 
+  # M1 Step 12 — the thin transport edge, not part of the default stack.
+  # SQLite-backed (n8n's own zero-config default): a second Postgres database
+  # just for n8n's internal state would be more infrastructure than three
+  # demo workflows justify. N8N_SECURE_COOKIE=false is required for the auth
+  # cookie to work over plain http:// on localhost; n8n refuses to set it
+  # otherwise. Import workflows/n8n/*.json after this is up — see README.md.
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    profiles: ["n8n"]
+    environment:
+      N8N_SECURE_COOKIE: "false"
+      ARIE_API_BASE_URL: http://api:8000
+      MOCK_CRM_SINK_URL: http://localhost:5678/webhook/mock-crm-sink
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      - api
+
 volumes:
   pgdata:
+  n8n_data:

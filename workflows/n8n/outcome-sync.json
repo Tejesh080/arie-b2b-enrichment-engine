@@ -1,0 +1,270 @@
+{
+  "name": "ARIE - Outcome Sync",
+  "nodes": [
+    {
+      "id": "e2b2c002-2222-4000-8000-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [220, 300],
+      "webhookId": "arie-outcome-sync",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "outcome-sync",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "e2b2c002-2222-4000-8000-000000000002",
+      "name": "GET /leads/{id}",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [460, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.ARIE_API_BASE_URL }}/leads/{{ $json.body.lead_id }}",
+        "authentication": "none",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "e2b2c002-2222-4000-8000-000000000003",
+      "name": "Lead Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [700, 300],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 200,
+              "operator": { "type": "number", "operation": "equals" }
+            }
+          ]
+        },
+        "looseTypeValidation": false,
+        "options": {}
+      }
+    },
+    {
+      "id": "e2b2c002-2222-4000-8000-000000000004",
+      "name": "Respond (Lead Not Found)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [940, 460],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.body }}",
+        "options": { "responseCode": "={{ $json.statusCode }}" }
+      }
+    },
+    {
+      "id": "e2b2c002-2222-4000-8000-000000000005",
+      "name": "Is Finalized?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [940, 180],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ ['AUTO_ROUTED', 'ROUTED', 'SYNCED', 'MANUAL_REVIEW'].includes($json.body.status) }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ]
+        },
+        "looseTypeValidation": false,
+        "options": {}
+      }
+    },
+    {
+      "id": "e2b2c002-2222-4000-8000-000000000006",
+      "name": "Respond (Not Finalized Yet)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1180, 340],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { synced: false, reason: 'lead not finalized', lead_id: $json.body.lead_id, status: $json.body.status } }}",
+        "options": { "responseCode": 200 }
+      }
+    },
+    {
+      "id": "e2b2c002-2222-4000-8000-000000000007",
+      "name": "Map to CRM Payload",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [1180, 60],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f2000000-0000-4000-8000-000000000001",
+              "name": "crm_lead_ref",
+              "type": "string",
+              "value": "={{ $json.body.lead_id }}"
+            },
+            {
+              "id": "f2000000-0000-4000-8000-000000000002",
+              "name": "crm_company_id",
+              "type": "string",
+              "value": "={{ $json.body.company_id }}"
+            },
+            {
+              "id": "f2000000-0000-4000-8000-000000000003",
+              "name": "crm_person_id",
+              "type": "string",
+              "value": "={{ $json.body.person_id }}"
+            },
+            {
+              "id": "f2000000-0000-4000-8000-000000000004",
+              "name": "pipeline_stage",
+              "type": "string",
+              "value": "={{ $json.body.status }}"
+            },
+            {
+              "id": "f2000000-0000-4000-8000-000000000005",
+              "name": "qualified",
+              "type": "boolean",
+              "value": "={{ ['AUTO_ROUTED', 'ROUTED'].includes($json.body.status) }}"
+            },
+            {
+              "id": "f2000000-0000-4000-8000-000000000006",
+              "name": "total_cost_usd",
+              "type": "string",
+              "value": "={{ $json.body.cost.total_cost_usd }}"
+            },
+            {
+              "id": "f2000000-0000-4000-8000-000000000007",
+              "name": "source_system",
+              "type": "string",
+              "value": "arie"
+            },
+            {
+              "id": "f2000000-0000-4000-8000-000000000008",
+              "name": "synced_at",
+              "type": "string",
+              "value": "={{ $now.toISO() }}"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      }
+    },
+    {
+      "id": "e2b2c002-2222-4000-8000-000000000008",
+      "name": "POST Mock CRM Sink",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [1400, 60],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.MOCK_CRM_SINK_URL }}",
+        "authentication": "none",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "e2b2c002-2222-4000-8000-000000000009",
+      "name": "Respond (Synced)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1620, 60],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { synced: true, lead_id: $('Webhook').item.json.body.lead_id, sink_status: $json.statusCode, sink_response: $json.body } }}",
+        "options": { "responseCode": 200 }
+      }
+    },
+    {
+      "id": "e2b2c002-2222-4000-8000-00000000000a",
+      "name": "Scope Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [220, -260],
+      "parameters": {
+        "content": "## Receive, not poll — deliberately\nARIE has no \"list leads by status\" endpoint today, and implementing a client-side discovery/retry loop here would duplicate backend concerns this task explicitly says n8n must not own. Call this webhook with `{\"lead_id\": \"...\"}` once you already know a decision finalized. If ARIE later adds e.g. `GET /leads?status=...`, swap the Webhook trigger for a Schedule Trigger against that endpoint — the rest of the chain (fetch -> filter finalized -> transform -> sink) is unchanged.",
+        "height": 220,
+        "width": 480
+      }
+    },
+    {
+      "id": "e2b2c002-2222-4000-8000-00000000000b",
+      "name": "Qualified Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1180, -180],
+      "parameters": {
+        "content": "`qualified` and the finalized-status set both restate labels ARIE already computed (the same AUTO_ROUTED/ROUTED split `migrations/0002_metrics_views.sql`'s `cost_per_qualified_lead` uses) — relabeling for the CRM shape, not a new decision.",
+        "height": 160,
+        "width": 320
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "GET /leads/{id}", "type": "main", "index": 0 }]]
+    },
+    "GET /leads/{id}": {
+      "main": [[{ "node": "Lead Found?", "type": "main", "index": 0 }]]
+    },
+    "Lead Found?": {
+      "main": [
+        [{ "node": "Is Finalized?", "type": "main", "index": 0 }],
+        [{ "node": "Respond (Lead Not Found)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Finalized?": {
+      "main": [
+        [{ "node": "Map to CRM Payload", "type": "main", "index": 0 }],
+        [{ "node": "Respond (Not Finalized Yet)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Map to CRM Payload": {
+      "main": [[{ "node": "POST Mock CRM Sink", "type": "main", "index": 0 }]]
+    },
+    "POST Mock CRM Sink": {
+      "main": [[{ "node": "Respond (Synced)", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

@@ -102,7 +102,7 @@ regression test.
 ## Architecture
 
 ```
-   n8n (thin edge: ingest webhook, CRM sync-out)          [M1, not built]
+   n8n (thin edge: ingest webhook, outcome sync)          [M1, BUILT]
                      |
                      v
         Ingestion API (FastAPI) --> Postgres / Supabase   [M1, BUILT]
@@ -133,10 +133,12 @@ regression test.
 M0 — the intelligence engine and its benchmark — is complete. M1 is partly
 built: schema and migrations, evidence store, identity resolution, the job
 queue and transactional state machine, the ingestion API, cost ledger,
-end-to-end tracing, and now LLM signal extraction. **The worker still has no
-real handlers** — nothing yet calls `CalibratedBoundsPolicy` in production,
-and nothing yet calls `arie.llm` either, both on purpose. See
-[the handoff](docs/06-m1-handoff.md) for exactly what is and isn't wired.
+end-to-end tracing, LLM signal extraction, a human review API, and now the
+n8n edge workflows. **The worker still has no real handlers** — nothing yet
+calls `CalibratedBoundsPolicy` in production, nothing yet calls `arie.llm`,
+and nothing yet calls `arie.approval.workflow.request_review` either, all on
+purpose. See [the handoff](docs/06-m1-handoff.md) for exactly what is and
+isn't wired.
 
 **Deliberately rejected**, with reasons in [`docs/adr/`](docs/adr/): LangGraph
 (the loop is a calculation, not agentic reasoning), Temporal (single-service
@@ -159,6 +161,76 @@ python -m bench.multi_seed   # 10 seeds + human-review cost sweep
 Everything runs offline against the provider simulator. Anyone cloning this repo
 reproduces every number in [`docs/05-results.md`](docs/05-results.md)
 byte-for-byte — reproducibility is a design goal enforced in CI, not a claim.
+
+---
+
+## n8n edge workflows
+
+Two thin workflows, importable as-is, plus a local helper. No business logic
+lives in n8n — validation, identity resolution, scoring, policy, and review
+outcomes are all decided by ARIE; n8n only maps field shapes and relays
+ARIE's response.
+
+```
+external webhook --> [has email?] --> ARIE POST /leads --> relay ARIE's response
+                                                             (lead_id, job_id, status, ...)
+
+{lead_id} webhook --> ARIE GET /leads/{id} --> [found? finalized?] --> CRM-shaped
+                                                                        payload --> sink
+```
+
+| File | Role |
+|---|---|
+| [`workflows/n8n/lead-ingestion.json`](workflows/n8n/lead-ingestion.json) | `POST /webhook/lead-ingest` → ARIE `POST /leads`. Preserves `source`/`external_ref` untouched so ARIE's own idempotency handles redelivery — n8n never invents or drops them. |
+| [`workflows/n8n/outcome-sync.json`](workflows/n8n/outcome-sync.json) | `POST /webhook/outcome-sync` with `{"lead_id": "..."}` → ARIE `GET /leads/{id}` → CRM-shaped payload → sink, once the lead's status is one ARIE already treats as finalized. |
+| [`workflows/n8n/mock-crm-sink.json`](workflows/n8n/mock-crm-sink.json) | Not one of the two edge workflows — a minimal local stand-in so `outcome-sync` has somewhere real to `POST` to. Swap `MOCK_CRM_SINK_URL` for a real CRM endpoint later; nothing else changes. |
+
+`outcome-sync` is receive-triggered rather than polling ARIE for a list of
+finalized leads, because no such endpoint exists yet and building
+discovery/retry logic into n8n to fake one would be exactly the
+backend-duplicating logic this step is scoped to avoid. Call it once you
+already know a decision finalized; see the sticky note in the workflow for
+the schedule-trigger swap if ARIE ever adds one.
+
+### Run n8n locally
+
+Not part of the default stack — opt in with Compose's `--profile` flag:
+
+```bash
+docker compose --profile n8n up -d n8n
+```
+
+Open [http://localhost:5678](http://localhost:5678) (first run asks you to
+create a local owner account; nothing leaves your machine). `ARIE_API_BASE_URL`
+and `MOCK_CRM_SINK_URL` are already set on the container — see the `n8n`
+service in [`docker-compose.yml`](docker-compose.yml) — pointing at the `api`
+service and the bundled mock sink respectively.
+
+### Import and try it
+
+In the n8n UI: **Workflows → Import from File** for each of the three JSON
+files above, then open each one and click **Activate** (n8n serves an
+inactive workflow's webhook only while its editor tab is open and listening).
+
+```bash
+curl -X POST http://localhost:5678/webhook/lead-ingest \
+  -H "Content-Type: application/json" \
+  -d '{"source": "landing-page", "email": "ada@acme.test", "external_ref": "demo-1"}'
+# -> {"lead_id": "...", "status": "NEW", "created": true, "job_id": "...", ...}
+
+curl -X POST http://localhost:5678/webhook/outcome-sync \
+  -H "Content-Type: application/json" \
+  -d '{"lead_id": "<the lead_id from above>"}'
+# -> {"synced": false, "reason": "lead not finalized", "status": "NEW"} today,
+#    since the worker has no handlers registered yet (see docs/06-m1-handoff.md)
+#    and nothing advances a lead past NEW. For a local demo of the synced path,
+#    move a lead there directly: UPDATE leads SET status = 'AUTO_ROUTED' WHERE
+#    lead_id = '...'; — outcome-sync then reaches the mock sink and its
+#    execution log shows the CRM-shaped payload it "wrote".
+```
+
+Redelivering the same ingestion payload is safe — that's ARIE's `(source,
+external_ref)` uniqueness doing the work, not anything n8n does.
 
 ---
 
@@ -211,10 +283,12 @@ src/arie/
     baseline.py     the deterministic comparison point, zero cost
     deepseek.py      client + retries + ledger + tracing, no tools registered
     eval.py           small synthetic corpus + delta scoring, separate from M0
+  approval/      human review workflow - request/decide around human_reviews (M1)
 bench/           harness, metrics, cost model, seed sweep, llm_signal_eval.py
 migrations/      numbered SQL (M1) - source of truth, applied via scripts/migrate.py
 supabase/        migrations/ mirror (generated) + config, for GitHub Branching PR previews
 scripts/         migrate.py, sync_supabase_migrations.py
+workflows/n8n/   thin transport-edge workflows (M1) - importable JSON, no business logic
 tests/           unit + integration (DB-backed, opt-in via `make test-all`)
 docs/            research, architecture, results, ADRs, handoff
 ```

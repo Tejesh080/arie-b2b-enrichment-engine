@@ -10,7 +10,7 @@ Written to be read cold, in a fresh session, with no memory of how M0 went.
 result is published — including the part that failed. Everything runs offline
 and deterministically; no credentials, no network.
 
-**M1 Steps 6–11 are complete.** Steps 6–9 (schema/migrations/evidence store,
+**M1 Steps 6–12 are complete.** Steps 6–9 (schema/migrations/evidence store,
 identity resolution, job queue/state machine, ingestion API, cost ledger,
 tracing) are verified against the live production Supabase database. Step 10
 (`arie.llm` — DeepSeek buying-signal extraction) needs no database at all and
@@ -18,12 +18,15 @@ is verified by 43 mocked unit tests plus 5 live-database ledger tests. Step 11
 (`arie.approval.workflow` — the human review API) is verified by 15
 live-database tests covering approve/reject/edit, idempotent retries,
 conflicting submissions, optimistic-concurrency failure with rollback, and the
-audit trail — see "Suggested order" below for exactly what's built versus
-deferred within each step. **Live-measured while running Step 11's gate** (not
-previously recorded anywhere): DeepSeek vs. the deterministic baseline on the
-26-sample corpus — exact-match accuracy 46.2% -> 73.1% (+26.9pp), $0.0074 total
-cost, ~1.17s mean latency, zero validation failures or retries across all 26
-calls. `bench/out/llm_signal_eval.json` has the full per-field breakdown.
+audit trail. Step 12 (`workflows/n8n/` — the edge workflows) is JSON, not
+Python — there is nothing for pytest to exercise, and it is unchanged by the
+rest of this session's gate — see "Suggested order" below for exactly what's
+built versus deferred within each step. **Live-measured while running Step
+11's gate** (not previously recorded anywhere): DeepSeek vs. the deterministic
+baseline on the 26-sample corpus — exact-match accuracy 46.2% -> 73.1%
+(+26.9pp), $0.0074 total cost, ~1.17s mean latency, zero validation failures
+or retries across all 26 calls. `bench/out/llm_signal_eval.json` has the full
+per-field breakdown.
 
 **Nothing yet calls `CalibratedBoundsPolicy` in production, nothing yet calls
 `arie.llm`, and nothing yet calls `arie.approval.workflow.request_review`
@@ -355,7 +358,51 @@ interface.
     below) — see `submit_decision`'s docstring for exactly which race hits
     which one. Migration `0006` adds one partial unique index
     (`human_reviews(lead_id) WHERE responded_at IS NULL`) and no new columns.
-11. **n8n edge workflows** next.
+11. ✅ **n8n edge workflows** — `workflows/n8n/`, three hand-authored,
+    importable JSON files (no live n8n instance was used to build or verify
+    them — see below). Two things worth knowing:
+
+    **Every decision stays in ARIE; n8n only maps field shapes and relays
+    responses.** `lead-ingestion.json` checks a webhook body has a non-empty
+    `email` before forwarding (a presence check, not a format/domain check —
+    those are still ARIE's `POST /leads` 422s) and passes `source`/
+    `external_ref` straight through unchanged so ARIE's own `(source,
+    external_ref)` uniqueness is what makes redelivery idempotent, not
+    anything n8n does. `outcome-sync.json`'s "finalized" gate and its
+    `qualified` field both restate status labels ARIE already computed (the
+    same `AUTO_ROUTED`/`ROUTED` split `v_pipeline_metrics.
+    cost_per_qualified_lead` uses) — relabeling for a CRM shape, not a new
+    rule invented in n8n.
+
+    **`outcome-sync` is receive-triggered, not polling, on purpose.** ARIE has
+    no "list leads by status" endpoint today; building client-side
+    discovery/retry logic into n8n to fake one would be exactly the
+    backend-duplicating logic this step was scoped to avoid (see "Do not"
+    below). It expects to be called with `{"lead_id": "..."}` once something
+    already knows a decision finalized — there is no caller wired up to do
+    that yet, the same "built and tested, not yet wired into anything that
+    runs automatically" posture Steps 10 and 11 left `arie.llm` and
+    `arie.approval.workflow.request_review` in. A third file,
+    `mock-crm-sink.json`, is **not** one of the two required workflows — a
+    minimal local stand-in (webhook that echoes what it received) so
+    `outcome-sync` has somewhere real to `POST` to without a real CRM
+    dependency; swap `MOCK_CRM_SINK_URL` for a real endpoint later and delete
+    it, nothing else changes.
+
+    The three JSON files were hand-authored against n8n's current node
+    schemas (confirmed via the n8n MCP server's read-only node-reference
+    tools, not by creating anything in a live instance) rather than built
+    through that server's live-instance SDK flow — this repo's `.mcp.json`
+    doesn't declare an n8n connection, and the task asked for portable,
+    importable JSON files, not workflow state tied to somebody's n8n
+    instance. **Consequently these have never been imported into a running
+    n8n and executed** — no n8n / Docker was available in this environment to
+    do that in. The JSON was validated structurally (parses, every
+    `connections` target resolves to a real node name, no duplicate node
+    ids/names) but not by an actual n8n import. Treat "does this import
+    cleanly and run" as the one thing about Step 12 still worth verifying by
+    hand before relying on it — see `docker compose --profile n8n up -d n8n`
+    in the README.
 
 ---
 
@@ -376,6 +423,13 @@ interface.
   validate and a second reason the schema might grow an action-shaped field;
   a tool-calling loop or a model cascade is exactly the "multi-model routing"
   and agentic behaviour this step was scoped to exclude by name.
+- Put scoring, confidence logic, policy decisions, identity resolution, or
+  retry semantics in `workflows/n8n/`. Field mapping and routing on a status
+  ARIE already decided are fine (see Step 11 above); re-deriving what that
+  status *should* be, or client-side polling/discovery logic standing in for
+  an endpoint ARIE doesn't have, is not — that logic would live in two
+  places, in two languages, and drift apart the first time one of them
+  changes without the other.
 
 ---
 
