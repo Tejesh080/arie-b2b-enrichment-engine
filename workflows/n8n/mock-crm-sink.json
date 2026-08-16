@@ -34,7 +34,7 @@
       "typeVersion": 1,
       "position": [220, 60],
       "parameters": {
-        "content": "## Not one of the two required edge workflows\nA minimal stand-in so `outcome-sync.json` has somewhere real to POST to without a real CRM dependency (task explicitly says not to introduce one unless already configured). It just echoes what it received back into n8n's execution log — that log entry is the \"proof of write\" for this demo.\n\nTo point at a real CRM later: change `MOCK_CRM_SINK_URL` (set on the n8n container) to the real endpoint and delete this workflow. Nothing in `outcome-sync.json` needs to change.",
+        "content": "## Not one of the two required edge workflows\nA minimal stand-in so `outcome-sync.json` has somewhere real to POST to without a real CRM dependency (task explicitly says not to introduce one unless already configured). It just echoes what it received back into n8n's execution log — that log entry is the \"proof of write\" for this demo.\n\nTo point at a real CRM later: edit the URL on `outcome-sync.json`'s \"POST Mock CRM Sink\" node (currently the literal `http://n8n:5678/webhook/mock-crm-sink` — n8n blocks `$env` access in expressions by default, so this is hardcoded rather than read from a container env var) and delete this workflow.",
         "height": 220,
         "width": 460
       }

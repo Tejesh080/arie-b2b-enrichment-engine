@@ -23,7 +23,7 @@
       "position": [460, 300],
       "parameters": {
         "method": "GET",
-        "url": "={{ $env.ARIE_API_BASE_URL }}/leads/{{ $json.body.lead_id }}",
+        "url": "={{ 'http://api:8000/leads/' + $json.body.lead_id }}",
         "authentication": "none",
         "options": {
           "response": {
@@ -185,7 +185,7 @@
       "position": [1400, 60],
       "parameters": {
         "method": "POST",
-        "url": "={{ $env.MOCK_CRM_SINK_URL }}",
+        "url": "http://n8n:5678/webhook/mock-crm-sink",
         "authentication": "none",
         "sendBody": true,
         "contentType": "json",

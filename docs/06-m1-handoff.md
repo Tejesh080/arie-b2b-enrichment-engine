@@ -371,8 +371,8 @@ interface.
     which one. Migration `0006` adds one partial unique index
     (`human_reviews(lead_id) WHERE responded_at IS NULL`) and no new columns.
 11. ✅ **n8n edge workflows** — `workflows/n8n/`, three hand-authored,
-    importable JSON files (no live n8n instance was used to build or verify
-    them — see below). Two things worth knowing:
+    importable JSON files, verified end to end against a real local n8n
+    instance (see below). Two things worth knowing:
 
     **Every decision stays in ARIE; n8n only maps field shapes and relays
     responses.** `lead-ingestion.json` checks a webhook body has a non-empty
@@ -398,8 +398,9 @@ interface.
     `mock-crm-sink.json`, is **not** one of the two required workflows — a
     minimal local stand-in (webhook that echoes what it received) so
     `outcome-sync` has somewhere real to `POST` to without a real CRM
-    dependency; swap `MOCK_CRM_SINK_URL` for a real endpoint later and delete
-    it, nothing else changes.
+    dependency; edit the URL on `outcome-sync`'s "POST Mock CRM Sink" node to
+    point at a real endpoint later and delete this workflow, nothing else
+    changes.
 
     The three JSON files were hand-authored against n8n's current node
     schemas (confirmed via the n8n MCP server's read-only node-reference
@@ -407,14 +408,41 @@ interface.
     through that server's live-instance SDK flow — this repo's `.mcp.json`
     doesn't declare an n8n connection, and the task asked for portable,
     importable JSON files, not workflow state tied to somebody's n8n
-    instance. **Consequently these have never been imported into a running
-    n8n and executed** — no n8n / Docker was available in this environment to
-    do that in. The JSON was validated structurally (parses, every
-    `connections` target resolves to a real node name, no duplicate node
-    ids/names) but not by an actual n8n import. Treat "does this import
-    cleanly and run" as the one thing about Step 12 still worth verifying by
-    hand before relying on it — see `docker compose --profile n8n up -d n8n`
-    in the README.
+    instance. First validated structurally only (parses, every `connections`
+    target resolves to a real node name, no duplicate node ids/names), then
+    **verified for real** in a follow-up session: imported into a local n8n
+    (`docker compose --profile n8n up -d`), activated, and driven through
+    both webhooks — ingestion returned 201, a worker processed the job to
+    `AUTO_ROUTED`, outcome-sync reached the mock sink and returned
+    `synced: true`, and redelivering the ingestion payload returned the same
+    lead with `created: false`/`job_created: false`.
+
+    **One real bug found doing that, worth knowing before writing another
+    expression:** the original JSON read `ARIE_API_BASE_URL`/
+    `MOCK_CRM_SINK_URL` via `{{ $env.VAR }}`, set correctly on the container
+    in `docker-compose.yml` — and it silently didn't work. n8n blocks `$env`
+    access inside node expressions by default
+    (`N8N_BLOCK_ENV_ACCESS_IN_NODE`), which this repo's Compose file never
+    overrode, so the expression evaluated to nothing and the HTTP Request
+    nodes called broken URLs. Fixed by hardcoding the two Docker-network
+    service names directly in the JSON (`http://api:8000/leads`,
+    `http://n8n:5678/webhook/mock-crm-sink`) rather than routing through env
+    vars at all — both are this Compose network's own DNS, not secrets, and
+    the now-dead env vars were removed from the `n8n` service. If a future
+    change reintroduces `$env.*` in one of these workflows, this is why it
+    will look like it should work and silently won't.
+
+    **Local n8n vs. a hosted n8n account — read before touching either.**
+    The Docker `n8n` service is a reproducible dev/demo environment shipped
+    *with the repo*, same philosophy as everything else here (offline-first,
+    zero required credentials). A separately hosted n8n account is a *later*,
+    deliberately deferred integration target — relevant once ARIE has a
+    publicly reachable deployed API for it to call, which nothing through M1
+    sets up. Nothing in this repo connects to or deploys against any hosted
+    n8n account; do not wire one up without being asked to, and do not remove
+    the local Docker service once a hosted one exists — they serve different
+    purposes (reproducible local demo vs. a real integration target) and both
+    are wanted.
 
 ---
 
@@ -442,6 +470,12 @@ interface.
   an endpoint ARIE doesn't have, is not — that logic would live in two
   places, in two languages, and drift apart the first time one of them
   changes without the other.
+- Connect to, configure, or deploy anything against a hosted n8n account
+  (cloud or otherwise) without being explicitly asked to in that session. The
+  local Docker `n8n` service is the reproducible dev/demo environment this
+  repo ships; a hosted instance is a deliberately deferred later integration,
+  relevant once ARIE has a public deployed API — not before, and not by
+  inference from "n8n" appearing in a task.
 
 ---
 

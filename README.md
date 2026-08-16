@@ -186,7 +186,7 @@ external webhook --> [has email?] --> ARIE POST /leads --> relay ARIE's response
 |---|---|
 | [`workflows/n8n/lead-ingestion.json`](workflows/n8n/lead-ingestion.json) | `POST /webhook/lead-ingest` → ARIE `POST /leads`. Preserves `source`/`external_ref` untouched so ARIE's own idempotency handles redelivery — n8n never invents or drops them. |
 | [`workflows/n8n/outcome-sync.json`](workflows/n8n/outcome-sync.json) | `POST /webhook/outcome-sync` with `{"lead_id": "..."}` → ARIE `GET /leads/{id}` → CRM-shaped payload → sink, once the lead's status is one ARIE already treats as finalized. |
-| [`workflows/n8n/mock-crm-sink.json`](workflows/n8n/mock-crm-sink.json) | Not one of the two edge workflows — a minimal local stand-in so `outcome-sync` has somewhere real to `POST` to. Swap `MOCK_CRM_SINK_URL` for a real CRM endpoint later; nothing else changes. |
+| [`workflows/n8n/mock-crm-sink.json`](workflows/n8n/mock-crm-sink.json) | Not one of the two edge workflows — a minimal local stand-in so `outcome-sync` has somewhere real to `POST` to. Swap the URL on `outcome-sync`'s "POST Mock CRM Sink" node for a real CRM endpoint later; nothing else changes. |
 
 `outcome-sync` is receive-triggered rather than polling ARIE for a list of
 finalized leads, because no such endpoint exists yet and building
@@ -204,10 +204,24 @@ docker compose --profile n8n up -d n8n
 ```
 
 Open [http://localhost:5678](http://localhost:5678) (first run asks you to
-create a local owner account; nothing leaves your machine). `ARIE_API_BASE_URL`
-and `MOCK_CRM_SINK_URL` are already set on the container — see the `n8n`
-service in [`docker-compose.yml`](docker-compose.yml) — pointing at the `api`
-service and the bundled mock sink respectively.
+create a local owner account; nothing leaves your machine). The workflow JSON
+calls the `api` and `n8n` services by their Docker Compose network names
+directly (`http://api:8000/...`, `http://n8n:5678/webhook/mock-crm-sink`) —
+not via a container env var, because n8n blocks `$env` access inside node
+expressions by default and this repo doesn't override that (found during
+manual end-to-end verification, not assumed). Nothing to configure; import
+and go.
+
+**Local n8n vs. a hosted n8n account.** This Docker service is a
+reproducible dev/demo environment shipped *with the repo* — the same
+philosophy as everything else here (offline-first, zero required
+credentials, runs the same way on anyone's machine). A separately hosted
+n8n (cloud or otherwise) is a *later*, deliberately deferred step: it only
+becomes relevant once ARIE has a publicly reachable deployed API for it to
+call, which nothing in M1 sets up yet. Nothing in this repo connects to or
+deploys against any hosted n8n account, and this local service is not meant
+to be removed once one exists — the two serve different purposes
+(reproducible local demo vs. a real integration target).
 
 ### Import and try it
 
@@ -215,7 +229,12 @@ In the n8n UI: **Workflows → Import from File** for each of the three JSON
 files above, then open each one and click **Activate** (n8n serves an
 inactive workflow's webhook only while its editor tab is open and listening).
 
-The demo identity below is a real person in the frozen eval corpus (seed 42),
+This exact sequence has been run end to end against a real n8n instance:
+ingestion returned 201, a worker processed the job to `AUTO_ROUTED`,
+outcome-sync reached the mock sink and returned `synced: true`, and
+redelivering the same ingestion payload returned the same lead with
+`created: false`/`job_created: false`. The demo identity below is a real
+person in the frozen eval corpus (seed 42),
 which matters: the workers run in `PROVIDER_MODE=simulated`, where the only
 data source is the corpus's frozen observations — an identity outside it has
 nothing to enrich from, and its job retries then dead-letters with a message

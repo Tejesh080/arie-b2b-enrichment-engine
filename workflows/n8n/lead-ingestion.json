@@ -126,7 +126,7 @@
       "position": [920, 180],
       "parameters": {
         "method": "POST",
-        "url": "={{ $env.ARIE_API_BASE_URL }}/leads",
+        "url": "http://api:8000/leads",
         "authentication": "none",
         "sendBody": true,
         "contentType": "json",
