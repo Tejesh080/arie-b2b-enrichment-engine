@@ -1,0 +1,61 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+ENV/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+
+# Type checking / linting
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+
+# Generated eval datasets (seeded — reproducible via `make dataset`)
+data/eval/*.jsonl
+data/eval/*.parquet
+
+# Benchmark outputs (reproducible via `make bench`)
+bench/out/
+*.png
+!docs/assets/*.png
+
+# Raw provider payloads (may contain PII)
+data/raw/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Supabase CLI local state
+supabase/.branches/
+supabase/.temp/
+
+# Claude Code local settings (keep .mcp.json — it's shared project config)
+.claude/settings.local.json

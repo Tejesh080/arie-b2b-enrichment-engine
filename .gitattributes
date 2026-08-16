@@ -1,0 +1,8 @@
+# Normalise to LF in the repository. Without this, files authored on Windows land
+# in CI with CRLF — which breaks Makefile recipes and shell scripts in the
+# Linux container.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.parquet binary

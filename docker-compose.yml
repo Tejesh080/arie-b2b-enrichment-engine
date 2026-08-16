@@ -1,0 +1,53 @@
+# Local development stack.
+#
+# Note: Postgres here is for local iteration only. The deployed target is
+# Supabase — set DATABASE_URL to the Supabase *pooled* connection string and the
+# api/worker services will use it instead.
+#
+# The benchmark (M0) needs none of this. `make bench` runs standalone.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: arie
+      POSTGRES_PASSWORD: arie_local_dev
+      POSTGRES_DB: arie
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arie"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    command: uvicorn arie.api.main:app --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_URL: postgresql://arie:arie_local_dev@db:5432/arie
+      PROVIDER_MODE: simulated
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: python -m arie.jobs.worker
+    environment:
+      DATABASE_URL: postgresql://arie:arie_local_dev@db:5432/arie
+      PROVIDER_MODE: simulated
+    depends_on:
+      db:
+        condition: service_healthy
+    # Workers are stateless and claim jobs via SKIP LOCKED, so this scales
+    # horizontally with no coordination.
+    deploy:
+      replicas: 2
+
+volumes:
+  pgdata:

@@ -1,0 +1,87 @@
+"""Central configuration.
+
+Policy parameters live here rather than being scattered across call sites so that
+a benchmark run can state, in one object, exactly what configuration produced a
+given result. Reproducibility depends on this.
+
+All defaults use ``default_factory`` rather than direct calls. That matters: a
+plain ``os.getenv(...)`` default is evaluated once at import time, so tests that
+patch the environment would silently read stale values, and the config could not
+be re-derived without reimporting the module.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from typing import Literal, cast
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+ProviderMode = Literal["simulated", "live"]
+
+
+def _env_float(key: str, default: float) -> float:
+    raw = os.getenv(key)
+    return float(raw) if raw else default
+
+
+def _env_int(key: str, default: int) -> int:
+    raw = os.getenv(key)
+    return int(raw) if raw else default
+
+
+@dataclass(frozen=True)
+class PolicyConfig:
+    """Parameters of the enrichment decision algorithm.
+
+    ``lead_budget_usd_cap`` is intentionally redundant with the EVoI stopping
+    rule. If the EVoI estimate is miscalibrated and wants to keep spending, the
+    hard cap stops it anyway — a policy bug should cost a bounded amount.
+    """
+
+    lead_budget_usd_cap: float = field(
+        default_factory=lambda: _env_float("LEAD_BUDGET_USD_CAP", 0.50)
+    )
+    target_autonomous_error_rate: float = field(
+        default_factory=lambda: _env_float("TARGET_AUTONOMOUS_ERROR_RATE", 0.05)
+    )
+    latency_penalty_usd_per_sec: float = field(
+        default_factory=lambda: _env_float("LATENCY_PENALTY_USD_PER_SEC", 0.01)
+    )
+
+    # Decision-confidence thresholds. These are *defaults*: the conformal
+    # procedure in arie.confidence replaces `auto_route_threshold` with a value
+    # derived from the calibration split. A hardcoded threshold that never gets
+    # replaced would be exactly the anti-pattern this project argues against.
+    auto_route_threshold: float = 0.90
+    escalate_floor: float = 0.60
+
+    max_enrichment_steps: int = 8
+
+
+@dataclass(frozen=True)
+class DatabaseConfig:
+    url: str = field(default_factory=lambda: os.getenv("DATABASE_URL", ""))
+    direct_url: str = field(default_factory=lambda: os.getenv("DATABASE_DIRECT_URL", ""))
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    provider_mode: ProviderMode = field(
+        default_factory=lambda: cast(ProviderMode, os.getenv("PROVIDER_MODE", "simulated"))
+    )
+    log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
+    worker_poll_interval_sec: int = field(
+        default_factory=lambda: _env_int("WORKER_POLL_INTERVAL_SEC", 2)
+    )
+    worker_max_attempts: int = field(default_factory=lambda: _env_int("WORKER_MAX_ATTEMPTS", 4))
+
+
+# Module-level singletons for convenience. Construct fresh instances directly
+# (e.g. `PolicyConfig()`) when a test needs to observe patched environment values.
+POLICY = PolicyConfig()
+DATABASE = DatabaseConfig()
+RUNTIME = RuntimeConfig()
