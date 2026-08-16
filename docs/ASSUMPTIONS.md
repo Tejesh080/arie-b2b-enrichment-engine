@@ -69,6 +69,33 @@ far more than a false-accept on a small lead, and the scoring reflects that.
 | Ambiguous-identity subset | ~5% | Makes deterministic-match failure rate measurable, converting the Splink decision into a data-driven one |
 | Irreducibly-hard subset | subset of `hard` | Sets an honest floor for human escalation rate — deliberately not engineered to zero |
 
+## Human review cost
+
+The single most consequential assumption in the project, because it decides
+whether the headline API saving survives a full accounting.
+
+| Price / escalated lead | Roughly equivalent to |
+|---|---|
+| $0.00 | the implicit assumption of an API-only accounting |
+| $0.25 | ~20 seconds of a $45/hr analyst |
+| $1.00 | ~80 seconds |
+| $2.50 | ~3 minutes — a realistic floor for a considered look at a lead |
+| $5.00 | ~6 minutes — a careful review |
+
+Rather than pick one, the benchmark sweeps the range and reports the
+**break-even price**: the review cost above which the cheaper-on-API policy
+stops being cheaper overall. Measured at **$0.59 mean / $0.16 worst case**
+across ten seeds — i.e. under a minute of analyst time. Above that, adaptive
+enrichment is the *most* expensive option, not the least.
+
+Any claim about savings that does not state a review price is incomplete.
+
+## Business value tiers
+
+Relative weights only; absolute levels are assumptions. They sit far above
+provider prices, which is realistic and is precisely why teams over-enrich by
+default — almost any call looks justified if it might change the answer.
+
 ## Known limitations
 
 1. **Synthetic data throughout.** No real lead data. Absolute numbers are not
