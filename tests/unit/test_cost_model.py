@@ -14,7 +14,7 @@ from bench.cost_model import (
     total_cost,
 )
 from bench.harness import run_once
-from bench.multi_seed import Spread
+from bench.multi_seed import DEFAULT_SEEDS, Spread
 
 from arie.core.types import Decision
 from arie.evalgen.schema import EvalLead
@@ -143,6 +143,20 @@ def test_spread_reports_the_full_range() -> None:
 
 def test_spread_of_one_value_has_no_deviation() -> None:
     assert Spread("metric", (0.5,)).stdev == 0.0
+
+
+def test_default_seeds_matches_the_documented_reproduction_command() -> None:
+    """Pins the gap found reconciling docs/05-results.md against a fresh run.
+
+    `DEFAULT_SEEDS` was seven seeds `(42, ..., 48)` while every "mean across 10
+    seeds" claim in README/05-results.md was actually produced by
+    `--seeds 42 43 44 45 46 47 48 49 50 51` — the reproduction command
+    documented at the top of 05-results.md, which this test also pins so the
+    two cannot drift apart silently again. Running `python -m bench.multi_seed`
+    with no arguments (as README's Quick Start tells a reader to) must measure
+    the same seeds the published numbers claim.
+    """
+    assert DEFAULT_SEEDS == (42, 43, 44, 45, 46, 47, 48, 49, 50, 51)
 
 
 # --- harness -----------------------------------------------------------------

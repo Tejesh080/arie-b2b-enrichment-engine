@@ -62,8 +62,8 @@ far more than a false-accept on a small lead, and the scoring reflects that.
 
 | Parameter | Value | Rationale |
 |---|---|---|
-| Total leads | ~450 | 150 calibration + 300 test |
-| Distinct companies | ~180 | Multiple contacts per company — otherwise cache hit rate is always ~0 and the largest real-world cost lever goes unmeasured |
+| Total leads | ~900 | 600 calibration + 300 test. Calibration was 150 (~450 total) before the calibration split was enlarged 4x — see [`05-results.md`](05-results.md#what-enlarging-the-calibration-split-changed) — and this row went stale for a while after that change; corrected as part of the M1 Step 9 gate's benchmark-provenance reconciliation |
+| Distinct companies | ~420 | Multiple contacts per company — otherwise cache hit rate is always ~0 and the largest real-world cost lever goes unmeasured |
 | Difficulty split | 40 / 35 / 25 (easy/medium/hard) | Difficulty skew is the mechanism cascades exploit; must be present but not dominant |
 | Cheap-evidence-misleads subset | ~20–30% of medium+hard | **Bounds the maximum possible gain from adaptive enrichment.** Reported explicitly so gains can't look inflated |
 | Ambiguous-identity subset | ~5% | Makes deterministic-match failure rate measurable, converting the Splink decision into a data-driven one |

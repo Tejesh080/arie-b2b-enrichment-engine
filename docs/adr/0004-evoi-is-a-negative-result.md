@@ -33,11 +33,15 @@ Mean across 10 seeds, on 300 held-out test leads:
 | | agreement | API $/lead | calls |
 |---|---|---|---|
 | calibrated_bounds | 0.8113 | 0.2463 | 5.26 |
-| adaptive_voi | 0.8093 | 0.2906 | 2.19 |
+| adaptive_voi (single un-scaled variant, `value_scale=1.0`) | 0.8093 | 0.2906 | 2.19 |
 
 EVoI costs **16.1% more** than the policy without it, at slightly worse
 agreement, on 9 of 10 seeds. It is also more expensive at every human-review
-price tested.
+price tested. That 16.1% and "9 of 10 seeds" are measured against
+`best_adaptive` — the best-of-seven `value_scale` variants per seed, the more
+generous comparison — not against the single un-scaled row above; see
+[`05-results.md`](../05-results.md#reconciling-this-page-against-a-fresh-run)
+for why the two are not the same cost figure.
 
 ## Why it failed
 

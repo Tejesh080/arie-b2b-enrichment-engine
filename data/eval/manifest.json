@@ -1,36 +1,36 @@
 {
-  "ambiguous_identity_count": 31,
+  "ambiguous_identity_count": 40,
   "band_counts": {
-    "easy": 179,
-    "hard": 97,
-    "medium": 174
+    "easy": 399,
+    "hard": 195,
+    "medium": 306
   },
-  "cheap_misleads_count": 172,
-  "constructed_adversarial_count": 112,
+  "cheap_misleads_count": 358,
+  "constructed_adversarial_count": 126,
   "contacts_per_company_by_band": {
-    "easy": 2.21,
-    "hard": 1.94,
-    "medium": 2.451
+    "easy": 2.375,
+    "hard": 1.857,
+    "medium": 2.096
   },
-  "content_sha256": "21764b970d02d67ec58c0e0ff1b447f04cfd2ed900b755bc2e2c9871bb2b0138",
+  "content_sha256": "0041ed2adc4148654a56f228b1e11b27cc00dd44c5a7e520fe14735a58a7d2a0",
   "decision_counts": {
-    "auto_route": 157,
-    "escalate_human": 39,
-    "reject": 254
+    "auto_route": 286,
+    "escalate_human": 102,
+    "reject": 512
   },
   "generator_version": "1.0.0",
-  "n_companies": 202,
-  "n_leads": 450,
+  "n_companies": 419,
+  "n_leads": 900,
   "rules_version": "icp-1.0.0",
   "seed": 42,
   "split_counts": {
-    "calibration": 150,
+    "calibration": 600,
     "test": 300
   },
   "value_tier_counts": {
-    "large": 81,
-    "medium": 150,
-    "small": 194,
-    "whale": 25
+    "large": 165,
+    "medium": 285,
+    "small": 416,
+    "whale": 34
   }
 }

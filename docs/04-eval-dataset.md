@@ -72,14 +72,19 @@ directly so gains cannot look inflated.
 
 ## Structure
 
-- **~450 leads across ~180 companies.** Multiple contacts per company is
+- **~900 leads across ~420 companies.** Multiple contacts per company is
   essential — without it, cache hit rate is always ~0 and the largest real-world
   cost lever goes unmeasured.
 - **~5% ambiguous-identity subset** (`Acme Inc` / `Acme Corporation` / `acme.com`)
   making deterministic-match failure rate measurable, which converts the Splink
   decision from taste into data.
-- **Splits:** 150 calibration (fits the calibration model and conformal τ; never
+- **Splits:** 600 calibration (fits the calibration model and conformal τ; never
   touched by the benchmark) + 300 test, stratified across difficulty × value tier.
+  Calibration was enlarged 4x from an original 150 — see
+  [`05-results.md`](05-results.md#what-enlarging-the-calibration-split-changed) —
+  after which the test split is unaffected by construction: company indices,
+  RNG namespaces, and name blocks restart per split, asserted by
+  `test_enlarging_calibration_leaves_the_test_split_untouched`.
 - **Fully synthetic identities** — no sanitised real leads, specifically so an LLM
   cannot recognise a real company from pretraining and defeat the
   must-combine-sources premise.

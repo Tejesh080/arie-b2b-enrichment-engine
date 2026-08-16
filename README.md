@@ -30,12 +30,13 @@ result: [ADR 0004](docs/adr/0004-evoi-is-a-negative-result.md).
 | full enrichment (call everything) | 0.8390 | 0.4447 | 8.00 | 0.816 |
 | tuned waterfall (industry baseline) | 0.8347 | 0.4205 | 7.58 | 0.795 |
 | **calibrated bounds** ← production | **0.8113** | **0.2463** | 5.26 | **0.833** |
-| adaptive EVoI | 0.8093 | 0.2906 | 2.19 | 0.786 |
+| adaptive EVoI (single un-scaled variant) | 0.8093 | 0.2906 | 2.19 | 0.786 |
 
 **41.6% cheaper than a tuned waterfall, at 2.3pp lower decision agreement**, and
 cheapest on total cost at every human-review price tested. Standard deviation on
 that saving is 11.0pp — the variance is large relative to the effect, and
-[the results doc](docs/05-results.md) reports it per seed rather than burying it.
+[the results doc](docs/05-results.md) reports it per seed rather than burying it,
+along with exactly what "single un-scaled variant" means for the EVoI row above.
 
 > **No policy met the pre-registered criteria** (≤1pp agreement loss at ≥20% cost
 > reduction). This is a frontier point with a stated trade-off, not a win.

@@ -281,8 +281,21 @@ interface.
 make lint && make type && make test     # ruff, mypy --strict, unit tests (no DB, no network)
 make check-supabase-migrations          # supabase/migrations/ must match migrations/ — see ADR 0005
 make validate-dataset                   # dataset must stay non-trivial
-python -m bench.multi_seed              # ~10 min; run before claiming an improvement
+python -m bench.multi_seed              # ~15 min for 10 seeds; run before claiming an improvement
 ```
+
+`python -m bench.multi_seed` runs its default seed set now, no `--seeds` needed
+— `DEFAULT_SEEDS` was 7 seeds until the M1 Step 9 gate's benchmark-provenance
+reconciliation found it didn't match the 10 seeds every published number
+actually used (that command was always documented at the top of
+[`05-results.md`](05-results.md), just not the tracked default). Fixed, and
+`data/eval/manifest.json` regenerated to match — both were provenance gaps, not
+wrong numbers: a fresh 10-seed run reproduced every figure in
+`05-results.md`/README/ADR 0004 exactly. Full account:
+[`05-results.md`'s reconciliation section](05-results.md#reconciling-this-page-against-a-fresh-run).
+If a future run of this command *doesn't* reproduce those numbers, that is a
+real regression worth investigating, not something to assume is "probably the
+same provenance gap again."
 
 CI additionally runs `ruff format --check`, which `make lint` does not — a
 change that passes locally can still fail the build on formatting. Run

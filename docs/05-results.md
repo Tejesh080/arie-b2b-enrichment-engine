@@ -10,6 +10,14 @@ Reproduce with:
 make dataset && python -m bench.multi_seed --seeds 42 43 44 45 46 47 48 49 50 51
 ```
 
+`python -m bench.multi_seed` alone now reproduces the same ten seeds by
+default — the explicit `--seeds` list above is kept only because it is the
+exact command that originally produced every number on this page, not because
+it is still necessary. It wasn't always: see
+["Reconciling this page against a fresh run"](#reconciling-this-page-against-a-fresh-run)
+at the end of this document before assuming a number here is stale just
+because it looks old.
+
 ---
 
 ## Headline: the thesis did not hold, and the ablation won
@@ -29,11 +37,31 @@ negative result.
 | full_enrichment | 0.8390 | 0.4447 | 8.00 | 0.816 | 0.0775 |
 | waterfall_expensive | 0.8347 | 0.4205 | 7.58 | 0.795 | 0.0807 |
 | **calibrated_bounds** (production) | **0.8113** | **0.2463** | 5.26 | **0.833** | 0.1155 |
-| adaptive_voi (EVoI) | 0.8093 | 0.2906 | 2.19 | 0.786 | 0.1092 |
+| adaptive_voi_x1 (EVoI) | 0.8093 | 0.2906 | 2.19 | 0.786 | 0.1092 |
 | escalation_aware @ $2.50 | 0.8120 | 0.2813 | 2.17 | 0.786 | 0.1052 |
 
-**The production policy is 41.4% cheaper than the tuned waterfall and 44.6%
-cheaper than full enrichment, at 2.3pp lower decision agreement.**
+The EVoI row is the single un-scaled policy (`value_scale=1.0`), held constant
+across all ten seeds — the policy as originally proposed, not tuned in
+hindsight. Every other EVoI figure on this page (the stability table, the
+total-cost table, the break-even price, the per-seed verdicts) instead uses
+`best_adaptive`: the best-of-seven `value_scale` variants *for that seed*,
+chosen by agreement. That is deliberately the more generous comparison —
+`best_adaptive` matched `adaptive_voi_x1` on only 1 of the 10 seeds, so this
+is a real methodological difference, not rounding. It means the two are not
+directly comparable cost figures: `adaptive_voi_x1` costs $0.2906/lead here,
+while `best_adaptive`'s mean is $0.2793/lead in the total-cost table below at
+the same $0 review price. Both are real, both reproduce exactly; they just
+answer "the plain policy" versus "the best this approach could do with its own
+tuning knob."
+
+**The production policy is 41.6% cheaper than the tuned waterfall on average
+across seeds (sd 11.0pp — see the stability table below) and 2.33pp lower on
+decision agreement (sd 2.07pp).** In aggregate dollar terms — mean production
+spend over mean waterfall spend, rather than the mean of each seed's own
+saving — that is 41.4% cheaper than the tuned waterfall and 44.6% cheaper than
+full enrichment. The two readings differ because a mean of ratios is not the
+same number as a ratio of means; both are reported rather than picking one
+silently.
 
 It also has the *highest* autonomy of any policy — higher than buying
 everything. Extra evidence can introduce conflict between sources and pull
@@ -156,6 +184,43 @@ correctly refuses to automate anything at 5%.
 met at roughly 45% coverage and stable across seeds. That is a policy choice with
 a stated cost, recorded in `config.py` and pinned by
 `test_five_percent_budget_is_not_achievable`.
+
+---
+
+## Reconciling this page against a fresh run
+
+Two provenance gaps were found and closed here, neither of which changed a
+published number — this section exists so that fact is checked, not assumed.
+
+**`bench/multi_seed.py`'s tracked default was seven seeds, not ten.**
+`DEFAULT_SEEDS` was `(42, ..., 48)` from the day the sweep was first built.
+Every number on this page was actually produced by the `--seeds 42 43 44 45
+46 47 48 49 50 51` override shown above — which was always documented as the
+reproduction command — but the bare `python -m bench.multi_seed` that
+README's Quick Start told a reader to run measured a different, smaller
+sweep. Fixed by extending the default to the same ten seeds already
+documented here, rather than picking a new sample.
+
+**The committed `data/eval/manifest.json` described a dataset that hasn't
+existed since before this page's numbers were measured.** It was last
+regenerated before the calibration split was enlarged 150 → 600 (see below),
+and never after. It has no effect on any benchmark or test — every consumer
+regenerates the dataset in memory via `generate_dataset(seed=...)`, never
+reads the committed file — so this was a stale snapshot, not a computational
+bug. Regenerated to match current generation.
+
+**What this means for the numbers above: nothing.** Nothing computational
+changed between the commit that produced this page's numbers and the one
+that made this fix (a verified behaviour-identical policy rename and
+CLI-only refactors — see that commit's diff). A fresh run at
+`--seeds 42 43 44 45 46 47 48 49 50 51` was executed to confirm rather than
+assume this, and reproduced every figure on this page exactly: the headline
+table, the full stability table, the complete total-cost table (all 25
+cells), the break-even price, and the per-seed verdict counts. The
+`adaptive_voi_x1` vs `best_adaptive` distinction noted after the headline
+table was a real, previously undocumented convention discovered while
+verifying this — consistently applied everywhere on this page, just never
+written down until now.
 
 ---
 
