@@ -14,6 +14,7 @@ Supabase branch, not a database you'd mind resetting.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from uuid import UUID
 
 import psycopg
@@ -23,6 +24,7 @@ from scripts.migrate import migrate
 
 from arie.config import DatabaseConfig
 from arie.evidence.store import PostgresEvidenceStore
+from arie.identity.resolver import IdentityResolver
 
 
 def _database_config() -> DatabaseConfig:
@@ -76,3 +78,51 @@ def cleanup_evidence(db_conn: psycopg.Connection) -> Iterator[list[UUID]]:
         with db_conn.cursor() as cur:
             cur.execute("DELETE FROM evidence WHERE entity_id = ANY(%s)", (entity_ids,))
         db_conn.commit()
+
+
+@pytest.fixture
+def identity_resolver(migrated_database: str) -> Iterator[IdentityResolver]:
+    pool = ConnectionPool(migrated_database, min_size=1, max_size=4, open=True)
+    resolver = IdentityResolver(pool)
+    try:
+        yield resolver
+    finally:
+        resolver.close()
+
+
+@dataclass
+class IdentityCleanup:
+    """Rows a test resolved and wants deleted afterward.
+
+    Identity resolution doesn't generate fresh UUIDs the way evidence tests do
+    (``ON CONFLICT`` may return an *existing* row from an earlier test run) —
+    tests register normalized keys, and teardown deletes by those keys so a
+    company/person genuinely created by this run is removed regardless of
+    which call happened to return its row.
+    """
+
+    domains: list[str] = field(default_factory=list)
+    company_names: list[str] = field(default_factory=list)  # normalized, for domain-less companies
+    emails: list[str] = field(default_factory=list)
+
+
+@pytest.fixture
+def cleanup_identity(db_conn: psycopg.Connection) -> Iterator[IdentityCleanup]:
+    tracker = IdentityCleanup()
+    yield tracker
+    with db_conn.cursor() as cur:
+        # Persons first: company_id references companies(company_id) with no
+        # ON DELETE clause (default RESTRICT), so a company row with a
+        # surviving person would fail to delete.
+        if tracker.emails:
+            cur.execute("DELETE FROM persons WHERE canonical_email = ANY(%s)", (tracker.emails,))
+        if tracker.domains:
+            cur.execute(
+                "DELETE FROM companies WHERE canonical_domain = ANY(%s)", (tracker.domains,)
+            )
+        if tracker.company_names:
+            cur.execute(
+                "DELETE FROM companies WHERE canonical_domain IS NULL AND normalized_name = ANY(%s)",
+                (tracker.company_names,),
+            )
+    db_conn.commit()
