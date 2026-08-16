@@ -1,0 +1,36 @@
+{
+  "ambiguous_identity_count": 31,
+  "band_counts": {
+    "easy": 179,
+    "hard": 97,
+    "medium": 174
+  },
+  "cheap_misleads_count": 194,
+  "constructed_adversarial_count": 112,
+  "contacts_per_company_by_band": {
+    "easy": 2.21,
+    "hard": 1.94,
+    "medium": 2.451
+  },
+  "content_sha256": "de4407843342062d608a4707b14fef9f89146ac105bdb9c8cb725ce7bcb42efa",
+  "decision_counts": {
+    "auto_route": 148,
+    "escalate_human": 55,
+    "reject": 247
+  },
+  "generator_version": "1.0.0",
+  "n_companies": 202,
+  "n_leads": 450,
+  "rules_version": "icp-1.0.0",
+  "seed": 42,
+  "split_counts": {
+    "calibration": 150,
+    "test": 300
+  },
+  "value_tier_counts": {
+    "large": 89,
+    "medium": 133,
+    "small": 203,
+    "whale": 25
+  }
+}
