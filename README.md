@@ -124,13 +124,18 @@ regression test.
   |        Provider adapter layer (Protocol)                        |
   |        SimulatedProvider | real APIs - indistinguishable        |
   +-----------------------------------------------------------------+
+
+   arie.llm (DeepSeek) -- buying-signal extraction from free text  [M1, BUILT,
+   Pydantic-validated, ledgered, traced -- not called by the worker  standalone]
+   above yet. Delta vs. a deterministic baseline: bench/llm_signal_eval.py
 ```
 
 M0 — the intelligence engine and its benchmark — is complete. M1 is partly
 built: schema and migrations, evidence store, identity resolution, the job
-queue and transactional state machine, and now the ingestion API, cost ledger,
-and end-to-end tracing. **The worker still has no real handlers** — nothing yet
-calls `CalibratedBoundsPolicy` in production, on purpose. See
+queue and transactional state machine, the ingestion API, cost ledger,
+end-to-end tracing, and now LLM signal extraction. **The worker still has no
+real handlers** — nothing yet calls `CalibratedBoundsPolicy` in production,
+and nothing yet calls `arie.llm` either, both on purpose. See
 [the handoff](docs/06-m1-handoff.md) for exactly what is and isn't wired.
 
 **Deliberately rejected**, with reasons in [`docs/adr/`](docs/adr/): LangGraph
@@ -201,7 +206,12 @@ src/arie/
   api/           FastAPI ingestion/runtime API - POST /leads (M1)
   ledger/        durable provider/model cost ledger + model pricing (M1)
   observability/ OpenTelemetry setup and cross-process trace propagation (M1)
-bench/           harness, metrics, cost model, seed sweep
+  llm/           DeepSeek buying-signal extraction - one narrow task (M1)
+    schema.py      ExtractedSignal - the entire LLM/state boundary
+    baseline.py     the deterministic comparison point, zero cost
+    deepseek.py      client + retries + ledger + tracing, no tools registered
+    eval.py           small synthetic corpus + delta scoring, separate from M0
+bench/           harness, metrics, cost model, seed sweep, llm_signal_eval.py
 migrations/      numbered SQL (M1) - source of truth, applied via scripts/migrate.py
 supabase/        migrations/ mirror (generated) + config, for GitHub Branching PR previews
 scripts/         migrate.py, sync_supabase_migrations.py

@@ -111,6 +111,39 @@ class ObservabilityConfig:
 
 
 @dataclass(frozen=True)
+class LLMConfig:
+    """DeepSeek client configuration for ``arie.llm`` signal extraction.
+
+    See ``docs/06-m1-handoff.md``'s Step 10 section for why this exists at all:
+    one narrow task (buying-signal extraction from free text), never a general
+    "call an LLM" facility.
+    """
+
+    deepseek_api_key: str = field(default_factory=lambda: os.getenv("DEEPSEEK_API_KEY", ""))
+    deepseek_base_url: str = field(
+        default_factory=lambda: os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip(
+            "/"
+        )
+    )
+    model: str = field(default_factory=lambda: os.getenv("DEEPSEEK_MODEL", "deepseek-chat"))
+    """``deepseek-chat`` (cheap tier), not ``deepseek-reasoner``. Fixed, not a
+    cascade: escalating between the two would be multi-model routing, which
+    Step 10 is deliberately scoped to exclude — see the module docstring of
+    ``arie.llm.deepseek``."""
+    timeout_seconds: float = field(
+        default_factory=lambda: _env_float("DEEPSEEK_TIMEOUT_SECONDS", 30.0)
+    )
+    max_attempts: int = field(default_factory=lambda: _env_int("DEEPSEEK_MAX_ATTEMPTS", 3))
+    """Total attempts (including the first), not retries on top of one. Bounded
+    the same way ``RuntimeConfig.worker_max_attempts`` is — a miscalibrated
+    prompt should cost a bounded amount, not loop."""
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.deepseek_api_key)
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     provider_mode: ProviderMode = field(
         default_factory=lambda: cast(ProviderMode, os.getenv("PROVIDER_MODE", "simulated"))
@@ -138,3 +171,4 @@ POLICY = PolicyConfig()
 DATABASE = DatabaseConfig()
 RUNTIME = RuntimeConfig()
 OBSERVABILITY = ObservabilityConfig()
+LLM = LLMConfig()

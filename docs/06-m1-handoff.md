@@ -10,18 +10,23 @@ Written to be read cold, in a fresh session, with no memory of how M0 went.
 result is published — including the part that failed. Everything runs offline
 and deterministically; no credentials, no network.
 
-**M1 Steps 6–9 are complete and verified against the live production Supabase
-database** (schema/migrations/evidence store, identity resolution, job
-queue/state machine, and now the ingestion API, cost ledger, and tracing).
-Step 10 (LLM signal extraction) has not started — see "Suggested order" below
-for exactly what's built versus deferred within each completed step.
+**M1 Steps 6–10 are complete.** Steps 6–9 (schema/migrations/evidence store,
+identity resolution, job queue/state machine, ingestion API, cost ledger,
+tracing) are verified against the live production Supabase database. Step 10
+(`arie.llm` — DeepSeek buying-signal extraction) needs no database at all and
+is verified by 43 mocked unit tests plus 5 live-database ledger tests — see
+"Suggested order" below for exactly what's built versus deferred within each
+step. Step 11 (human approval path) has not started.
 
-**Nothing yet calls `CalibratedBoundsPolicy` in production.** That is still
-true after Step 9 and is still deliberate. There is now a request path that
-creates leads and queues work for them, but `arie.jobs.worker.main()` runs with
-zero handlers registered, so every job fails with "no handler registered" and
-correctly retries then dead-letters. Wiring real handlers is the next real
-piece of behaviour, and it needs provider adapters that do not exist yet.
+**Nothing yet calls `CalibratedBoundsPolicy` in production, and nothing yet
+calls `arie.llm` either.** Both are true for the same reason. There is now a
+request path that creates leads and queues work for them, and now a tested
+LLM extraction module that could be called from a handler, but
+`arie.jobs.worker.main()` runs with zero handlers registered, so every job
+still fails with "no handler registered" and correctly retries then
+dead-letters. Wiring real handlers — scoring, evidence fetching, the policy,
+*and* signal extraction — is one piece of future work, not several, and it
+still needs provider adapters that do not exist yet.
 
 Read [`05-results.md`](05-results.md) before writing code. The single most
 important thing to absorb: **the sophisticated policy lost to the simple one.**
@@ -254,10 +259,45 @@ interface.
    and every processing attempt it caused land in one trace. Tracing is **off
    unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set** — no separate flag, because
    "enabled but pointed nowhere" isn't a state worth being able to express.
-9. **LLM signal extraction** (DeepSeek), one narrow task: buying signals from
-   free text. Measure it as a delta against the deterministic baseline. If it
-   does not move decision agreement, cut it — that is the precedent this project
-   has already set once. **Not started.**
+9. ✅ **LLM signal extraction** — `arie.llm`, DeepSeek, one narrow task: buying
+   signals from free text. Three things worth knowing before touching it:
+
+   **It has no free text to run on yet, and that's expected.** M0's dataset is
+   deliberately structured-only (`recent_trigger_event` is a five-value closed
+   enum, not prose — see `docs/03-mvp.md`: "No LLM in M0... introducing
+   nondeterminism into the experiment that establishes the baseline result is
+   a methodological error"). `arie.llm.eval` is *M1's own* small, hand-labeled
+   corpus (26 samples, fully synthetic), structurally separate from
+   `arie.evalgen`/`bench/multi_seed.py`/`data/eval/` — it imports nothing from
+   them, so nothing about it can perturb the M0 benchmark or the provenance
+   reconciled just before this step. `bench/llm_signal_eval.py` runs the delta
+   measurement (deterministic baseline vs. DeepSeek); it costs a fraction of a
+   cent and needs `DEEPSEEK_API_KEY` set, which nothing in this repo requires
+   — unset, it reports the baseline only and exits 0.
+
+   **The schema is the entire safety boundary.** `arie.llm.schema.ExtractedSignal`
+   (`extra="forbid"`) has no field shaped like an action — no provider name, no
+   lead status, nothing a caller could mistake for an instruction to *do*
+   something. `arie.llm.deepseek` never registers tools/functions with the API
+   either, so there is nothing in the request a model could invoke even if it
+   tried. "The LLM may extract signals but must not choose providers, change
+   lead state, or call tools" is enforced by what the code makes possible, not
+   by a comment saying so.
+
+   **Retries are stateless on purpose.** A schema-invalid response is retried
+   with the *identical* request, up to `LLMConfig.max_attempts` times — no
+   multi-turn "here's what you got wrong" correction loop, which would start
+   to look like the agentic reasoning this step is scoped to exclude. Every
+   billable attempt (DeepSeek returned a completion, whether or not it passed
+   validation) is ledgered as its own `model_calls` row via
+   `arie.llm.deepseek.record_extraction_cost` — a validation-failing retry
+   still cost money and does not disappear from the ledger.
+
+   **Not wired into a worker handler.** Building the module and measuring its
+   contribution was Step 10's scope; calling it from a live job is the same
+   "still the biggest single gap in M1" future work as the policy itself (see
+   item 5 above) — there is no `arie.jobs.worker` handler for any job type
+   yet, LLM-backed or not.
 10. **Human approval path**, then **n8n edge workflows** last.
 
 ---
@@ -272,6 +312,13 @@ interface.
 - Call anything an "agent" that is a deterministic function.
 - Replace the simulator. It is what keeps CI free and the benchmark reproducible;
   real adapters go *alongside* it behind the same Protocol.
+- Give `arie.llm` a second task, a tool-calling loop, or a second model to
+  escalate to. One narrow extraction task, one fixed cheap model, zero tools
+  registered with the API — each of those was a deliberate Step 10 boundary,
+  not an oversight to fill in later. A second task is a second prompt to
+  validate and a second reason the schema might grow an action-shaped field;
+  a tool-calling loop or a model cascade is exactly the "multi-model routing"
+  and agentic behaviour this step was scoped to exclude by name.
 
 ---
 

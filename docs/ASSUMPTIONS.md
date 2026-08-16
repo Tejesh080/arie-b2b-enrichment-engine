@@ -116,15 +116,52 @@ Unlike provider costs, which the provider *reports* and the ledger records
 verbatim, model costs are **derived**. That asymmetry is why these sit in this
 file and provider prices largely don't.
 
-**Step 10 is where these stop being assumptions.** It wires the first real
-model call; reconcile the computed cost against whatever the API's own usage
-reporting returns, and correct the table. Until then, treat any model-cost
-number this system produces as conditional on the above.
+**Step 10 wired the first real model call (`arie.llm.deepseek`) but did not
+reconcile this table** — worth being precise about, since the sentence above
+predicted it would. No live DeepSeek call was made while building Step 10: no
+`DEEPSEEK_API_KEY` was available in that environment, and the module was
+built and verified entirely against `httpx.MockTransport` (see
+`tests/unit/test_llm_deepseek_client.py`) plus a live-database ledger test
+that constructs its `ExtractionOutcome` directly rather than calling the real
+API (`tests/integration/test_llm_ledger_integration.py`). The prices above are
+therefore still exactly as unverified as they were before Step 10, and the
+first live run — `python -m bench.llm_signal_eval` with a real key set — is
+still the reconciliation this section is waiting for. Treat any model-cost
+number this system produces as conditional on the above until that happens.
 
 An unpriced model raises `UnknownModelError` rather than being ledgered at
 $0.00 — free is indistinguishable downstream from genuinely cheap, so the
 cascade would appear to be saving money at exactly the moment it was spending
 money nobody was tracking.
+
+## LLM signal-extraction eval corpus (M1 Step 10)
+
+`arie.llm.eval.LABELED_SAMPLES` — 26 hand-written, fully synthetic samples,
+hand-labeled by the same person who wrote them. Stated the same way
+`05-results.md` states its own sample-size caveat: **this is a smoke-test-scale
+corpus, not a statistically powered one.** A field with 26 samples moves in
+steps of ~3.8 percentage points; a reported delta smaller than that is noise,
+not a finding. It exists to give `bench/llm_signal_eval.py` something concrete
+to measure, not to support a claim like "the LLM is N% more accurate" at any
+real confidence level.
+
+Two things keep it a fair comparison rather than a rigged one, both worth
+stating because neither is enforced by any test — a future edit to the corpus
+could quietly break either:
+
+- **Self-labeled, not adjudicated.** No second labeler checked these against
+  the deterministic baseline's own phrase list beforehand — see
+  `test_the_labeled_corpus_is_not_degenerate_for_the_baseline`, which is the
+  one mechanical check that exists: the baseline must score neither 0% nor
+  100% on any field, which at least rules out a corpus trivially rigged
+  either for or against it.
+- **Deliberately mixed phrasing.** Roughly half the samples use phrasing the
+  baseline's own keyword list matches; the rest use different real-world
+  phrasing (different tense, a synonym, a spelled-out title instead of an
+  abbreviation) chosen to be things a keyword list plausibly misses. If every
+  sample were written *from* the baseline's phrase list, of course the
+  baseline would score perfectly and the delta would only measure that
+  circularity.
 
 ## Known limitations
 
