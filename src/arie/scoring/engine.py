@@ -105,6 +105,15 @@ class EvidenceSignals:
     boundary_distance: float
     """How far the current score sits from the nearest decision boundary."""
 
+    total_candidates: int
+    """How many individual claims were gathered, across all fields.
+
+    Evidence *volume*, distinct from completeness (which counts fields covered).
+    Needed to disentangle conflict from enrichment depth: disagreement can only
+    be observed once several sources have reported, so without this a conflict
+    signal silently proxies for "many providers were called" and its effect
+    inverts."""
+
     known_fields: tuple[str, ...]
     unknown_fields: tuple[str, ...]
     contested_fields: tuple[str, ...]
@@ -178,6 +187,7 @@ def compute_signals(
         max_conflict_points=round(max_conflict, 6),
         mean_source_confidence=round(mean_confidence, 6),
         boundary_distance=round(_boundary_distance(score_facts(dict(facts)).total_score), 6),
+        total_candidates=sum(r.candidate_count for r in resolutions.values()),
         known_fields=known,
         unknown_fields=unknown,
         contested_fields=tuple(sorted(r.field_name for r in contested)),

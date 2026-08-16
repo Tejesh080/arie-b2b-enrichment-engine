@@ -8,6 +8,7 @@ the states a lead actually passes through as evidence accumulates.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -18,7 +19,13 @@ from arie.scoring.engine import (
     score_evidence,
     score_resolved,
 )
-from arie.scoring.merge import CONFLICT_EPSILON, Candidate, resolve_candidates
+from arie.scoring.merge import (
+    CONFLICT_EPSILON,
+    Candidate,
+    FieldResolution,
+    facts_from,
+    resolve_candidates,
+)
 from arie.scoring.rules import (
     MAX_TOTAL_SCORE,
     QUALIFY_THRESHOLD,
@@ -317,9 +324,11 @@ def test_agreeing_sources_produce_no_conflict() -> None:
     assert result.signals.max_conflict_points == 0.0
 
 
-def _resolved(candidates: list[Candidate]) -> tuple[dict[str, object], dict[str, object]]:
+def _resolved(
+    candidates: list[Candidate],
+) -> tuple[dict[str, Any], dict[str, FieldResolution]]:
     resolutions = resolve_candidates(candidates)
-    return {k: v.value for k, v in resolutions.items()}, resolutions  # type: ignore[return-value]
+    return facts_from(resolutions), resolutions
 
 
 # --- staleness ---------------------------------------------------------------

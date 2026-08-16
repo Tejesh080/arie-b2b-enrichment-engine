@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=1.26",
     "pandas>=2.2",
     "scikit-learn>=1.5",      # isotonic / Platt calibration
+    "scipy>=1.13",            # exact binomial bounds for threshold selection
     "matplotlib>=3.8",        # frontier + reliability diagrams
     "python-dotenv>=1.0",
 ]
@@ -63,8 +64,16 @@ warn_return_any = true
 disallow_untyped_defs = true
 # Third-party libs without stubs
 [[tool.mypy.overrides]]
-module = ["sklearn.*", "matplotlib.*"]
+module = ["sklearn.*", "scipy.*", "matplotlib.*"]
 ignore_missing_imports = true
+
+# numpy ships .pyi stubs using 3.12-only `type` statements, which mypy cannot
+# parse on our 3.11 target. Following its imports aborts the whole run, so the
+# stubs are skipped rather than the type checking weakened elsewhere.
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

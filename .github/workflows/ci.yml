@@ -20,7 +20,9 @@ jobs:
       - name: Format check
         run: ruff format --check src tests bench
       - name: Type check
-        run: mypy src
+        run: mypy src tests
+      - name: Fit confidence model (calibration split only)
+        run: python -m arie.confidence.cli --seed 42
       - name: Unit tests
         run: pytest -m "not integration" --cov=src/arie --cov-report=term-missing
 

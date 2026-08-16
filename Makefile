@@ -32,7 +32,7 @@ fmt:
 	ruff check --fix src tests bench
 
 type:
-	mypy src
+	mypy src tests
 
 test:
 	pytest -m "not integration"
