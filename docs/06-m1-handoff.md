@@ -10,23 +10,31 @@ Written to be read cold, in a fresh session, with no memory of how M0 went.
 result is published — including the part that failed. Everything runs offline
 and deterministically; no credentials, no network.
 
-**M1 Steps 6–10 are complete.** Steps 6–9 (schema/migrations/evidence store,
+**M1 Steps 6–11 are complete.** Steps 6–9 (schema/migrations/evidence store,
 identity resolution, job queue/state machine, ingestion API, cost ledger,
 tracing) are verified against the live production Supabase database. Step 10
 (`arie.llm` — DeepSeek buying-signal extraction) needs no database at all and
-is verified by 43 mocked unit tests plus 5 live-database ledger tests — see
-"Suggested order" below for exactly what's built versus deferred within each
-step. Step 11 (human approval path) has not started.
+is verified by 43 mocked unit tests plus 5 live-database ledger tests. Step 11
+(`arie.approval.workflow` — the human review API) is verified by 15
+live-database tests covering approve/reject/edit, idempotent retries,
+conflicting submissions, optimistic-concurrency failure with rollback, and the
+audit trail — see "Suggested order" below for exactly what's built versus
+deferred within each step. **Live-measured while running Step 11's gate** (not
+previously recorded anywhere): DeepSeek vs. the deterministic baseline on the
+26-sample corpus — exact-match accuracy 46.2% -> 73.1% (+26.9pp), $0.0074 total
+cost, ~1.17s mean latency, zero validation failures or retries across all 26
+calls. `bench/out/llm_signal_eval.json` has the full per-field breakdown.
 
-**Nothing yet calls `CalibratedBoundsPolicy` in production, and nothing yet
-calls `arie.llm` either.** Both are true for the same reason. There is now a
-request path that creates leads and queues work for them, and now a tested
-LLM extraction module that could be called from a handler, but
+**Nothing yet calls `CalibratedBoundsPolicy` in production, nothing yet calls
+`arie.llm`, and nothing yet calls `arie.approval.workflow.request_review`
+either.** All three are true for the same reason. There is now a request path
+that creates leads and queues work for them, a tested LLM extraction module,
+and a tested human-review API — all three could be called from a handler, but
 `arie.jobs.worker.main()` runs with zero handlers registered, so every job
 still fails with "no handler registered" and correctly retries then
 dead-letters. Wiring real handlers — scoring, evidence fetching, the policy,
-*and* signal extraction — is one piece of future work, not several, and it
-still needs provider adapters that do not exist yet.
+signal extraction, *and* escalating to a human — is one piece of future work,
+not several, and it still needs provider adapters that do not exist yet.
 
 Read [`05-results.md`](05-results.md) before writing code. The single most
 important thing to absorb: **the sophisticated policy lost to the simple one.**
@@ -120,6 +128,17 @@ transaction.
 carrier, and the worker starts its own trace instead. A malformed
 `traceparent` — a hand-edited row, a future spec version — is an observability
 problem; dropping work over it would be a much worse one.
+
+**8. A review's own idempotency and the lead's optimistic concurrency are two
+different guards, not one.** `submit_decision` completing a review (the CAS on
+`human_reviews.responded_at`) and `apply_transition` moving the lead (the CAS
+on `leads.version`) fail independently, and both surface as 409 — but only a
+version conflict is safe to retry immediately after re-reading the lead's
+current version; a content conflict (`ReviewConflictError`) means someone
+already decided this review differently, and retrying with the same body
+fixes nothing. Collapsing the two into one error type would make a client's
+correct response depend on parsing a message string instead of the exception
+class it caught.
 
 ---
 
@@ -298,7 +317,45 @@ interface.
    "still the biggest single gap in M1" future work as the policy itself (see
    item 5 above) — there is no `arie.jobs.worker` handler for any job type
    yet, LLM-backed or not.
-10. **Human approval path**, then **n8n edge workflows** last.
+10. ✅ **Human approval path** — `arie.approval.workflow`, two endpoints
+    (`GET /reviews/{review_id}`, `POST /reviews/{review_id}/decision`) around
+    the existing `human_reviews` table, plus a second outcome-branching node
+    in the state graph. Three things worth knowing before touching it:
+
+    **`request_review` is built and tested but not called by anything yet** —
+    the same posture Step 10 took with `arie.llm`. There is still no
+    `finalize_decision` handler to call it from (see item 5 above); once one
+    exists, escalating a lead is `request_review(conn, lead_id=...,
+    expected_version=..., original_decision=...)`, atomically transitioning
+    DECISION -> AWAITING_HUMAN and opening the pending `human_reviews` row in
+    the same transaction — a crash between the two would otherwise strand a
+    lead in AWAITING_HUMAN with nothing for a reviewer to act on.
+
+    **The review action is not the decision-label vocabulary.**
+    `human_reviews.original_decision`/`final_decision` speak the same labels
+    `DECISION_OUTCOMES` already uses (`auto_route`/`reject`), because
+    `v_escalation_rate`'s `human_overrode` column compares them with a bare
+    `IS DISTINCT FROM` — that comparison predates this step and was never
+    negotiable. A reviewer's action (`approve`/`reject`/`edit`) is translated
+    (`approve` -> `auto_route`, `reject` -> `reject`, `edit` ->
+    `manual_review`) before it ever reaches `arie.statemachine.transitions.
+    HUMAN_REVIEW_OUTCOMES` or the audit row. `edit` is the one outcome with no
+    automatic-path equivalent, landing on `MANUAL_REVIEW` — defined since
+    Step 8, unreachable until now.
+
+    **Idempotency is content-based, not a supplied token** — consistent with
+    this codebase's preference for natural keys (`leads`' `(source,
+    external_ref)`) over synthetic ones. A decision is completed by one
+    compare-and-swap `UPDATE human_reviews ... WHERE responded_at IS NULL`;
+    whichever attempt loses that race either finds an *identical* decision
+    already recorded (a client retry — same result comes back,
+    `already_applied=True`) or a *different* one (a genuine conflict —
+    `ReviewConflictError`, 409). This is a second, independent guard from
+    `apply_transition`'s own `OptimisticConcurrencyError` (also 409, see
+    below) — see `submit_decision`'s docstring for exactly which race hits
+    which one. Migration `0006` adds one partial unique index
+    (`human_reviews(lead_id) WHERE responded_at IS NULL`) and no new columns.
+11. **n8n edge workflows** next.
 
 ---
 

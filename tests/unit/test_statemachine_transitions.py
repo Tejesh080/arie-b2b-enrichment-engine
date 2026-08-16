@@ -11,7 +11,13 @@ from __future__ import annotations
 import pytest
 
 from arie.core.types import LeadStatus
-from arie.statemachine.transitions import DECISION_OUTCOMES, TERMINAL, job_type_for, next_status
+from arie.statemachine.transitions import (
+    DECISION_OUTCOMES,
+    HUMAN_REVIEW_OUTCOMES,
+    TERMINAL,
+    job_type_for,
+    next_status,
+)
 
 
 def test_new_leads_advance_toward_scoring() -> None:
@@ -63,6 +69,32 @@ def test_decision_without_a_recognised_outcome_raises(bad_outcome: str | None) -
 
 
 @pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        ("auto_route", LeadStatus.AUTO_ROUTED),
+        ("reject", LeadStatus.SYNCED),
+        ("manual_review", LeadStatus.MANUAL_REVIEW),
+    ],
+)
+def test_human_review_branches_on_outcome(outcome: str, expected: LeadStatus) -> None:
+    assert next_status(LeadStatus.AWAITING_HUMAN, outcome=outcome) == expected
+
+
+def test_human_review_outcomes_table_matches_what_next_status_accepts() -> None:
+    for outcome in HUMAN_REVIEW_OUTCOMES:
+        next_status(LeadStatus.AWAITING_HUMAN, outcome=outcome)  # must not raise
+
+
+@pytest.mark.parametrize("bad_outcome", [None, "", "maybe", "escalate_human", "APPROVE"])
+def test_awaiting_human_without_a_recognised_outcome_raises(bad_outcome: str | None) -> None:
+    """`escalate_human` is deliberately in the bad-outcome list: it's a valid
+    DECISION_OUTCOMES key but a lead already in AWAITING_HUMAN can't escalate
+    to itself -- the two outcome tables are intentionally not interchangeable."""
+    with pytest.raises(ValueError):
+        next_status(LeadStatus.AWAITING_HUMAN, outcome=bad_outcome)
+
+
+@pytest.mark.parametrize(
     "status",
     [LeadStatus.ROUTED, LeadStatus.SYNCED, LeadStatus.FAILED, LeadStatus.DEAD_LETTER],
 )
@@ -77,7 +109,6 @@ def test_terminal_statuses_have_no_next_action(status: LeadStatus) -> None:
     [
         LeadStatus.IDENTITY_RESOLVED,
         LeadStatus.AUTO_ROUTED,
-        LeadStatus.AWAITING_HUMAN,
         LeadStatus.MANUAL_REVIEW,
     ],
 )
@@ -85,19 +116,21 @@ def test_statuses_not_yet_wired_do_not_auto_advance(status: LeadStatus) -> None:
     """Not terminal in the business sense, but this module doesn't move them yet:
     IDENTITY_RESOLVED has no job wired (leads carry an already-resolved
     person_id/company_id under the current schema, not raw identity fields --
-    see the module docstring); routing/CRM sync and human review aren't built."""
+    see the module docstring); routing/CRM sync (AUTO_ROUTED) isn't built, and
+    MANUAL_REVIEW is a resting state with no further auto-advancement defined.
+    AWAITING_HUMAN moved out of this group in M1 Step 11 -- it now branches on
+    an outcome, the same way DECISION always has (see the tests above)."""
     assert job_type_for(status) is None
     assert next_status(status) is None
 
 
 def test_every_lead_status_is_classified() -> None:
-    """Every status either auto-advances, is terminal, is DECISION (branches on
-    outcome), or is an acknowledged not-yet-wired wait -- none silently falls
-    through unclassified."""
+    """Every status either auto-advances, is terminal, branches on an outcome
+    (DECISION, AWAITING_HUMAN), or is an acknowledged not-yet-wired wait --
+    none silently falls through unclassified."""
     not_yet_wired = {
         LeadStatus.IDENTITY_RESOLVED,
         LeadStatus.AUTO_ROUTED,
-        LeadStatus.AWAITING_HUMAN,
         LeadStatus.MANUAL_REVIEW,
     }
     auto_advancing = {
@@ -106,9 +139,13 @@ def test_every_lead_status_is_classified() -> None:
         LeadStatus.FETCHING_EVIDENCE,
         LeadStatus.INTEGRATING,
     }
+    branches_on_outcome = {LeadStatus.DECISION, LeadStatus.AWAITING_HUMAN}
 
     for status in LeadStatus:
-        classified = status in TERMINAL or status in not_yet_wired or status in auto_advancing
-        assert classified or status is LeadStatus.DECISION, (
-            f"{status} isn't accounted for in the graph's classification"
+        classified = (
+            status in TERMINAL
+            or status in not_yet_wired
+            or status in auto_advancing
+            or status in branches_on_outcome
         )
+        assert classified, f"{status} isn't accounted for in the graph's classification"

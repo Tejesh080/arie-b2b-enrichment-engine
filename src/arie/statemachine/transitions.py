@@ -11,8 +11,10 @@ this is that. Two functions, deliberately kept separate:
   that work succeeds.
 
 **Scope, stated plainly:** this is the queue/state-machine *mechanism* (M1
-Step 8) — a linear scaffold connecting ``NEW`` through ``DECISION``. It is
-*not* a reimplementation of ``CalibratedBoundsPolicy``'s actual adaptive
+Step 8, extended in Step 11) — a linear scaffold connecting ``NEW`` through
+``DECISION``, plus the one additional branch a human review resolves
+(``AWAITING_HUMAN`` -> outcome). It is *not* a reimplementation of
+``CalibratedBoundsPolicy``'s actual adaptive
 score/fetch-evidence loop, which decides whether to keep buying evidence from
 bounds and confidence computed over evidence *content* — information a bare
 ``LeadStatus`` label can't carry, and real provider adapters this module has
@@ -56,10 +58,32 @@ DECISION_OUTCOMES: dict[str, LeadStatus] = {
     "reject": LeadStatus.SYNCED,  # nothing further to route
 }
 
+# AWAITING_HUMAN is the same shape of branch as DECISION, one level later: which
+# status a reviewed lead moves to depends on what the human decided, not on the
+# status label. Keyed by the decision-label vocabulary `human_reviews.
+# final_decision` already uses (see the hand-written fixtures in
+# test_cost_ledger_integration.py predating this step) -- not by the review
+# "action" a caller submits (approve/reject/edit, arie.approval.workflow
+# .ReviewAction), which is a human-facing verb translated into this vocabulary
+# before it ever reaches the state graph. "reject" intentionally reuses
+# DECISION_OUTCOMES's own SYNCED target: a human rejecting a lead terminates it
+# the same way the automatic reject branch does, and 0005's comment about SYNCED
+# being an ambiguous, deliberately-deferred terminal applies identically here.
+# "manual_review" is the one outcome with no automatic-path equivalent -- a
+# human materially overriding the decision rather than a plain approve/reject,
+# landing on MANUAL_REVIEW rather than being forced into one of the other two.
+HUMAN_REVIEW_OUTCOMES: dict[str, LeadStatus] = {
+    "auto_route": LeadStatus.AUTO_ROUTED,
+    "reject": LeadStatus.SYNCED,
+    "manual_review": LeadStatus.MANUAL_REVIEW,
+}
+
 # No job_type_for entry -- and therefore no automatic advancement -- for
-# AUTO_ROUTED, AWAITING_HUMAN, or MANUAL_REVIEW: routing/CRM sync and human
-# review are both not built yet (n8n edge workflows, human approval path).
-# ROUTED has nowhere further to go without that sync path either.
+# AUTO_ROUTED or MANUAL_REVIEW: routing/CRM sync isn't built yet (n8n edge
+# workflows), and MANUAL_REVIEW is a resting state for an overridden lead with
+# no further auto-advancement defined. AWAITING_HUMAN is no longer in this
+# category as of M1 Step 11 -- see HUMAN_REVIEW_OUTCOMES and next_status below.
+# ROUTED has nowhere further to go without the sync path either.
 TERMINAL: frozenset[LeadStatus] = frozenset(
     {
         LeadStatus.ROUTED,
@@ -79,10 +103,11 @@ def job_type_for(status: LeadStatus) -> str | None:
 def next_status(current: LeadStatus, *, outcome: str | None = None) -> LeadStatus | None:
     """The status a lead moves to once the work for `current` succeeds.
 
-    Raises ValueError for DECISION without a recognised outcome — silently
-    guessing which way a decision branched would be worse than failing loudly.
-    Returns None for terminal states and for any status this module doesn't
-    yet auto-advance (see the module docstring).
+    Raises ValueError for DECISION or AWAITING_HUMAN without a recognised
+    outcome — silently guessing which way a decision or a review branched
+    would be worse than failing loudly. Returns None for terminal states and
+    for any status this module doesn't yet auto-advance (see the module
+    docstring).
     """
     if current is LeadStatus.DECISION:
         if outcome not in DECISION_OUTCOMES:
@@ -90,6 +115,14 @@ def next_status(current: LeadStatus, *, outcome: str | None = None) -> LeadStatu
                 f"DECISION requires one of {sorted(DECISION_OUTCOMES)} as outcome, got {outcome!r}"
             )
         return DECISION_OUTCOMES[outcome]
+
+    if current is LeadStatus.AWAITING_HUMAN:
+        if outcome not in HUMAN_REVIEW_OUTCOMES:
+            raise ValueError(
+                f"AWAITING_HUMAN requires one of {sorted(HUMAN_REVIEW_OUTCOMES)} "
+                f"as outcome, got {outcome!r}"
+            )
+        return HUMAN_REVIEW_OUTCOMES[outcome]
 
     if current in TERMINAL:
         return None

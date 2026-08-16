@@ -13,7 +13,8 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from arie.api.schemas import IngestLeadRequest
+from arie.api.schemas import IngestLeadRequest, ReviewDecisionRequest
+from arie.approval.workflow import ReviewAction
 
 
 def _minimal(**overrides: object) -> dict[str, object]:
@@ -83,6 +84,54 @@ def test_non_positive_budget_cap_is_rejected(cap: Decimal) -> None:
     silently-does-nothing pipeline rather than an error anyone would notice."""
     with pytest.raises(ValidationError):
         IngestLeadRequest(**_minimal(budget_usd_cap=cap))  # type: ignore[arg-type]
+
+
+def _review_decision(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "action": ReviewAction.APPROVE,
+        "reviewer": "reviewer@example.test",
+        "expected_lead_version": 1,
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize("action", [ReviewAction.APPROVE, ReviewAction.REJECT])
+def test_approve_and_reject_do_not_require_notes(action: ReviewAction) -> None:
+    request = ReviewDecisionRequest(**_review_decision(action=action))  # type: ignore[arg-type]
+    assert request.notes is None
+
+
+def test_edit_with_notes_is_valid() -> None:
+    request = ReviewDecisionRequest(
+        **_review_decision(action=ReviewAction.EDIT, notes="Corrected the trigger category.")  # type: ignore[arg-type]
+    )
+    assert request.action == ReviewAction.EDIT
+
+
+@pytest.mark.parametrize("notes", [None, "", "   "])
+def test_edit_without_substantive_notes_is_rejected(notes: str | None) -> None:
+    """An unexplained override defeats the audit trail the whole workflow exists for."""
+    with pytest.raises(ValidationError):
+        ReviewDecisionRequest(**_review_decision(action=ReviewAction.EDIT, notes=notes))  # type: ignore[arg-type]
+
+
+def test_unrecognised_action_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        ReviewDecisionRequest(**_review_decision(action="approve_with_extreme_prejudice"))  # type: ignore[arg-type]
+
+
+def test_blank_reviewer_is_rejected() -> None:
+    """Every human action must be auditable — an anonymous decision isn't."""
+    with pytest.raises(ValidationError):
+        ReviewDecisionRequest(**_review_decision(reviewer=""))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("version", [0, -1])
+def test_non_positive_expected_lead_version_is_rejected(version: int) -> None:
+    """Lead versions start at 1 (0001_init.sql); zero or negative can never be real."""
+    with pytest.raises(ValidationError):
+        ReviewDecisionRequest(**_review_decision(expected_lead_version=version))  # type: ignore[arg-type]
 
 
 def test_to_command_carries_every_field_through() -> None:

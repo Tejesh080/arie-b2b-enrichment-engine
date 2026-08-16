@@ -15,9 +15,10 @@ from decimal import Decimal
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from arie.api.ingest import LeadIngestCommand
+from arie.approval.workflow import ReviewAction
 from arie.core.types import LeadStatus
 from arie.identity.normalize import normalize_domain, normalize_email
 
@@ -117,3 +118,61 @@ class LeadResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     database: bool
+
+
+class ReviewResponse(BaseModel):
+    """One human review, joined with the lead's live status and version."""
+
+    review_id: UUID
+    lead_id: UUID
+    requested_at: datetime
+    reviewer: str | None
+    original_decision: str | None
+    final_decision: str | None
+    notes: str | None
+    responded_at: datetime | None
+    is_pending: bool
+    lead_status: LeadStatus
+    lead_version: int
+    """Pass this back as `expected_lead_version` when submitting a decision —
+    the same optimistic-concurrency contract `GET /leads/{lead_id}` implies
+    for every other write in this API."""
+
+
+class ReviewDecisionRequest(BaseModel):
+    """One reviewer's answer to a pending review.
+
+    ``action`` is the human-facing verb (approve/reject/edit); ``arie.
+    approval.workflow`` translates it into the decision-label vocabulary the
+    state graph and ``v_escalation_rate`` already use — this request never
+    speaks that vocabulary directly.
+    """
+
+    action: ReviewAction
+    reviewer: Annotated[str, Field(min_length=1, max_length=200)]
+    notes: Annotated[str | None, Field(default=None, max_length=2000)] = None
+    expected_lead_version: Annotated[int, Field(ge=1)]
+    """The lead's `version` at the time this review was read (`GET
+    /reviews/{review_id}`). A stale value fails with 409, matching every
+    other optimistic-concurrency write in this API."""
+
+    @model_validator(mode="after")
+    def _edit_requires_notes(self) -> ReviewDecisionRequest:
+        if self.action == ReviewAction.EDIT and not (self.notes and self.notes.strip()):
+            raise ValueError("action 'edit' requires non-empty notes explaining the override")
+        return self
+
+
+class ReviewDecisionResponse(BaseModel):
+    review_id: UUID
+    lead_id: UUID
+    action: ReviewAction
+    final_decision: str
+    reviewer: str
+    notes: str | None
+    responded_at: datetime
+    lead_status: LeadStatus
+    lead_version: int
+    already_applied: bool
+    """True if this exact decision was already recorded by an earlier,
+    identical submission — the idempotent-retry path, not an error."""

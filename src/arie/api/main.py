@@ -40,12 +40,22 @@ from arie.api.schemas import (
     IngestLeadResponse,
     LeadCostResponse,
     LeadResponse,
+    ReviewDecisionRequest,
+    ReviewDecisionResponse,
+    ReviewResponse,
+)
+from arie.approval.workflow import (
+    ReviewConflictError,
+    ReviewNotFoundError,
+    get_review,
+    submit_decision,
 )
 from arie.config import DATABASE, OBSERVABILITY
 from arie.identity.resolver import IdentityResolver
 from arie.jobs.queue import PostgresJobQueue
 from arie.ledger.store import PostgresCostLedger
 from arie.observability.tracing import configure_tracing, shutdown_tracing
+from arie.statemachine.apply import OptimisticConcurrencyError
 
 
 @dataclass(frozen=True)
@@ -233,6 +243,71 @@ def register_routes(app: FastAPI) -> None:
                 cache_hits=cost.cache_hits,
                 provider_latency_ms=cost.provider_latency_ms,
             ),
+        )
+
+    @app.get("/reviews/{review_id}", response_model=ReviewResponse)
+    def get_review_endpoint(review_id: UUID, state: StateDep) -> ReviewResponse:
+        with state.pool.connection() as conn:
+            record = get_review(conn, review_id)
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"no review {review_id}"
+            )
+
+        return ReviewResponse(
+            review_id=record.review_id,
+            lead_id=record.lead_id,
+            requested_at=record.requested_at,
+            reviewer=record.reviewer,
+            original_decision=record.original_decision,
+            final_decision=record.final_decision,
+            notes=record.notes,
+            responded_at=record.responded_at,
+            is_pending=record.is_pending,
+            lead_status=record.lead_status,
+            lead_version=record.lead_version,
+        )
+
+    @app.post("/reviews/{review_id}/decision", response_model=ReviewDecisionResponse)
+    def submit_review_decision(
+        review_id: UUID,
+        payload: ReviewDecisionRequest,
+        state: StateDep,
+    ) -> ReviewDecisionResponse:
+        # Every failure mode below rolls back the whole transaction, including
+        # the review's own compare-and-swap update if it got that far — see
+        # `arie.approval.workflow.submit_decision`'s docstring. `_transaction`'s
+        # pooled connection rolls back on any exception leaving this block,
+        # matching `post_lead`'s rollback story exactly.
+        with _transaction(state.pool) as conn:
+            try:
+                result = submit_decision(
+                    conn,
+                    review_id=review_id,
+                    action=payload.action,
+                    reviewer=payload.reviewer,
+                    notes=payload.notes,
+                    expected_lead_version=payload.expected_lead_version,
+                )
+            except ReviewNotFoundError as exc:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+            except ReviewConflictError as exc:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            except OptimisticConcurrencyError as exc:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            conn.commit()
+
+        return ReviewDecisionResponse(
+            review_id=result.review_id,
+            lead_id=result.lead_id,
+            action=result.action,
+            final_decision=result.final_decision,
+            reviewer=result.reviewer,
+            notes=result.notes,
+            responded_at=result.responded_at,
+            lead_status=result.lead_status,
+            lead_version=result.lead_version,
+            already_applied=result.already_applied,
         )
 
 
