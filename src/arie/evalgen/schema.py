@@ -35,6 +35,14 @@ class LatentCompany:
     recent_trigger_event: str | None
     disqualifying_flag: bool
 
+    # Intent is an *account*-level property, not a personal one — intent vendors
+    # sell surge signals about the company, not the individual. Modelling it here
+    # keeps company-scoped providers coherent (a company-scoped observation of a
+    # person-scoped truth would be meaningless) and makes the most expensive
+    # field in the catalogue company-cacheable, which is what gives the
+    # company-level cache its cost leverage.
+    buying_intent: float
+
     # Single per-company draw in [0, 1] that degrades every provider's coverage.
     # This is the mechanism that makes provider misses *correlated* — real
     # vendors fail together on the same thin, messy accounts.
@@ -56,7 +64,6 @@ class LatentPerson:
     email: str
     title_seniority: str
     title_function: str
-    buying_intent: float
 
 
 @dataclass(frozen=True)

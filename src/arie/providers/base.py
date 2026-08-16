@@ -23,17 +23,34 @@ class EnrichmentProvider(Protocol):
     *before* calling it. A provider that misdeclares its cost corrupts the policy.
     """
 
-    name: str
-    entity_type: EntityType
+    # Declared as read-only properties rather than plain attributes. A bare
+    # annotation in a Protocol demands a *settable* member, which would exclude
+    # any implementation exposing this metadata via @property — and nothing
+    # should be mutating a provider's declared price or latency at runtime.
+    @property
+    def name(self) -> str: ...
 
-    # Fields this provider can supply. The controller uses this to estimate
-    # P(flips decision) — a provider covering fields we already know with high
-    # confidence has low expected information value.
-    provides_fields: tuple[str, ...]
+    @property
+    def entity_type(self) -> EntityType: ...
 
-    base_cost_usd: float
-    p50_latency_ms: int
-    p95_latency_ms: int
+    @property
+    def provides_fields(self) -> tuple[str, ...]:
+        """Fields this provider can supply.
+
+        The controller uses this to estimate P(flips decision): a provider
+        covering only fields already known with high confidence has low
+        expected information value.
+        """
+        ...
+
+    @property
+    def base_cost_usd(self) -> float: ...
+
+    @property
+    def p50_latency_ms(self) -> int: ...
+
+    @property
+    def p95_latency_ms(self) -> int: ...
 
     def fetch(self, entity: Entity) -> ProviderResult:
         """Retrieve evidence for `entity`.

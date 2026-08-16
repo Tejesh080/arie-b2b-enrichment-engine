@@ -5,18 +5,18 @@
     "hard": 97,
     "medium": 174
   },
-  "cheap_misleads_count": 194,
+  "cheap_misleads_count": 172,
   "constructed_adversarial_count": 112,
   "contacts_per_company_by_band": {
     "easy": 2.21,
     "hard": 1.94,
     "medium": 2.451
   },
-  "content_sha256": "de4407843342062d608a4707b14fef9f89146ac105bdb9c8cb725ce7bcb42efa",
+  "content_sha256": "8e3ee5829a9922af944e3386678513d162b03d821938f0dffcc940ac57ede2a5",
   "decision_counts": {
-    "auto_route": 148,
-    "escalate_human": 55,
-    "reject": 247
+    "auto_route": 157,
+    "escalate_human": 39,
+    "reject": 254
   },
   "generator_version": "1.0.0",
   "n_companies": 202,
@@ -28,9 +28,9 @@
     "test": 300
   },
   "value_tier_counts": {
-    "large": 89,
-    "medium": 133,
-    "small": 203,
+    "large": 81,
+    "medium": 150,
+    "small": 194,
     "whale": 25
   }
 }

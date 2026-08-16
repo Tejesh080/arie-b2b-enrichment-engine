@@ -11,7 +11,7 @@ data on every run while still looking deterministic within a single session.
 
 from __future__ import annotations
 
-from arie.evalgen.generator import _child_rng, generate_dataset
+from arie.evalgen.generator import _child_rng, generate_dataset, latent_facts
 from arie.evalgen.schema import EvalLead
 from arie.scoring.rules import decide, score_facts
 
@@ -74,15 +74,6 @@ def test_oracle_is_recorded_consistently(leads: list[EvalLead]) -> None:
     drift rather than acquisition behaviour.
     """
     for lead in leads:
-        facts = {
-            "employee_count": lead.company.employee_count,
-            "industry": lead.company.industry,
-            "title_seniority": lead.person.title_seniority,
-            "title_function": lead.person.title_function,
-            "buying_intent": lead.person.buying_intent,
-            "recent_trigger_event": lead.company.recent_trigger_event,
-            "disqualifying_flag": lead.company.disqualifying_flag,
-        }
-        breakdown = score_facts(facts)
+        breakdown = score_facts(latent_facts(lead.company, lead.person))
         assert decide(breakdown.total_score) == lead.oracle_decision
         assert round(breakdown.total_score, 4) == lead.oracle_score

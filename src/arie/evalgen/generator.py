@@ -305,6 +305,26 @@ class _BandAllocator:
         return {b: round(c / self._total, 4) for b, c in sorted(self._counts.items())}
 
 
+def latent_facts(company: LatentCompany, person: LatentPerson) -> dict[str, Any]:
+    """Assemble complete ground-truth facts for a lead.
+
+    Deliberately the *only* place this mapping is written. The oracle, the
+    band-targeting sampler, and the tests all route through here — three
+    hand-maintained copies would eventually disagree, and a divergence would
+    make "agreement with the oracle" measure rule drift instead of acquisition
+    behaviour.
+    """
+    return {
+        "employee_count": company.employee_count,
+        "industry": company.industry,
+        "title_seniority": person.title_seniority,
+        "title_function": person.title_function,
+        "buying_intent": company.buying_intent,
+        "recent_trigger_event": company.recent_trigger_event,
+        "disqualifying_flag": company.disqualifying_flag,
+    }
+
+
 def _boundary_distance(score: float) -> float:
     """Distance to the nearest decision boundary."""
     return min(abs(score - QUALIFY_THRESHOLD), abs(score - REJECT_THRESHOLD))
@@ -342,7 +362,20 @@ def _generate_company(
     if disqualifying:
         industry = rng.choice(["software", "fintech"])
 
-    trigger = rng.choice(sorted(_TRIGGER_EVENTS)) if rng.random() < profile.trigger_prob else None
+    # Type B misleading construction: intent and a trigger event — both visible
+    # only to expensive providers — flip the true answer to "qualify" while the
+    # cheap tier sees an unremarkable lead.
+    type_b = cheap_misleads and not disqualifying
+
+    trigger: str | None
+    if type_b:
+        trigger = rng.choice(sorted(_TRIGGER_EVENTS))
+        buying_intent = rng.uniform(0.80, 1.0)
+    else:
+        trigger = (
+            rng.choice(sorted(_TRIGGER_EVENTS)) if rng.random() < profile.trigger_prob else None
+        )
+        buying_intent = rng.betavariate(2.0, 2.5)
 
     employee_count = max(1, min(20_000, round(rng.lognormvariate(mu=5.0, sigma=1.25))))
     if disqualifying:
@@ -356,6 +389,7 @@ def _generate_company(
         industry=industry,
         recent_trigger_event=trigger,
         disqualifying_flag=disqualifying,
+        buying_intent=round(buying_intent, 4),
         obscurity=round(obscurity, 4),
         name_variants=variants,
     )
@@ -367,6 +401,7 @@ def _generate_person(
     person_index: int,
     band: DifficultyBand,
     cheap_misleads: bool,
+    used_locals: set[str],
 ) -> LatentPerson:
     """Sample person attributes, steering the oracle score into the band.
 
@@ -377,8 +412,9 @@ def _generate_person(
     profile = _BAND_PROFILES[band]
     lo, hi = profile.boundary_distance
 
-    # Type B misleading construction: weak-looking cheap signals, but intent and
-    # a trigger event (both expensive-only) flip the true answer to "qualify".
+    # The company half of a Type B construction (high intent + trigger) is set
+    # in _generate_company. Here the person is kept deliberately unremarkable,
+    # so cheap evidence — which sees only title — reads the lead as weak.
     type_b = cheap_misleads and not company.disqualifying_flag
 
     best: tuple[float, LatentPerson] | None = None
@@ -387,23 +423,9 @@ def _generate_person(
         if type_b:
             seniority = rng.choice(["manager", "director"])
             function = rng.choice(["operations", "marketing", "finance"])
-            intent = rng.uniform(0.80, 1.0)
         else:
             seniority = rng.choice(sorted(_SENIORITY_LADDER))
             function = rng.choice(sorted(_FUNCTIONS))
-            intent = rng.betavariate(2.0, 2.5)
-
-        facts: dict[str, Any] = {
-            "employee_count": company.employee_count,
-            "industry": company.industry,
-            "title_seniority": seniority,
-            "title_function": function,
-            "buying_intent": intent,
-            "recent_trigger_event": company.recent_trigger_event,
-            "disqualifying_flag": company.disqualifying_flag,
-        }
-        score = score_facts(facts).total_score
-        distance = _boundary_distance(score)
 
         person = LatentPerson(
             person_id=f"{company.company_id}p{person_index:02d}",
@@ -412,8 +434,9 @@ def _generate_person(
             email="",  # filled below, once the name is settled
             title_seniority=seniority,
             title_function=function,
-            buying_intent=round(intent, 4),
         )
+        score = score_facts(latent_facts(company, person)).total_score
+        distance = _boundary_distance(score)
 
         # A disqualified company scores zero by rule, so boundary distance is
         # meaningless for it — accept immediately.
@@ -430,7 +453,19 @@ def _generate_person(
 
     assert best is not None
     person = best[1]
+
+    # Email is the canonical person key, so it must be unique. Two contacts at
+    # one company can independently draw the same name from a finite pool, and
+    # a duplicate would silently collapse two distinct people into one entity.
+    # Real directories disambiguate the same way.
     local = person.full_name.lower().replace(" ", ".")
+    if local in used_locals:
+        suffix = 2
+        while f"{local}{suffix}" in used_locals:
+            suffix += 1
+        local = f"{local}{suffix}"
+    used_locals.add(local)
+
     return LatentPerson(
         person_id=person.person_id,
         company_id=person.company_id,
@@ -438,7 +473,6 @@ def _generate_person(
         email=f"{local}@{company.canonical_domain}",
         title_seniority=person.title_seniority,
         title_function=person.title_function,
-        buying_intent=person.buying_intent,
     )
 
 
@@ -491,14 +525,20 @@ def _generate_observations(
         "industry": company.industry,
         "recent_trigger_event": company.recent_trigger_event,
         "disqualifying_flag": company.disqualifying_flag,
+        "buying_intent": company.buying_intent,
         "title_seniority": person.title_seniority,
         "title_function": person.title_function,
-        "buying_intent": person.buying_intent,
     }
 
     observations: dict[str, ProviderObservation] = {}
     for spec in CATALOG:
-        rng = _child_rng(seed, "obs", person.person_id, spec.name)
+        # Seed by the entity the provider actually describes, not by the lead.
+        # A company-scoped provider must return the SAME answer for every
+        # contact at that company — otherwise caching it would be lossy
+        # (contact B would receive contact A's draw) and full enrichment would
+        # get different answers from calling one company API twice.
+        scope = company.company_id if spec.entity_type == "company" else person.person_id
+        rng = _child_rng(seed, "obs", scope, spec.name)
         latency = _lognormal_latency(rng, spec.p50_latency_ms, spec.p95_latency_ms)
 
         if rng.random() < spec.failure_rate:
@@ -544,16 +584,7 @@ def _generate_observations(
 def _oracle(
     company: LatentCompany, person: LatentPerson
 ) -> tuple[Decision, float, dict[str, float]]:
-    facts: dict[str, Any] = {
-        "employee_count": company.employee_count,
-        "industry": company.industry,
-        "title_seniority": person.title_seniority,
-        "title_function": person.title_function,
-        "buying_intent": person.buying_intent,
-        "recent_trigger_event": company.recent_trigger_event,
-        "disqualifying_flag": company.disqualifying_flag,
-    }
-    breakdown = score_facts(facts)
+    breakdown = score_facts(latent_facts(company, person))
     return decide(breakdown.total_score), breakdown.total_score, breakdown.components
 
 
@@ -606,9 +637,14 @@ def generate_dataset(
 
             company = _generate_company(crng, company_index, band, misleads, ambiguous)
 
+            # Scoped per company: contacts are disambiguated against their own
+            # colleagues, and the sequence is deterministic because
+            # person_index ascends.
+            used_locals: set[str] = set()
+
             for person_index in range(n_contacts):
                 prng = _child_rng(seed, "person", company.company_id, str(person_index))
-                person = _generate_person(prng, company, person_index, band, misleads)
+                person = _generate_person(prng, company, person_index, band, misleads, used_locals)
                 observations = _generate_observations(seed, company, person)
                 decision, score, components = _oracle(company, person)
 

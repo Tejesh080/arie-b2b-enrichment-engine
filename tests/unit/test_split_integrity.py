@@ -55,6 +55,24 @@ def test_lead_ids_are_unique(leads: list[EvalLead]) -> None:
     assert len(ids) == len(set(ids))
 
 
+def test_person_emails_are_unique(leads: list[EvalLead]) -> None:
+    """Email is the canonical person key, so collisions merge distinct people.
+
+    Regression test: contacts at one company draw names from a finite pool and
+    two independently produced the same address, which silently collapsed them
+    into a single entity in the observation store.
+    """
+    emails = [x.person.email for x in leads]
+    duplicates = {e for e in emails if emails.count(e) > 1}
+    assert not duplicates, f"duplicate person emails: {sorted(duplicates)[:5]}"
+
+
+def test_company_domains_are_unique(leads: list[EvalLead]) -> None:
+    """The company analogue — domain is the canonical company key."""
+    domains = {x.company.company_id: x.company.canonical_domain for x in leads}
+    assert len(set(domains.values())) == len(domains)
+
+
 def test_multiple_contacts_share_companies(manifest: DatasetManifest) -> None:
     """Cache-hit opportunity must actually exist.
 
