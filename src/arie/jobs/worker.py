@@ -1,13 +1,13 @@
 """The worker loop — claims jobs and runs them to completion, atomically.
 
-No real handlers are registered here yet. Wiring `compute_score` /
-`fetch_evidence` / `integrate_evidence` / `finalize_decision` to real logic
-(the scoring engine, real provider adapters, `CalibratedBoundsPolicy`) is
-deliberately deferred — see `arie.statemachine.transitions`'s module
-docstring for why. What this module guarantees today: whatever a handler
-does, its effect on the lead and the job's own bookkeeping commit together or
-not at all, and a handler that raises is retried with backoff and eventually
-dead-lettered, uniformly, regardless of what job_type it was.
+Production handlers live in `arie.jobs.handlers` and are wired in by
+`main()`: `compute_score` runs `CalibratedBoundsPolicy` over the simulated
+provider registry and drives the lead through the state graph itself — see
+that module's docstring for why it is one handler rather than four. This
+module stays agnostic about what handlers do; what it guarantees is that
+whatever a handler does, its effect on the lead and the job's own bookkeeping
+commit together or not at all, and a handler that raises is retried with
+backoff and eventually dead-lettered, uniformly, regardless of job_type.
 
 Since M1 Step 9 it also continues the trace that created the job. `jobs.trace_context`
 carries the W3C context captured when the ingestion request enqueued the work,
@@ -252,11 +252,19 @@ def main() -> int:
     configure_tracing()
     pool = ConnectionPool(DATABASE.url, min_size=1, max_size=5, open=True)
     queue = PostgresJobQueue(pool)
-    handlers: dict[str, JobHandler] = {}  # real handlers not wired yet — see module docstring
+
+    # Imported here, not at module top: build_handlers pulls in the dataset
+    # generator and the sklearn fitting stack, which nothing else touching
+    # this module (tests, the API process) should pay for.
+    from arie.jobs.handlers import build_handlers
+
+    print("Building enrichment runtime (seeded dataset + confidence model refit)…")
+    handlers = build_handlers(pool)
 
     print(
         f"Worker starting (poll interval {RUNTIME.worker_poll_interval_sec}s, "
-        f"{len(handlers)} handler(s) registered). Ctrl-C to stop."
+        f"{len(handlers)} handler(s) registered: {', '.join(sorted(handlers))}). "
+        "Ctrl-C to stop."
     )
     try:
         while True:

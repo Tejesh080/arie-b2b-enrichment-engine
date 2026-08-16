@@ -27,6 +27,24 @@ services:
       timeout: 3s
       retries: 10
 
+  # One-shot: applies migrations/ via the canonical runner (scripts/migrate.py,
+  # checksum-guarded schema_migrations — the ONLY path that writes schema, per
+  # ADR 0005) and exits. api and worker gate on it having *completed*, not just
+  # started, which is what fixes the clean-start crash where workers raced the
+  # schema into existence ('relation "jobs" does not exist'). Idempotent by
+  # construction, so restarting the stack re-runs it as a no-op.
+  migrate:
+    build: .
+    command: python scripts/migrate.py
+    environment:
+      DATABASE_URL: postgresql://arie:arie_local_dev@db:5432/arie
+      # Locally the "direct" and pooled connections are the same Postgres;
+      # the distinction only matters against Supabase's pooler.
+      DATABASE_DIRECT_URL: postgresql://arie:arie_local_dev@db:5432/arie
+    depends_on:
+      db:
+        condition: service_healthy
+
   api:
     build: .
     command: uvicorn arie.api.main:app --host 0.0.0.0 --port 8000
@@ -38,6 +56,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   worker:
     build: .
@@ -48,6 +68,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     # Workers are stateless and claim jobs via SKIP LOCKED, so this scales
     # horizontally with no coordination.
     deploy:

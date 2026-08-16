@@ -112,8 +112,8 @@ regression test.
                           jobs.trace_context carries the
                           W3C trace across the process boundary
                                       v
-                          Worker (SKIP LOCKED queue)      [M1, mechanism built,
-                                      |                    handlers deferred]
+                          Worker (SKIP LOCKED queue)      [M1, BUILT — runs the
+                                      |                    policy, simulated mode]
   +-----------------------------------+----------------------------+
   |                    M0 - BUILT AND MEASURED                      |
   |                                                                 |
@@ -130,15 +130,18 @@ regression test.
    above yet. Delta vs. a deterministic baseline: bench/llm_signal_eval.py
 ```
 
-M0 — the intelligence engine and its benchmark — is complete. M1 is partly
-built: schema and migrations, evidence store, identity resolution, the job
-queue and transactional state machine, the ingestion API, cost ledger,
-end-to-end tracing, LLM signal extraction, a human review API, and now the
-n8n edge workflows. **The worker still has no real handlers** — nothing yet
-calls `CalibratedBoundsPolicy` in production, nothing yet calls `arie.llm`,
-and nothing yet calls `arie.approval.workflow.request_review` either, all on
-purpose. See [the handoff](docs/06-m1-handoff.md) for exactly what is and
-isn't wired.
+M0 — the intelligence engine and its benchmark — is complete. M1 is built
+through the worker: schema and migrations, evidence store, identity
+resolution, the job queue and transactional state machine, the ingestion API,
+cost ledger, end-to-end tracing, LLM signal extraction, a human review API,
+the n8n edge workflows — and the worker handler that composes them.
+`CalibratedBoundsPolicy` now runs in production (over the simulated provider
+registry — no real vendor adapter exists yet, so only identities from the
+frozen eval corpus can be enriched), buying evidence into the durable store,
+ledgering every call, and escalating low-confidence decisions through
+`request_review`. `arie.llm` alone remains uncalled by the worker — ingestion
+carries no free-text field for it to extract from yet. See
+[the handoff](docs/06-m1-handoff.md) for exactly what is and isn't wired.
 
 **Deliberately rejected**, with reasons in [`docs/adr/`](docs/adr/): LangGraph
 (the loop is a calculation, not agentic reasoning), Temporal (single-service
@@ -212,25 +215,34 @@ In the n8n UI: **Workflows → Import from File** for each of the three JSON
 files above, then open each one and click **Activate** (n8n serves an
 inactive workflow's webhook only while its editor tab is open and listening).
 
+The demo identity below is a real person in the frozen eval corpus (seed 42),
+which matters: the workers run in `PROVIDER_MODE=simulated`, where the only
+data source is the corpus's frozen observations — an identity outside it has
+nothing to enrich from, and its job retries then dead-letters with a message
+saying exactly that.
+
 ```bash
 curl -X POST http://localhost:5678/webhook/lead-ingest \
   -H "Content-Type: application/json" \
-  -d '{"source": "landing-page", "email": "ada@acme.test", "external_ref": "demo-1"}'
+  -d '{"source": "landing-page", "email": "nadia.delacroix@lumen500.com", "company_domain": "lumen500.com", "full_name": "Nadia Delacroix", "external_ref": "demo-1"}'
 # -> {"lead_id": "...", "status": "NEW", "created": true, "job_id": "...", ...}
 
+# Within a few seconds a worker claims the job, runs the policy, and the lead
+# lands in AUTO_ROUTED (7 provider calls, ~$0.41 simulated spend). Then:
 curl -X POST http://localhost:5678/webhook/outcome-sync \
   -H "Content-Type: application/json" \
   -d '{"lead_id": "<the lead_id from above>"}'
-# -> {"synced": false, "reason": "lead not finalized", "status": "NEW"} today,
-#    since the worker has no handlers registered yet (see docs/06-m1-handoff.md)
-#    and nothing advances a lead past NEW. For a local demo of the synced path,
-#    move a lead there directly: UPDATE leads SET status = 'AUTO_ROUTED' WHERE
-#    lead_id = '...'; — outcome-sync then reaches the mock sink and its
-#    execution log shows the CRM-shaped payload it "wrote".
+# -> {"synced": true, "sink_status": 200, ...} — the mock sink's execution log
+#    in n8n shows the CRM-shaped payload it received. Calling outcome-sync
+#    before the worker has finished returns {"synced": false, "reason": "lead
+#    not finalized"} — poll GET /leads/{id} or just retry a moment later.
 ```
 
 Redelivering the same ingestion payload is safe — that's ARIE's `(source,
-external_ref)` uniqueness doing the work, not anything n8n does.
+external_ref)` uniqueness doing the work, not anything n8n does. And on a
+completely fresh clone, `docker compose --profile n8n up -d` needs no manual
+migration step: a one-shot `migrate` service applies `migrations/` via the
+canonical runner before the API or workers are allowed to start.
 
 ---
 

@@ -17,12 +17,11 @@ Step 8, extended in Step 11) — a linear scaffold connecting ``NEW`` through
 ``CalibratedBoundsPolicy``'s actual adaptive
 score/fetch-evidence loop, which decides whether to keep buying evidence from
 bounds and confidence computed over evidence *content* — information a bare
-``LeadStatus`` label can't carry, and real provider adapters this module has
-no dependency on. Wiring real handlers (scoring, evidence fetching, the
-policy itself) behind ``SCORING``/``FETCHING_EVIDENCE``/``INTEGRATING`` is
-future work, deliberately deferred — see docs/06-m1-handoff.md's suggested
-order, item 5. What this module guarantees today is that the graph, however
-it ends up populated, transitions safely and atomically; see
+``LeadStatus`` label can't carry. That loop runs in ``arie.jobs.handlers``'
+one ``compute_score`` handler, which walks a lead through this scaffold's
+statuses itself rather than splitting the calculation across four job types —
+see that module's docstring for the argument. What this module guarantees is
+that the graph, however it is driven, transitions safely and atomically; see
 ``arie.statemachine.apply``.
 """
 

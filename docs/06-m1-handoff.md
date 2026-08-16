@@ -28,16 +28,20 @@ baseline on the 26-sample corpus — exact-match accuracy 46.2% -> 73.1%
 or retries across all 26 calls. `bench/out/llm_signal_eval.json` has the full
 per-field breakdown.
 
-**Nothing yet calls `CalibratedBoundsPolicy` in production, nothing yet calls
-`arie.llm`, and nothing yet calls `arie.approval.workflow.request_review`
-either.** All three are true for the same reason. There is now a request path
-that creates leads and queues work for them, a tested LLM extraction module,
-and a tested human-review API — all three could be called from a handler, but
-`arie.jobs.worker.main()` runs with zero handlers registered, so every job
-still fails with "no handler registered" and correctly retries then
-dead-letters. Wiring real handlers — scoring, evidence fetching, the policy,
-signal extraction, *and* escalating to a human — is one piece of future work,
-not several, and it still needs provider adapters that do not exist yet.
+**`CalibratedBoundsPolicy` and `request_review` now run in production;
+`arie.llm` still does not.** The Step 12 runtime fix (found by actually
+booting the Compose stack, not by tests) wired `arie.jobs.handlers` into
+`arie.jobs.worker.main()`: `compute_score` looks the ingested lead up in the
+frozen corpus, runs the policy over the simulated registry with a
+write-through durable evidence cache and cost ledger, walks the lead through
+the state graph inside the work transaction, persists a `scores` row, and
+either lands the lead in `AUTO_ROUTED`/`SYNCED` or escalates via
+`request_review`. Two boundaries to keep in mind: **only corpus identities
+can be enriched** (simulated providers replay frozen observations; anything
+else retries then dead-letters with a message saying so — the honest shape of
+"production" until a real vendor adapter exists), and **`arie.llm` remains
+uncalled** because ingestion carries no free-text field to extract from —
+adding one is its own decision, not an oversight here.
 
 Read [`05-results.md`](05-results.md) before writing code. The single most
 important thing to absorb: **the sophisticated policy lost to the simple one.**
@@ -226,19 +230,27 @@ interface.
    and processing are deliberately two transactions (claim commits fast so
    `SKIP LOCKED` stays cheap for other workers; the work transaction is where
    completion and the lead's state transition commit together).
-5. **Partially done — state machine mechanism built, real handlers not wired.**
-   `arie.statemachine` gives a pure `next_status`/`job_type_for` graph
-   (`NEW → SCORING → FETCHING_EVIDENCE → INTEGRATING → DECISION → …`) and
-   `apply_transition` (optimistic concurrency on `leads.version`, atomic with
-   job completion via `arie.jobs.worker.run_worker_cycle`). What's *not* done:
-   the graph is a linear scaffold, not `CalibratedBoundsPolicy`'s real
-   score/fetch-evidence loop (that loop reads evidence *content*, not just a
-   status label, and needs real provider adapters this scaffold has no
-   dependency on). `arie.jobs.worker.main()` runs today with zero handlers
-   registered — wiring real handlers (scoring, evidence fetching, the policy
-   itself) behind the job types `next_status` already names is **still the
-   biggest single gap in M1**, and step 6 has now removed the excuse: there is
-   a request path creating leads with work queued against them.
+5. ✅ **State machine + production handler — the "biggest single gap" is
+   closed** (Step 12 runtime fix). `arie.statemachine` gives the pure
+   `next_status`/`job_type_for` graph and `apply_transition` (optimistic
+   concurrency on `leads.version`, atomic with job completion);
+   `arie.jobs.handlers.build_handlers` now populates it. Design worth reading
+   before touching (`arie.jobs.handlers`' module docstring has the full
+   argument): **one handler, not four.** The policy's score/buy/score loop is
+   a single calculation that reads evidence content to decide whether to keep
+   buying (ADR 0001), so `compute_score` runs the whole pipeline and walks the
+   lead `NEW → SCORING → FETCHING_EVIDENCE → INTEGRATING → DECISION → branch`
+   itself, one audited `apply_transition` per hop, all inside the one work
+   transaction — the other three job types stay unclaimed on purpose, and the
+   worker's no-handler path dead-letters them loudly if anything ever enqueues
+   one. Evidence and ledger writes go through write-through subclasses of the
+   benchmark's own `EvidenceCache`/`CallLedger` (durable-cache hits are
+   provider-keyed, exactly the benchmark's semantics; ledger idempotency keys
+   derive from the job id, so a crashed-and-retried job reproduces its keys,
+   can't double-charge, and gets served from the evidence its first attempt
+   already persisted). The worker fits the confidence model at startup —
+   refit, never pickled — and refuses `PROVIDER_MODE=live` outright since no
+   real adapter exists.
 
    Since step 9, `run_worker_cycle` also takes an optional `job_types` filter,
    for running a pool dedicated to one kind of work. It deliberately does *not*
@@ -325,11 +337,11 @@ interface.
     the existing `human_reviews` table, plus a second outcome-branching node
     in the state graph. Three things worth knowing before touching it:
 
-    **`request_review` is built and tested but not called by anything yet** —
-    the same posture Step 10 took with `arie.llm`. There is still no
-    `finalize_decision` handler to call it from (see item 5 above); once one
-    exists, escalating a lead is `request_review(conn, lead_id=...,
-    expected_version=..., original_decision=...)`, atomically transitioning
+    **`request_review` is now called in production** — `compute_score`'s
+    escalation branch (item 5 above) invokes it for every non-autonomous
+    decision and every decision the policy itself labels `escalate_human`:
+    `request_review(conn, lead_id=..., expected_version=...,
+    original_decision=str(outcome.decision))`, atomically transitioning
     DECISION -> AWAITING_HUMAN and opening the pending `human_reviews` row in
     the same transaction — a crash between the two would otherwise strand a
     lead in AWAITING_HUMAN with nothing for a reviewer to act on.
@@ -491,7 +503,8 @@ Running the service locally:
 
 ```bash
 make serve    # uvicorn arie.api.main:app --reload --port 8000
-make worker   # python -m arie.jobs.worker  (still zero handlers registered)
+make worker   # python -m arie.jobs.worker  (fits the confidence model at boot,
+              # then registers compute_score — simulated providers only)
 ```
 
 CI runs the benchmark on every push with zero credentials. If a change to

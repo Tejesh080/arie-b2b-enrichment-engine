@@ -35,6 +35,7 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.10",
     "pandas-stubs",
+    "types-PyYAML",  # PyYAML itself arrives via uvicorn[standard]; the compose-contract test parses docker-compose.yml
 ]
 
 [project.scripts]

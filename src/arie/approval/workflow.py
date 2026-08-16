@@ -11,10 +11,10 @@ identity resolution, the lead row, and its first job into one commit.
 Two entry points:
 
 - `request_review` — moves a lead DECISION -> AWAITING_HUMAN and opens the
-  pending `human_reviews` row atomically. Nothing calls this today (there is
-  no `finalize_decision` handler yet — see docs/06-m1-handoff.md's "suggested
-  order", item 5), but it is built and tested standalone, the same posture
-  Step 10 took with `arie.llm` before a handler existed to call it either.
+  pending `human_reviews` row atomically. Called in production by
+  `arie.jobs.handlers`' compute_score handler, whose escalation branch is
+  exactly this: a non-autonomous decision (or one the policy itself labelled
+  escalate_human) becomes a pending review in the same work transaction.
 - `submit_decision` — the human's answer. See its docstring for the
   idempotency and conflict-safety guarantees, which are the point of this
   module.

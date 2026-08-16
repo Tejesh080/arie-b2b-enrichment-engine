@@ -1,0 +1,138 @@
+"""The handler registry and its pure parts — no database, no network.
+
+The registration test is the one that pins the Step 12 runtime fix: a worker
+that boots with zero handlers processes nothing, and nothing else in the
+suite would notice, because every other test hands `run_worker_cycle` its own
+handlers. The full pipeline behaviour lives in
+tests/integration/test_pipeline_integration.py.
+"""
+
+from __future__ import annotations
+
+import pytest
+from psycopg_pool import ConnectionPool
+
+from arie.core.types import Decision, LeadStatus
+from arie.evalgen.schema import EvalLead
+from arie.jobs.handlers import (
+    SimulatedEnrichmentRuntime,
+    UnknownCorpusIdentityError,
+    UnsupportedProviderModeError,
+    build_handlers,
+    build_runtime,
+    decision_route,
+)
+from arie.statemachine.transitions import job_type_for
+
+
+@pytest.fixture(scope="module")
+def runtime(leads: list[EvalLead]) -> SimulatedEnrichmentRuntime:
+    """Built from the session dataset so the model is fitted once per module."""
+    return build_runtime(leads=leads)
+
+
+@pytest.fixture(scope="module")
+def unopened_pool() -> ConnectionPool:
+    """A pool that never connects — handler construction must not need a database."""
+    return ConnectionPool("dbname=never_connected", open=False)
+
+
+# ------------------------------------------------------------ registration --
+
+
+def test_the_ingestion_entry_job_type_has_a_handler(
+    runtime: SimulatedEnrichmentRuntime, unopened_pool: ConnectionPool
+) -> None:
+    """`POST /leads` enqueues exactly one job type; a worker booted from
+    build_handlers must be able to claim and process it. This is the
+    regression test for the boot path that shipped with zero handlers."""
+    handlers = build_handlers(unopened_pool, runtime=runtime, provider_mode="simulated")
+
+    entry_job_type = job_type_for(LeadStatus.NEW)
+    assert entry_job_type is not None
+    assert entry_job_type in handlers
+    assert len(handlers) >= 1
+
+
+def test_every_registered_handler_names_a_job_type_the_graph_defines(
+    runtime: SimulatedEnrichmentRuntime, unopened_pool: ConnectionPool
+) -> None:
+    """A handler for a job type nothing can enqueue would be dead code wearing
+    a registration."""
+    handlers = build_handlers(unopened_pool, runtime=runtime, provider_mode="simulated")
+
+    graph_job_types = {
+        job_type for status in LeadStatus if (job_type := job_type_for(status)) is not None
+    }
+    assert set(handlers) <= graph_job_types
+
+
+def test_live_provider_mode_is_refused_loudly(
+    runtime: SimulatedEnrichmentRuntime, unopened_pool: ConnectionPool
+) -> None:
+    """No real provider adapter exists (ADR 0003). A worker silently falling
+    back to the simulator would report coverage for vendors it never called."""
+    with pytest.raises(UnsupportedProviderModeError):
+        build_handlers(unopened_pool, runtime=runtime, provider_mode="live")
+
+
+# ----------------------------------------------------------- corpus lookup --
+
+
+def test_a_corpus_identity_resolves_to_its_own_lead(
+    runtime: SimulatedEnrichmentRuntime, leads: list[EvalLead]
+) -> None:
+    sample = leads[0]
+    found = runtime.corpus_lead_for(sample.person.email, sample.company.canonical_domain)
+    assert found.person.email == sample.person.email
+    assert found.company.canonical_domain == sample.company.canonical_domain
+
+
+def test_an_unknown_identity_raises_with_an_actionable_message(
+    runtime: SimulatedEnrichmentRuntime,
+) -> None:
+    with pytest.raises(UnknownCorpusIdentityError) as exc_info:
+        runtime.corpus_lead_for("nobody@not-in-the-corpus.test", "not-in-the-corpus.test")
+    assert "frozen eval corpus" in str(exc_info.value)
+
+
+def test_an_email_at_the_wrong_company_is_rejected(
+    runtime: SimulatedEnrichmentRuntime, leads: list[EvalLead]
+) -> None:
+    """A corpus person whose ingested lead resolved to a different company
+    would replay another company's observations — refuse, don't guess."""
+    sample = leads[0]
+    with pytest.raises(UnknownCorpusIdentityError):
+        runtime.corpus_lead_for(sample.person.email, "some-other-company.test")
+
+
+def test_a_missing_db_domain_does_not_block_the_corpus_match(
+    runtime: SimulatedEnrichmentRuntime, leads: list[EvalLead]
+) -> None:
+    """`companies.canonical_domain` is nullable; an email match alone is
+    sufficient when there is no domain to cross-check."""
+    sample = leads[0]
+    found = runtime.corpus_lead_for(sample.person.email, None)
+    assert found.person.email == sample.person.email
+
+
+# ---------------------------------------------------------- decision route --
+
+
+@pytest.mark.parametrize(
+    ("decision", "autonomous", "expected"),
+    [
+        (Decision.AUTO_ROUTE, True, "auto_route"),
+        (Decision.REJECT, True, "reject"),
+        # The policy itself concluding "a human should look" escalates even
+        # when it is confident about that conclusion.
+        (Decision.ESCALATE_HUMAN, True, "escalate_human"),
+        # Below tau, *every* decision escalates — autonomy is gated on
+        # calibrated confidence, never on the decision label or is_settled.
+        (Decision.AUTO_ROUTE, False, "escalate_human"),
+        (Decision.REJECT, False, "escalate_human"),
+        (Decision.ESCALATE_HUMAN, False, "escalate_human"),
+    ],
+)
+def test_decision_route(decision: Decision, autonomous: bool, expected: str) -> None:
+    assert decision_route(decision, autonomous) == expected
