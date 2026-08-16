@@ -181,6 +181,10 @@ src/arie/
     baselines.py         full enrichment, tuned waterfall
     adaptive.py          EVoI - negative result, retained
     escalation_aware.py  EVoI + human-review pricing - also negative
+  evidence/      PostgresEvidenceStore - TTL/cache semantics (M1)
+  identity/      deterministic company/person resolution (M1)
+  jobs/          Postgres job queue - SKIP LOCKED, backoff, dead-letter (M1)
+  statemachine/  pure transition graph + atomic apply_transition (M1)
 bench/           harness, metrics, cost model, seed sweep
 migrations/      numbered SQL (M1) - source of truth, applied via scripts/migrate.py
 supabase/        migrations/ mirror (generated) + config, for GitHub Branching PR previews

@@ -10,8 +10,12 @@ Written to be read cold, in a fresh session, with no memory of how M0 went.
 result is published — including the part that failed. Everything runs offline
 and deterministically; no credentials, no network.
 
-**M1 has not started.** No database has been provisioned, no service written, no
-n8n workflow built.
+**M1 Steps 6–8 are complete and verified against the live production Supabase
+database** (schema/migrations/evidence store, identity resolution, job
+queue/state machine). Step 9 (FastAPI ingest) has not started — see
+"Suggested order" below for exactly what's built versus deferred within each
+completed step; none of them wire up real provider adapters or
+`CalibratedBoundsPolicy` yet, on purpose.
 
 Read [`05-results.md`](05-results.md) before writing code. The single most
 important thing to absorb: **the sophisticated policy lost to the simple one.**
@@ -86,18 +90,18 @@ company-level evidence store.
 
 ## Schema already written
 
-`migrations/0001_init.sql`, `0002_metrics_views.sql`, and
-`0003_identity_resolution.sql` exist and have been run against the live
-production Supabase database (Steps 6–7) — one real bug was found and fixed
-doing so: `evidence.expires_at` couldn't be a `GENERATED` column because
-`timestamptz + interval` is STABLE, not IMMUTABLE (see the migration's own
-comment). `migrations/` is the source of truth and the only path that touches
-production, via `scripts/migrate.py`. `supabase/migrations/` is a generated
-mirror kept in sync by `scripts/sync_supabase_migrations.py` and CI, added so
-Supabase's GitHub Branching provisions PR preview databases with the same
-schema — see [ADR 0005](adr/0005-migration-source-of-truth.md) for why both
-directories exist and why production deploys still go through neither
-Branching nor the Supabase CLI.
+`migrations/0001_init.sql` through `0004_job_queue_lease_index.sql` exist and
+have been run against the live production Supabase database (Steps 6–8) — one
+real bug was found and fixed doing so: `evidence.expires_at` couldn't be a
+`GENERATED` column because `timestamptz + interval` is STABLE, not IMMUTABLE
+(see the migration's own comment). `migrations/` is the source of truth and
+the only path that touches production, via `scripts/migrate.py`.
+`supabase/migrations/` is a generated mirror kept in sync by
+`scripts/sync_supabase_migrations.py` and CI, added so Supabase's GitHub
+Branching provisions PR preview databases with the same schema — see
+[ADR 0005](adr/0005-migration-source-of-truth.md) for why both directories
+exist and why production deploys still go through neither Branching nor the
+Supabase CLI.
 
 Design notes worth honouring:
 
@@ -118,19 +122,42 @@ interface.
 
 ## Suggested order
 
-1. **Supabase + migrations.** Run `0001`/`0002` for real. Use the *pooled*
-   connection string for workers, direct only for migrations.
-2. **Evidence store with TTL**, replacing `EvidenceCache`. This is the cache, and
-   it is where the company-level cost saving actually lives.
-3. **Identity resolution** — deterministic domain/email normalisation only.
-   Splink is deferred; the ambiguous-identity subset in the dataset exists to
-   tell you whether exact matching is failing enough to justify it. Measure
-   before adding it.
-4. **Job queue** — `SKIP LOCKED`, backoff, dead-letter. Claim the job and commit
-   the lead's state transition in *one* transaction; that is the whole reason
-   Postgres was chosen over Redis ([ADR 0002](adr/0002-postgres-queue-not-temporal-or-redis.md)).
-5. **State machine + worker** running `CalibratedBoundsPolicy`.
-6. **FastAPI ingest**, one `POST /leads`.
+1. ✅ **Supabase + migrations.** `0001`/`0002` ran for real. Pooled connection
+   string for workers, direct for migrations — *except* the plain direct-connect
+   host turned out to be IPv6-only and unreachable from the dev machine used so
+   far; the Session Pooler (port 5432) stood in for both. See "Environment"
+   below before assuming `DATABASE_DIRECT_URL` will just work.
+2. ✅ **Evidence store with TTL**, replacing `EvidenceCache` for real DB use —
+   `arie.evidence.store.PostgresEvidenceStore`. Note it is *not* wired into
+   `RunContext`/the policy loop; that's still ahead, once there's a worker
+   handler that actually needs it (see step 5 below).
+3. ✅ **Identity resolution** — `arie.identity`, deterministic domain/email
+   normalisation, exact-match only. Measured live against the dataset's
+   ambiguous-identity subset: **0% failure, 0 false merges**. Splink is not
+   currently justified — do not add it on spec.
+4. ✅ **Job queue** — `arie.jobs`, `SKIP LOCKED`, exponential backoff + full
+   jitter, dead-letter (including lease-expiry reclaim counting toward the
+   attempt budget, so a hard-crashed worker's job still terminates). Claiming
+   and processing are deliberately two transactions (claim commits fast so
+   `SKIP LOCKED` stays cheap for other workers; the work transaction is where
+   completion and the lead's state transition commit together).
+5. **Partially done — state machine mechanism built, real handlers not wired.**
+   `arie.statemachine` gives a pure `next_status`/`job_type_for` graph
+   (`NEW → SCORING → FETCHING_EVIDENCE → INTEGRATING → DECISION → …`) and
+   `apply_transition` (optimistic concurrency on `leads.version`, atomic with
+   job completion via `arie.jobs.worker.run_worker_cycle`). What's *not* done:
+   the graph is a linear scaffold, not `CalibratedBoundsPolicy`'s real
+   score/fetch-evidence loop (that loop reads evidence *content*, not just a
+   status label, and needs real provider adapters this scaffold has no
+   dependency on). `arie.jobs.worker.main()` runs today with zero handlers
+   registered — wiring real handlers (scoring, evidence fetching, the policy
+   itself) behind the job types `next_status` already names is the next real
+   step, once step 6 gives a way to create leads with something to work on.
+6. **FastAPI ingest**, one `POST /leads`. Not started. This is also where
+   identity resolution actually gets called for the first time in the request
+   path — `leads` currently only carries resolved `person_id`/`company_id`,
+   not raw inbound fields, so ingestion is what decides how raw lead data
+   becomes those IDs.
 7. **Cost ledger + metric views** — `0002_metrics_views.sql` is already written.
 8. **LLM signal extraction** (DeepSeek), one narrow task: buying signals from
    free text. Measure it as a delta against the deterministic baseline. If it
@@ -156,10 +183,18 @@ interface.
 ## Guard rails to keep green
 
 ```bash
-make lint && make type && make test    # ruff, mypy --strict, 162 tests
-make validate-dataset                  # dataset must stay non-trivial
-python -m bench.multi_seed             # ~10 min; run before claiming an improvement
+make lint && make type && make test     # ruff, mypy --strict, unit tests (no DB, no network)
+make check-supabase-migrations          # supabase/migrations/ must match migrations/ — see ADR 0005
+make validate-dataset                   # dataset must stay non-trivial
+python -m bench.multi_seed              # ~10 min; run before claiming an improvement
 ```
+
+`make test` runs offline; it does not exercise anything in `arie.evidence`,
+`arie.identity`, or `arie.jobs`/`arie.statemachine` against a real database —
+that needs `make test-all` with `DATABASE_URL`/`DATABASE_DIRECT_URL` set,
+which is opt-in specifically because it writes to whatever database those
+point at (see `tests/integration/conftest.py`'s own warning). Don't infer
+"the M1 pieces are covered" from a green `make test` alone.
 
 CI runs the benchmark on every push with zero credentials. If a change to
 scoring, confidence, or the policy moves the numbers, that is a result and
@@ -173,15 +208,31 @@ longer comparable.
 
 ## Environment
 
-- Supabase project `phkytiiwrkhuyedhkfrd`, MCP server registered in `.mcp.json`
-  at project scope. OAuth must be completed interactively (`claude` then `/mcp`)
-  — it cannot be done from a non-interactive session.
+- Supabase project `lobsbijgazlpurymxynd` (region `ap-northeast-2`), MCP server
+  registered in `.mcp.json` at project scope. OAuth must be completed
+  interactively (`claude` then `/mcp`) — it cannot be done from a
+  non-interactive session; all live-DB work through Step 8 has gone through
+  direct `psycopg` connections instead (`scripts/migrate.py`,
+  `arie.evidence.store`, `arie.identity.resolver`, `arie.jobs.queue`).
+- **The plain direct-connection host is IPv6-only.** `db.<ref>.supabase.co` has
+  no IPv4 (A) record on this project; a dev machine without outbound IPv6
+  cannot reach it (confirmed via `nslookup`/`getaddrinfo`, not assumed). Use
+  the **Session Pooler** instead —
+  `postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres`
+  — for both `DATABASE_URL` and `DATABASE_DIRECT_URL` until a worker actually
+  needs the Transaction Pooler (port 6543) for concurrent-connection headroom,
+  at which point the connection pool needs `prepare_threshold=None`:
+  psycopg3's default server-side auto-prepare is unsafe under pgbouncer's
+  transaction-mode pooling (a prepared statement can outlive the backend
+  connection pgbouncer handed it).
 - DeepSeek API key available. Anthropic/OpenAI not confirmed.
 - n8n connected via MCP.
 - Firecrawl key to be provided.
 - `gh` CLI is **not** installed; push over HTTPS with the existing git remote.
-- Python 3.11, venv at `.venv/`. Note `mypy` cannot follow numpy's stubs on 3.11
-  — already handled via a `follow_imports = "skip"` override in `pyproject.toml`.
+- Python 3.11 target (`pyproject.toml`); this environment's dev venv actually
+  runs 3.14, which is why `mypy` cannot follow numpy's stubs (3.12-only `type`
+  statement syntax) — already handled via a `follow_imports = "skip"`
+  override in `pyproject.toml`.
 
 ---
 

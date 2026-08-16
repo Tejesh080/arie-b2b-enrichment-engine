@@ -99,6 +99,16 @@ class RuntimeConfig:
         default_factory=lambda: _env_int("WORKER_POLL_INTERVAL_SEC", 2)
     )
     worker_max_attempts: int = field(default_factory=lambda: _env_int("WORKER_MAX_ATTEMPTS", 4))
+    worker_lease_seconds: int = field(default_factory=lambda: _env_int("WORKER_LEASE_SECONDS", 300))
+    """How long a claimed job stays locked before another worker may reclaim it.
+
+    Protects against a worker that crashes or is killed mid-job: without this,
+    a job claimed by a dead worker would stay `processing` forever. Five
+    minutes is generous relative to expected job duration (no real handler
+    calls a network provider yet — see arie.jobs.worker) and cheap to widen
+    later; the failure mode of too-short a lease (two workers both process the
+    same job) is worse than the failure mode of too-long one (a dead worker's
+    job waits a few extra minutes to be reclaimed)."""
 
 
 # Module-level singletons for convenience. Construct fresh instances directly

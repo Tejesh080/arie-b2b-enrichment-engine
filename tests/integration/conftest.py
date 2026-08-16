@@ -13,7 +13,7 @@ Supabase branch, not a database you'd mind resetting.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from uuid import UUID
 
@@ -25,6 +25,7 @@ from scripts.migrate import migrate
 from arie.config import DatabaseConfig
 from arie.evidence.store import PostgresEvidenceStore
 from arie.identity.resolver import IdentityResolver
+from arie.jobs.queue import PostgresJobQueue
 
 
 def _database_config() -> DatabaseConfig:
@@ -126,3 +127,73 @@ def cleanup_identity(db_conn: psycopg.Connection) -> Iterator[IdentityCleanup]:
                 (tracker.company_names,),
             )
     db_conn.commit()
+
+
+@pytest.fixture
+def job_queue(migrated_database: str) -> Iterator[PostgresJobQueue]:
+    pool = ConnectionPool(migrated_database, min_size=1, max_size=8, open=True)
+    queue = PostgresJobQueue(pool)
+    try:
+        yield queue
+    finally:
+        queue.close()
+
+
+@pytest.fixture
+def worker_pool(migrated_database: str) -> Iterator[ConnectionPool]:
+    """A standalone pool for arie.jobs.worker's `pool` argument.
+
+    Separate from `job_queue`'s internal pool on purpose — in real use the
+    worker's transaction pool and the queue's claim/complete/fail pool are the
+    same physical database but there's no requirement they share a Python
+    pool object, and keeping them distinct here catches any accidental
+    coupling between the two.
+    """
+    pool = ConnectionPool(migrated_database, min_size=1, max_size=8, open=True)
+    try:
+        yield pool
+    finally:
+        pool.close()
+
+
+@pytest.fixture
+def cleanup_leads(db_conn: psycopg.Connection) -> Iterator[list[UUID]]:
+    """Deletes leads (and, via ON DELETE CASCADE, their jobs and lead_events)."""
+    lead_ids: list[UUID] = []
+    yield lead_ids
+    if lead_ids:
+        with db_conn.cursor() as cur:
+            cur.execute("DELETE FROM leads WHERE lead_id = ANY(%s)", (lead_ids,))
+        db_conn.commit()
+
+
+@pytest.fixture
+def cleanup_jobs(db_conn: psycopg.Connection) -> Iterator[list[UUID]]:
+    """For jobs with no lead_id — lead-linked jobs are cleaned up via cleanup_leads' cascade."""
+    job_ids: list[UUID] = []
+    yield job_ids
+    if job_ids:
+        with db_conn.cursor() as cur:
+            cur.execute("DELETE FROM jobs WHERE job_id = ANY(%s)", (job_ids,))
+        db_conn.commit()
+
+
+@pytest.fixture
+def make_lead(
+    db_conn: psycopg.Connection, cleanup_leads: list[UUID]
+) -> Callable[[], tuple[UUID, int]]:
+    """Factory for a minimal lead row. Returns (lead_id, version); registers for cleanup."""
+
+    def _make(*, source: str = "test") -> tuple[UUID, int]:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO leads (source) VALUES (%s) RETURNING lead_id, version", (source,)
+            )
+            row = cur.fetchone()
+            assert row is not None
+        db_conn.commit()
+        lead_id, version = row
+        cleanup_leads.append(lead_id)
+        return lead_id, version
+
+    return _make
