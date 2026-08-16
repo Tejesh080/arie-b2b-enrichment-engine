@@ -80,10 +80,27 @@ CREATE TABLE IF NOT EXISTS evidence (
     effect_on_score    NUMERIC,
     ttl_seconds        INT NOT NULL CHECK (ttl_seconds > 0),
     fetched_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at         TIMESTAMPTZ GENERATED ALWAYS AS
-                           (fetched_at + make_interval(secs => ttl_seconds)) STORED,
+    expires_at         TIMESTAMPTZ NOT NULL,
     raw_ref            TEXT
 );
+
+-- expires_at can't be a GENERATED column: `timestamptz + interval` is a STABLE
+-- operator, not IMMUTABLE, regardless of the interval being pure seconds —
+-- Postgres rejects it outright ("generation expression is not immutable").
+-- Discovered running this migration against a live database for the first
+-- time; a trigger gets the identical guarantee — expires_at can never drift
+-- out of sync with fetched_at + ttl_seconds — without that restriction.
+CREATE OR REPLACE FUNCTION evidence_set_expires_at() RETURNS trigger AS $$
+BEGIN
+    NEW.expires_at := NEW.fetched_at + make_interval(secs => NEW.ttl_seconds);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS evidence_expires_at_trigger ON evidence;
+CREATE TRIGGER evidence_expires_at_trigger
+    BEFORE INSERT OR UPDATE ON evidence
+    FOR EACH ROW EXECUTE FUNCTION evidence_set_expires_at();
 
 -- The lookup that powers every cache hit.
 CREATE INDEX IF NOT EXISTS idx_evidence_lookup

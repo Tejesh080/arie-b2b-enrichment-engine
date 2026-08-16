@@ -16,11 +16,11 @@ jobs:
           cache: pip
       - run: pip install -e ".[dev,service]"
       - name: Lint
-        run: ruff check src tests bench
+        run: ruff check src tests bench scripts
       - name: Format check
-        run: ruff format --check src tests bench
+        run: ruff format --check src tests bench scripts
       - name: Type check
-        run: mypy src tests
+        run: mypy src tests scripts
       - name: Fit confidence model (calibration split only)
         run: python -m arie.confidence.cli --seed 42
       - name: Unit tests

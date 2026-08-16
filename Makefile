@@ -25,14 +25,14 @@ dev-install:
 	pip install -e ".[dev,service]"
 
 lint:
-	ruff check src tests bench
+	ruff check src tests bench scripts
 
 fmt:
-	ruff format src tests bench
-	ruff check --fix src tests bench
+	ruff format src tests bench scripts
+	ruff check --fix src tests bench scripts
 
 type:
-	mypy src tests
+	mypy src tests scripts
 
 test:
 	pytest -m "not integration"

@@ -1,0 +1,190 @@
+"""The evidence store — M1's replacement for the in-memory ``EvidenceCache``.
+
+``arie.policy.base.EvidenceCache`` is an in-memory stand-in that exists so the
+M0 benchmark can run offline: within one benchmark pass nothing expires, and a
+hit just means "already fetched for an earlier lead in this run."
+
+This module is what it stands in for. The ``evidence`` table
+(``migrations/0001_init.sql``) already models the real thing: one row per
+(entity, field, source), with ``expires_at`` generated from ``fetched_at +
+ttl_seconds``. There is no separate cache subsystem to keep in sync — a cache
+hit is exactly a row whose ``expires_at`` is still in the future.
+
+Note this is a field-level cache, not a provider-level one like
+``EvidenceCache``. That is a deliberate widening, not an accident: two
+providers can supply the same field, and a second contact at an
+already-enriched company should read every cached fact back for free regardless
+of which provider originally supplied it — that cross-provider, cross-contact
+sharing is where the real M1 cost saving lives. Wiring this store into the
+policy execution path (replacing ``RunContext.cache``) is deliberately left to
+the worker step — that wiring decides *when* to consult the store and *which*
+provider to call next, which is policy logic, not persistence.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from typing import Any, cast
+from uuid import UUID
+
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool
+
+from arie.core.types import EntityType, Evidence
+
+_SELECT_FRESH = """
+    SELECT entity_type, entity_id, field_name, value, signal_description,
+           source, confidence, effect_on_score, ttl_seconds, fetched_at
+    FROM evidence
+    WHERE entity_type = %(entity_type)s AND entity_id = %(entity_id)s
+      AND field_name = %(field_name)s AND expires_at > %(now)s
+    ORDER BY fetched_at DESC
+    LIMIT 1
+"""
+
+_SELECT_ALL_FRESH = """
+    SELECT entity_type, entity_id, field_name, value, signal_description,
+           source, confidence, effect_on_score, ttl_seconds, fetched_at
+    FROM evidence
+    WHERE entity_type = %(entity_type)s AND entity_id = %(entity_id)s
+      AND expires_at > %(now)s
+    ORDER BY field_name, fetched_at DESC
+"""
+
+_INSERT = """
+    INSERT INTO evidence (
+        entity_type, entity_id, field_name, value, signal_description,
+        source, confidence, effect_on_score, ttl_seconds, fetched_at
+    ) VALUES (
+        %(entity_type)s, %(entity_id)s, %(field_name)s, %(value)s,
+        %(signal_description)s, %(source)s, %(confidence)s,
+        %(effect_on_score)s, %(ttl_seconds)s, %(fetched_at)s
+    )
+"""
+
+
+def _evidence_from_row(row: dict[str, Any]) -> Evidence:
+    """Map one ``evidence`` row to the pure domain type.
+
+    Postgres NUMERIC columns arrive as ``Decimal`` via psycopg's default type
+    map; ``Evidence`` declares ``confidence``/``effect_on_score`` as ``float``,
+    so both are cast explicitly rather than leaking a DB-specific type into
+    code shared with the (DB-free) benchmark.
+    """
+    effect_on_score = row["effect_on_score"]
+    return Evidence(
+        entity_type=cast(EntityType, row["entity_type"]),
+        entity_id=row["entity_id"],
+        field_name=row["field_name"],
+        value=row["value"],
+        source=row["source"],
+        confidence=float(row["confidence"]),
+        ttl_seconds=row["ttl_seconds"],
+        fetched_at=row["fetched_at"],
+        signal_description=row["signal_description"],
+        effect_on_score=float(effect_on_score) if effect_on_score is not None else None,
+    )
+
+
+def _row_for_insert(evidence: Evidence) -> dict[str, Any]:
+    return {
+        "entity_type": evidence.entity_type,
+        "entity_id": evidence.entity_id,
+        "field_name": evidence.field_name,
+        "value": Jsonb(evidence.value),
+        "signal_description": evidence.signal_description,
+        "source": evidence.source,
+        "confidence": evidence.confidence,
+        "effect_on_score": evidence.effect_on_score,
+        "ttl_seconds": evidence.ttl_seconds,
+        "fetched_at": evidence.fetched_at,
+    }
+
+
+class PostgresEvidenceStore:
+    """TTL/cache semantics over the ``evidence`` table.
+
+    Answers exactly one question — "is there a still-fresh fact for this entity
+    and field?" — and records new facts when the answer is no. It does not
+    decide *whether* to fetch (the policy's job) or *which* value wins when
+    sources disagree (``arie.scoring.merge``); keeping those separate is what
+    let the M0 merge logic stay pure and DB-free and still apply unchanged here.
+    """
+
+    def __init__(self, pool: ConnectionPool) -> None:
+        self._pool = pool
+
+    @classmethod
+    def connect(
+        cls, conninfo: str, *, min_size: int = 1, max_size: int = 10
+    ) -> PostgresEvidenceStore:
+        """Open a pooled store. Use the *pooled* connection string (``DATABASE_URL``),
+        not the direct one — this is the runtime read/write path, not migrations."""
+        pool = ConnectionPool(conninfo, min_size=min_size, max_size=max_size, open=True)
+        return cls(pool)
+
+    def close(self) -> None:
+        self._pool.close()
+
+    def __enter__(self) -> PostgresEvidenceStore:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def get_fresh(
+        self,
+        entity_type: EntityType,
+        entity_id: UUID,
+        field_name: str,
+        *,
+        now: datetime | None = None,
+    ) -> Evidence | None:
+        """The single-field cache lookup: freshest non-expired row, or ``None``."""
+        now = now or datetime.now(UTC)
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                _SELECT_FRESH,
+                {
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "field_name": field_name,
+                    "now": now,
+                },
+            )
+            row = cur.fetchone()
+            return _evidence_from_row(row) if row is not None else None
+
+    def get_all_fresh(
+        self, entity_type: EntityType, entity_id: UUID, *, now: datetime | None = None
+    ) -> tuple[Evidence, ...]:
+        """Every still-fresh fact known about one entity, across all sources and fields.
+
+        This is the shape a policy actually wants before deciding what to buy:
+        the full known-facts bundle for one company or person, ready to feed
+        into ``arie.scoring.merge.candidates_from_evidence``.
+        """
+        now = now or datetime.now(UTC)
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                _SELECT_ALL_FRESH, {"entity_type": entity_type, "entity_id": entity_id, "now": now}
+            )
+            return tuple(_evidence_from_row(row) for row in cur.fetchall())
+
+    def put(self, evidence: Evidence) -> None:
+        self.put_many((evidence,))
+
+    def put_many(self, items: Iterable[Evidence]) -> None:
+        """Persist a batch of facts, e.g. every field one provider call returned.
+
+        A single ``executemany`` in one transaction: a provider call either
+        lands as evidence in full or not at all, never partially cached.
+        """
+        rows = [_row_for_insert(item) for item in items]
+        if not rows:
+            return
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.executemany(_INSERT, rows)
+            conn.commit()
