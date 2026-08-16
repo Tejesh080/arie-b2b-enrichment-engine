@@ -7,6 +7,11 @@ operations manage their own transaction and which don't:
 
 - `enqueue` and `claim` are standalone: each opens its own connection, does
   its work, and commits.
+- `enqueue_in` is `enqueue`'s body without the connection or the commit, for
+  callers that must schedule work *as part of* a wider transaction — the
+  ingestion API creates a lead and its first job together, so a crash between
+  the two cannot leave a lead nothing will ever pick up. `enqueue` is now a
+  thin wrapper around it and behaves exactly as it always did.
 - `complete` and `fail` take a caller-provided connection and never commit.
   `complete` must share a transaction with the lead-state transition it
   accompanies (arie.statemachine.apply) — that shared commit *is* "job
@@ -26,6 +31,7 @@ from uuid import UUID
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from arie.jobs.backoff import compute_backoff
@@ -42,7 +48,7 @@ _RECLAIM_EXPIRED_LEASES = """
 """
 
 _CLAIM_SELECT = """
-    SELECT job_id, lead_id, job_type, attempt_count, idempotency_key
+    SELECT job_id, lead_id, job_type, attempt_count, idempotency_key, trace_context
     FROM jobs
     WHERE status = 'pending' AND next_retry_at <= now() {job_type_filter}
     ORDER BY next_retry_at
@@ -55,9 +61,16 @@ _CLAIM_UPDATE = """
     WHERE job_id = ANY(%(job_ids)s)
 """
 
+# The DO UPDATE deliberately writes nothing (jobs.job_type = jobs.job_type): it
+# exists only so RETURNING fires for the already-existed case, which DO NOTHING
+# would skip. One consequence worth naming: `trace_context` is therefore left at
+# whatever the *first* enqueue stored. That is the wanted behaviour — the job is
+# the one the first request scheduled, so it belongs to that request's trace; a
+# duplicate request gets its own span recording that it deduplicated, and does
+# not get to retroactively reparent work it did not cause.
 _ENQUEUE = """
-    INSERT INTO jobs (lead_id, job_type, idempotency_key)
-    VALUES (%(lead_id)s, %(job_type)s, %(idempotency_key)s)
+    INSERT INTO jobs (lead_id, job_type, idempotency_key, trace_context)
+    VALUES (%(lead_id)s, %(job_type)s, %(idempotency_key)s, %(trace_context)s)
     ON CONFLICT (idempotency_key) DO UPDATE SET job_type = jobs.job_type
     RETURNING job_id, (xmax = 0) AS created
 """
@@ -103,6 +116,13 @@ class ClaimedJob:
     job_type: str
     attempt_count: int
     idempotency_key: str | None
+    trace_context: dict[str, str] | None = None
+    """W3C carrier captured at enqueue time; None for a job enqueued outside a trace.
+
+    Defaulted so the pre-tracing construction shape still works — a job row
+    written before migration 0005 reads back as NULL here and simply starts its
+    own trace.
+    """
 
 
 @dataclass(frozen=True)
@@ -131,12 +151,46 @@ class PostgresJobQueue:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
+    def enqueue_in(
+        self,
+        conn: psycopg.Connection,
+        *,
+        lead_id: UUID | None,
+        job_type: str,
+        idempotency_key: str | None = None,
+        trace_context: dict[str, str] | None = None,
+    ) -> EnqueuedJob:
+        """Create a job on a caller-provided connection. Does **not** commit.
+
+        For work that must be scheduled atomically with whatever created it.
+        The ingestion API uses this so a lead row and the job that will process
+        it commit together: the alternative — insert the lead, commit, then
+        enqueue — has a window where a crash leaves a lead in ``NEW`` that no
+        worker will ever claim, and nothing downstream would ever notice
+        because a lead with no job looks exactly like a lead whose job hasn't
+        run yet.
+        """
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                _ENQUEUE,
+                {
+                    "lead_id": lead_id,
+                    "job_type": job_type,
+                    "idempotency_key": idempotency_key,
+                    "trace_context": Jsonb(trace_context) if trace_context else None,
+                },
+            )
+            row = cur.fetchone()
+            assert row is not None
+        return EnqueuedJob(job_id=row["job_id"], created=row["created"])
+
     def enqueue(
         self,
         *,
         lead_id: UUID | None,
         job_type: str,
         idempotency_key: str | None = None,
+        trace_context: dict[str, str] | None = None,
     ) -> EnqueuedJob:
         """Create a job, or return the existing one if `idempotency_key` already exists.
 
@@ -144,15 +198,16 @@ class PostgresJobQueue:
         distinct under a UNIQUE constraint, so callers with no natural dedup
         key (e.g. a one-off maintenance job) simply always get a new row.
         """
-        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                _ENQUEUE,
-                {"lead_id": lead_id, "job_type": job_type, "idempotency_key": idempotency_key},
+        with self._pool.connection() as conn:
+            enqueued = self.enqueue_in(
+                conn,
+                lead_id=lead_id,
+                job_type=job_type,
+                idempotency_key=idempotency_key,
+                trace_context=trace_context,
             )
-            row = cur.fetchone()
-            assert row is not None
             conn.commit()
-        return EnqueuedJob(job_id=row["job_id"], created=row["created"])
+        return enqueued
 
     def claim(
         self,
@@ -203,6 +258,7 @@ class PostgresJobQueue:
                 job_type=row["job_type"],
                 attempt_count=row["attempt_count"],
                 idempotency_key=row["idempotency_key"],
+                trace_context=row["trace_context"],
             )
             for row in rows
         ]

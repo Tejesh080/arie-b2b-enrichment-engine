@@ -90,6 +90,27 @@ class DatabaseConfig:
 
 
 @dataclass(frozen=True)
+class ObservabilityConfig:
+    """Tracing configuration. Absent an endpoint, tracing is off — see
+    ``arie.observability.tracing``.
+
+    There is deliberately no ``TRACING_ENABLED`` flag. Two switches for one
+    behaviour (an endpoint *and* a boolean) is two things to get out of sync,
+    and "enabled but pointed nowhere" is not a state worth being able to
+    express. Configuring an endpoint is the act of enabling it.
+    """
+
+    service_name: str = field(default_factory=lambda: os.getenv("OTEL_SERVICE_NAME", "arie"))
+    otlp_endpoint: str = field(
+        default_factory=lambda: os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    )
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.otlp_endpoint)
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     provider_mode: ProviderMode = field(
         default_factory=lambda: cast(ProviderMode, os.getenv("PROVIDER_MODE", "simulated"))
@@ -116,3 +137,4 @@ class RuntimeConfig:
 POLICY = PolicyConfig()
 DATABASE = DatabaseConfig()
 RUNTIME = RuntimeConfig()
+OBSERVABILITY = ObservabilityConfig()

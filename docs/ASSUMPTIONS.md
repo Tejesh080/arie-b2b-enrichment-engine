@@ -96,6 +96,36 @@ Relative weights only; absolute levels are assumptions. They sit far above
 provider prices, which is realistic and is precisely why teams over-enrich by
 default — almost any call looks justified if it might change the answer.
 
+## Model prices (M1 cost ledger)
+
+Added with the cost ledger in M1 Step 9 (`arie.ledger.pricing`). These are the
+figures the ledger multiplies token counts by to produce `model_calls.cost_usd`,
+which flows into `v_lead_cost` and `v_model_escalation`.
+
+| Model | Tier | Input $/1M | Output $/1M | Basis | Confidence |
+|---|---|---|---|---|---|
+| `deepseek-chat` | cheap | 0.27 | 1.10 | Published list price, transcribed by hand | **Unverified** |
+| `deepseek-reasoner` | strong | 0.55 | 2.19 | Published list price, transcribed by hand | **Unverified** |
+
+⚠️ **None of this is measured, and no live model call has ever been made by this
+project.** If a price is stale, or a discount or cache-token rate applies, every
+cost figure derived from it is wrong by exactly that factor and nothing in the
+system will notice — a wrong price produces a plausible number, not an error.
+
+Unlike provider costs, which the provider *reports* and the ledger records
+verbatim, model costs are **derived**. That asymmetry is why these sit in this
+file and provider prices largely don't.
+
+**Step 10 is where these stop being assumptions.** It wires the first real
+model call; reconcile the computed cost against whatever the API's own usage
+reporting returns, and correct the table. Until then, treat any model-cost
+number this system produces as conditional on the above.
+
+An unpriced model raises `UnknownModelError` rather than being ledgered at
+$0.00 — free is indistinguishable downstream from genuinely cheap, so the
+cascade would appear to be saving money at exactly the moment it was spending
+money nobody was tracking.
+
 ## Known limitations
 
 1. **Synthetic data throughout.** No real lead data. Absolute numbers are not

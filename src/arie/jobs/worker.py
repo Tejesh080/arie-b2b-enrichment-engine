@@ -8,6 +8,14 @@ docstring for why. What this module guarantees today: whatever a handler
 does, its effect on the lead and the job's own bookkeeping commit together or
 not at all, and a handler that raises is retried with backoff and eventually
 dead-lettered, uniformly, regardless of what job_type it was.
+
+Since M1 Step 9 it also continues the trace that created the job. `jobs.trace_context`
+carries the W3C context captured when the ingestion request enqueued the work,
+and `_process_one` starts its span as a child of it — so a lead's HTTP request
+and every processing attempt it caused appear in one trace, across two
+processes and however much wall-clock separates them. See
+`arie.observability.tracing` for why that link has to travel through the queue
+row and nowhere else.
 """
 
 from __future__ import annotations
@@ -15,7 +23,7 @@ from __future__ import annotations
 import socket
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import psycopg
@@ -24,9 +32,20 @@ from psycopg_pool import ConnectionPool
 from arie.config import DATABASE, RUNTIME
 from arie.core.types import LeadStatus
 from arie.jobs.queue import ClaimedJob, PostgresJobQueue
+from arie.observability.tracing import (
+    configure_tracing,
+    extract_trace_context,
+    get_tracer,
+    record_error,
+    set_attributes,
+    shutdown_tracing,
+    traced,
+)
 from arie.statemachine.apply import apply_transition
 
 _SELECT_LEAD_STATE = "SELECT status, version FROM leads WHERE lead_id = %(lead_id)s"
+
+_TRACER = get_tracer("arie.jobs.worker")
 
 
 @dataclass(frozen=True)
@@ -77,6 +96,7 @@ def run_worker_cycle(
     *,
     worker_id: str | None = None,
     batch_size: int = 1,
+    job_types: Sequence[str] | None = None,
     lease_seconds: int | None = None,
     max_attempts: int | None = None,
 ) -> list[CycleResult]:
@@ -86,6 +106,16 @@ def run_worker_cycle(
     Each claimed job then gets a fresh transaction for the actual work: run
     the handler, mark the job done, apply the lead's state transition — all
     committed together, or all rolled back together if anything raises.
+
+    `job_types` restricts what this worker will claim, for running a pool
+    dedicated to one kind of work — and for tests against a shared database,
+    where an unfiltered claim would happily pick up another test's job.
+
+    It deliberately does **not** default to ``handlers.keys()``, tempting as
+    that is. A job whose type has no handler registered anywhere must still be
+    claimed, failed, and eventually dead-lettered; silently declining to claim
+    it would leave it pending forever, which looks identical to a backlog and
+    is far harder to notice than a dead letter.
     """
     resolved_worker_id = worker_id or _default_worker_id()
     resolved_lease = lease_seconds if lease_seconds is not None else RUNTIME.worker_lease_seconds
@@ -93,12 +123,22 @@ def run_worker_cycle(
         max_attempts if max_attempts is not None else RUNTIME.worker_max_attempts
     )
 
-    claimed = queue.claim(
-        worker_id=resolved_worker_id,
-        limit=batch_size,
-        lease_seconds=resolved_lease,
-        max_attempts=resolved_max_attempts,
-    )
+    # The claim span stands alone rather than parenting the processing spans:
+    # one claim can return a batch of jobs from unrelated traces, so making it
+    # their parent would splice unrelated leads' work into whichever trace
+    # happened to be claimed alongside them. Each job reattaches to its own
+    # originating trace inside `_process_one`.
+    with traced(
+        _TRACER, "job.claim", attributes={"arie.worker_id": resolved_worker_id}
+    ) as claim_span:
+        claimed = queue.claim(
+            worker_id=resolved_worker_id,
+            job_types=job_types,
+            limit=batch_size,
+            lease_seconds=resolved_lease,
+            max_attempts=resolved_max_attempts,
+        )
+        claim_span.set_attribute("arie.jobs_claimed", len(claimed))
 
     return [
         _process_one(queue, pool, handlers, job, max_attempts=resolved_max_attempts)
@@ -114,53 +154,79 @@ def _process_one(
     *,
     max_attempts: int,
 ) -> CycleResult:
-    handler = handlers.get(job.job_type)
-    if handler is None:
-        return _fail(
-            queue,
-            pool,
-            job,
-            max_attempts=max_attempts,
-            error=f"no handler registered for job_type {job.job_type!r}",
+    # Reattach to the trace that enqueued this job, if there was one. A missing
+    # or unparseable context yields None, which starts a fresh trace rather
+    # than failing the job — a broken trace header is an observability problem,
+    # never a reason to drop work.
+    parent = extract_trace_context(job.trace_context)
+
+    with _TRACER.start_as_current_span("job.process", context=parent) as span:
+        set_attributes(
+            span,
+            {
+                "arie.job_id": job.job_id,
+                "arie.job_type": job.job_type,
+                "arie.lead_id": job.lead_id,
+                "arie.job.attempt": job.attempt_count,
+            },
         )
 
-    try:
-        with pool.connection() as conn:
-            lead_status: LeadStatus | None = None
-            lead_version: int | None = None
-            if job.lead_id is not None:
-                with conn.cursor() as cur:
-                    cur.execute(_SELECT_LEAD_STATE, {"lead_id": job.lead_id})
-                    row = cur.fetchone()
-                    if row is not None:
-                        lead_status, lead_version = LeadStatus(row[0]), row[1]
+        handler = handlers.get(job.job_type)
+        if handler is None:
+            error = f"no handler registered for job_type {job.job_type!r}"
+            record_error(span, error)
+            result = _fail(queue, pool, job, max_attempts=max_attempts, error=error)
+            span.set_attribute("arie.job.outcome", result.outcome)
+            return result
 
-            context = JobContext(
-                conn=conn, job=job, lead_status=lead_status, lead_version=lead_version
-            )
-            new_status = handler(context)
+        try:
+            with pool.connection() as conn:
+                lead_status: LeadStatus | None = None
+                lead_version: int | None = None
+                if job.lead_id is not None:
+                    with conn.cursor() as cur:
+                        cur.execute(_SELECT_LEAD_STATE, {"lead_id": job.lead_id})
+                        row = cur.fetchone()
+                        if row is not None:
+                            lead_status, lead_version = LeadStatus(row[0]), row[1]
 
-            queue.complete(conn, job.job_id)
-
-            if new_status is not None:
-                if job.lead_id is None or lead_version is None:
-                    raise ValueError(
-                        f"handler for {job.job_type!r} returned a new status but job has no lead"
-                    )
-                apply_transition(
-                    conn,
-                    lead_id=job.lead_id,
-                    expected_version=lead_version,
-                    new_status=new_status,
-                    event_type=f"job:{job.job_type}",
-                    payload={"job_id": str(job.job_id)},
+                context = JobContext(
+                    conn=conn, job=job, lead_status=lead_status, lead_version=lead_version
                 )
+                new_status = handler(context)
 
-            conn.commit()
-        return CycleResult(job_id=job.job_id, job_type=job.job_type, outcome="done")
+                queue.complete(conn, job.job_id)
 
-    except Exception as exc:
-        return _fail(queue, pool, job, max_attempts=max_attempts, error=str(exc))
+                if new_status is not None:
+                    if job.lead_id is None or lead_version is None:
+                        raise ValueError(
+                            f"handler for {job.job_type!r} returned a new status "
+                            "but job has no lead"
+                        )
+                    apply_transition(
+                        conn,
+                        lead_id=job.lead_id,
+                        expected_version=lead_version,
+                        new_status=new_status,
+                        event_type=f"job:{job.job_type}",
+                        payload={"job_id": str(job.job_id)},
+                    )
+                    span.set_attribute("arie.lead.new_status", str(new_status))
+
+                conn.commit()
+
+            span.set_attribute("arie.job.outcome", "done")
+            return CycleResult(job_id=job.job_id, job_type=job.job_type, outcome="done")
+
+        except Exception as exc:
+            # The span is marked ERROR even though the exception stops here: a
+            # job that is retried is still a job that failed, and swallowing it
+            # for tracing purposes would hide every transient failure until it
+            # became a dead letter.
+            record_error(span, exc)
+            result = _fail(queue, pool, job, max_attempts=max_attempts, error=str(exc))
+            span.set_attribute("arie.job.outcome", result.outcome)
+            return result
 
 
 def _fail(
@@ -183,6 +249,7 @@ def main() -> int:
         print("DATABASE_URL is not set — see .env.example")
         return 1
 
+    configure_tracing()
     pool = ConnectionPool(DATABASE.url, min_size=1, max_size=5, open=True)
     queue = PostgresJobQueue(pool)
     handlers: dict[str, JobHandler] = {}  # real handlers not wired yet — see module docstring
@@ -203,6 +270,7 @@ def main() -> int:
     finally:
         queue.close()
         pool.close()
+        shutdown_tracing()
 
 
 if __name__ == "__main__":

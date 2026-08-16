@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
+import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -110,29 +111,39 @@ class IdentityResolver:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
-    def resolve_company(
-        self, *, domain: str | None = None, name: str | None = None
-    ) -> ResolvedCompany:
-        """Resolve a company by domain if given, else by name among domain-less companies.
+    # -- transaction-joining variants ---------------------------------------
+    #
+    # Each `*_in` method does the work on a caller-provided connection and does
+    # not commit; the public method of the same name wraps it with its own
+    # connection and commit, exactly as it always behaved. The split exists for
+    # the ingestion API, which resolves identity and inserts the lead in one
+    # transaction so a failure anywhere leaves no partial trace of the request.
+    #
+    # A note on the advisory lock in the name path: `pg_advisory_xact_lock` is
+    # transaction-scoped, so when identity resolution shares the ingestion
+    # transaction the lock is held until ingestion commits rather than being
+    # released immediately. That is longer, but ingestion is a handful of
+    # statements with no network call in it, and the lock is keyed on one
+    # normalized company name — it serializes concurrent ingests of the *same*
+    # domain-less company, which is precisely the race it exists to prevent.
 
-        The domain path is always safe to call repeatedly: it's a plain
-        UPSERT on a unique key. The name-only path is the one Step 7 measures
-        rather than trusts — see the ambiguous-identity tests.
-        """
+    def resolve_company_in(
+        self, conn: psycopg.Connection, *, domain: str | None = None, name: str | None = None
+    ) -> ResolvedCompany:
+        """Resolve a company on a caller-provided connection. Does not commit."""
         if domain is None and name is None:
             raise ValueError("resolve_company requires a domain, a name, or both")
 
         if domain is not None:
             normalized_domain = normalize_domain(domain)
             display_name = name if name is not None else normalized_domain
-            with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     _INSERT_COMPANY_BY_DOMAIN,
                     {"domain": normalized_domain, "name": display_name},
                 )
                 row = cur.fetchone()
                 assert row is not None
-                conn.commit()
             return ResolvedCompany(
                 company_id=row["company_id"],
                 canonical_domain=row["canonical_domain"],
@@ -141,12 +152,11 @@ class IdentityResolver:
 
         assert name is not None  # narrows for mypy; the guard above already enforced it
         normalized_name = normalize_company_name(name)
-        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(_LOCK_NORMALIZED_NAME, {"normalized_name": normalized_name})
             cur.execute(_FIND_COMPANY_BY_NAME, {"normalized_name": normalized_name})
             existing = cur.fetchone()
             if existing is not None:
-                conn.commit()
                 return ResolvedCompany(
                     company_id=existing["company_id"],
                     canonical_domain=existing["canonical_domain"],
@@ -156,10 +166,77 @@ class IdentityResolver:
             cur.execute(_INSERT_COMPANY_BY_NAME, {"name": name, "normalized_name": normalized_name})
             row = cur.fetchone()
             assert row is not None
-            conn.commit()
             return ResolvedCompany(
                 company_id=row["company_id"], canonical_domain=row["canonical_domain"], created=True
             )
+
+    def resolve_person_in(
+        self,
+        conn: psycopg.Connection,
+        *,
+        email: str,
+        full_name: str | None = None,
+        title: str | None = None,
+        company_id: UUID | None = None,
+    ) -> ResolvedPerson:
+        """Resolve a person on a caller-provided connection. Does not commit."""
+        normalized_email = normalize_email(email)
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                _UPSERT_PERSON,
+                {
+                    "email": normalized_email,
+                    "full_name": full_name,
+                    "title": title,
+                    "company_id": company_id,
+                },
+            )
+            row = cur.fetchone()
+            assert row is not None
+        return ResolvedPerson(
+            person_id=row["person_id"],
+            canonical_email=row["canonical_email"],
+            company_id=row["company_id"],
+            created=row["created"],
+        )
+
+    def resolve_lead_in(
+        self,
+        conn: psycopg.Connection,
+        *,
+        person_email: str,
+        company_domain: str | None = None,
+        company_name: str | None = None,
+        person_full_name: str | None = None,
+        person_title: str | None = None,
+    ) -> tuple[ResolvedCompany, ResolvedPerson]:
+        """Resolve company and contact on a caller-provided connection. Does not commit."""
+        domain = company_domain or domain_from_email(person_email)
+        company = self.resolve_company_in(conn, domain=domain, name=company_name)
+        person = self.resolve_person_in(
+            conn,
+            email=person_email,
+            full_name=person_full_name,
+            title=person_title,
+            company_id=company.company_id,
+        )
+        return company, person
+
+    # -- self-committing public API -----------------------------------------
+
+    def resolve_company(
+        self, *, domain: str | None = None, name: str | None = None
+    ) -> ResolvedCompany:
+        """Resolve a company by domain if given, else by name among domain-less companies.
+
+        The domain path is always safe to call repeatedly: it's a plain
+        UPSERT on a unique key. The name-only path is the one Step 7 measures
+        rather than trusts — see the ambiguous-identity tests.
+        """
+        with self._pool.connection() as conn:
+            resolved = self.resolve_company_in(conn, domain=domain, name=name)
+            conn.commit()
+        return resolved
 
     def resolve_person(
         self,
@@ -175,26 +252,12 @@ class IdentityResolver:
         sharing a name is far more common than two different companies sharing
         a normalized name, so a name-only match would be materially unsafe.
         """
-        normalized_email = normalize_email(email)
-        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                _UPSERT_PERSON,
-                {
-                    "email": normalized_email,
-                    "full_name": full_name,
-                    "title": title,
-                    "company_id": company_id,
-                },
+        with self._pool.connection() as conn:
+            resolved = self.resolve_person_in(
+                conn, email=email, full_name=full_name, title=title, company_id=company_id
             )
-            row = cur.fetchone()
-            assert row is not None
             conn.commit()
-        return ResolvedPerson(
-            person_id=row["person_id"],
-            canonical_email=row["canonical_email"],
-            company_id=row["company_id"],
-            created=row["created"],
-        )
+        return resolved
 
     def resolve_lead(
         self,
@@ -212,12 +275,14 @@ class IdentityResolver:
         ``arie.identity.normalize.domain_from_email``) so a Gmail sender never
         gets treated as a company.
         """
-        domain = company_domain or domain_from_email(person_email)
-        company = self.resolve_company(domain=domain, name=company_name)
-        person = self.resolve_person(
-            email=person_email,
-            full_name=person_full_name,
-            title=person_title,
-            company_id=company.company_id,
-        )
-        return company, person
+        with self._pool.connection() as conn:
+            resolved = self.resolve_lead_in(
+                conn,
+                person_email=person_email,
+                company_domain=company_domain,
+                company_name=company_name,
+                person_full_name=person_full_name,
+                person_title=person_title,
+            )
+            conn.commit()
+        return resolved

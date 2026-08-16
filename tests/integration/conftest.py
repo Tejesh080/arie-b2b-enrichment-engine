@@ -19,13 +19,16 @@ from uuid import UUID
 
 import psycopg
 import pytest
+from fastapi.testclient import TestClient
 from psycopg_pool import ConnectionPool
 from scripts.migrate import migrate
 
+from arie.api.main import AppState, build_state, create_app
 from arie.config import DatabaseConfig
 from arie.evidence.store import PostgresEvidenceStore
 from arie.identity.resolver import IdentityResolver
 from arie.jobs.queue import PostgresJobQueue
+from arie.ledger.store import PostgresCostLedger
 
 
 def _database_config() -> DatabaseConfig:
@@ -176,6 +179,102 @@ def cleanup_jobs(db_conn: psycopg.Connection) -> Iterator[list[UUID]]:
         with db_conn.cursor() as cur:
             cur.execute("DELETE FROM jobs WHERE job_id = ANY(%s)", (job_ids,))
         db_conn.commit()
+
+
+# ---------------------------------------------------------------- step 9 --
+#
+# `span_exporter` / `spans` are in tests/conftest.py, not here — see its
+# docstring for why they have to be shared with the unit tests.
+
+
+@pytest.fixture
+def app_state(migrated_database: str) -> Iterator[AppState]:
+    state = build_state(migrated_database, min_size=1, max_size=6)
+    try:
+        yield state
+    finally:
+        state.pool.close()
+
+
+@pytest.fixture
+def api_client(app_state: AppState) -> Iterator[TestClient]:
+    """A client over an app wired to the test pool, with the lifespan bypassed.
+
+    Passing `state` to ``create_app`` skips the real lifespan entirely, so the
+    test owns the pool's lifetime rather than racing startup and shutdown
+    against its own fixtures.
+
+    ``raise_server_exceptions=False`` so a handler that raises produces a 500
+    response to assert on, which is what the rollback tests need — the default
+    re-raises into the test and the response is never formed.
+    """
+    with TestClient(create_app(state=app_state), raise_server_exceptions=False) as client:
+        yield client
+
+
+@pytest.fixture
+def cost_ledger(migrated_database: str) -> Iterator[PostgresCostLedger]:
+    pool = ConnectionPool(migrated_database, min_size=1, max_size=4, open=True)
+    ledger = PostgresCostLedger(pool)
+    try:
+        yield ledger
+    finally:
+        ledger.close()
+
+
+@dataclass
+class IngestCleanup:
+    """Everything one ingestion/ledger test created, deleted in FK-safe order.
+
+    A single fixture rather than composing ``cleanup_leads`` with
+    ``cleanup_identity``: pytest tears fixtures down in reverse instantiation
+    order, so which of those two ran first would depend on the order a test
+    happened to request them — and getting it backwards fails on the FK from
+    persons to companies only sometimes. One teardown, one explicit order.
+    """
+
+    lead_ids: list[UUID] = field(default_factory=list)
+    domains: list[str] = field(default_factory=list)
+    emails: list[str] = field(default_factory=list)
+    company_names: list[str] = field(default_factory=list)
+    provider_call_keys: list[str] = field(default_factory=list)
+    model_call_keys: list[str] = field(default_factory=list)
+
+
+@pytest.fixture
+def cleanup_ingest(db_conn: psycopg.Connection) -> Iterator[IngestCleanup]:
+    tracker = IngestCleanup()
+    yield tracker
+    with db_conn.cursor() as cur:
+        # provider_calls/model_calls reference leads ON DELETE SET NULL, so
+        # deleting the lead orphans rather than removes them — they have to go
+        # first and by their own key, or a test database accumulates ledger rows
+        # that every metrics-view assertion then has to work around.
+        if tracker.provider_call_keys:
+            cur.execute(
+                "DELETE FROM provider_calls WHERE idempotency_key = ANY(%s)",
+                (tracker.provider_call_keys,),
+            )
+        if tracker.model_call_keys:
+            cur.execute(
+                "DELETE FROM model_calls WHERE idempotency_key = ANY(%s)",
+                (tracker.model_call_keys,),
+            )
+        if tracker.lead_ids:
+            # Cascades to jobs, lead_events, scores, voi_decisions, human_reviews.
+            cur.execute("DELETE FROM leads WHERE lead_id = ANY(%s)", (tracker.lead_ids,))
+        if tracker.emails:
+            cur.execute("DELETE FROM persons WHERE canonical_email = ANY(%s)", (tracker.emails,))
+        if tracker.domains:
+            cur.execute(
+                "DELETE FROM companies WHERE canonical_domain = ANY(%s)", (tracker.domains,)
+            )
+        if tracker.company_names:
+            cur.execute(
+                "DELETE FROM companies WHERE canonical_domain IS NULL AND normalized_name = ANY(%s)",
+                (tracker.company_names,),
+            )
+    db_conn.commit()
 
 
 @pytest.fixture

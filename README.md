@@ -91,6 +91,10 @@ regression test.
 | Company-scoped providers returned **per-person** answers | Made company-level caching lossy and let full enrichment disagree with itself. |
 | Two contacts drew the **same email** | Email is the canonical person key, so two distinct people were silently merged. |
 | Difficulty was **confounded** with cache-hit opportunity | Contact count was drawn from the company RNG, so it depended on which code branch ran. |
+| `expires_at` could not be a **`GENERATED`** column | `timestamptz + interval` is STABLE, not IMMUTABLE. Found by running the migration against a real database for the first time. |
+| Cost per *qualified* lead **counted rejections as qualified** | `SYNCED` is where the reject branch terminates, so rejecting more leads made the metric look better — inverting the failure mode the view exists to expose. |
+| Escalation rate counted a lead **once per review** | A `LEFT JOIN` to `human_reviews` fanned each lead out per review, so a twice-reviewed lead was two leads. |
+| The lead budget cap defaulted **below the priciest provider** | `$0.50` against `deep_research` at `$0.600` — the only source of the disqualifying flag. The config had fixed this; the column default never got the memo. |
 
 ---
 
@@ -100,11 +104,15 @@ regression test.
    n8n (thin edge: ingest webhook, CRM sync-out)          [M1, not built]
                      |
                      v
-        Ingestion API (FastAPI) --> Postgres / Supabase   [M1, not built]
+        Ingestion API (FastAPI) --> Postgres / Supabase   [M1, BUILT]
+          POST /leads: identity resolution + lead +
+          first job, in ONE transaction
                                       |
+                          jobs.trace_context carries the
+                          W3C trace across the process boundary
                                       v
-                          Worker (SKIP LOCKED queue)      [M1, not built]
-                                      |
+                          Worker (SKIP LOCKED queue)      [M1, mechanism built,
+                                      |                    handlers deferred]
   +-----------------------------------+----------------------------+
   |                    M0 - BUILT AND MEASURED                      |
   |                                                                 |
@@ -117,8 +125,12 @@ regression test.
   +-----------------------------------------------------------------+
 ```
 
-M0 — the intelligence engine and its benchmark — is complete. M1 (the durable
-runtime) has not started; see [the handoff](docs/06-m1-handoff.md).
+M0 — the intelligence engine and its benchmark — is complete. M1 is partly
+built: schema and migrations, evidence store, identity resolution, the job
+queue and transactional state machine, and now the ingestion API, cost ledger,
+and end-to-end tracing. **The worker still has no real handlers** — nothing yet
+calls `CalibratedBoundsPolicy` in production, on purpose. See
+[the handoff](docs/06-m1-handoff.md) for exactly what is and isn't wired.
 
 **Deliberately rejected**, with reasons in [`docs/adr/`](docs/adr/): LangGraph
 (the loop is a calculation, not agentic reasoning), Temporal (single-service
@@ -185,6 +197,9 @@ src/arie/
   identity/      deterministic company/person resolution (M1)
   jobs/          Postgres job queue - SKIP LOCKED, backoff, dead-letter (M1)
   statemachine/  pure transition graph + atomic apply_transition (M1)
+  api/           FastAPI ingestion/runtime API - POST /leads (M1)
+  ledger/        durable provider/model cost ledger + model pricing (M1)
+  observability/ OpenTelemetry setup and cross-process trace propagation (M1)
 bench/           harness, metrics, cost model, seed sweep
 migrations/      numbered SQL (M1) - source of truth, applied via scripts/migrate.py
 supabase/        migrations/ mirror (generated) + config, for GitHub Branching PR previews
