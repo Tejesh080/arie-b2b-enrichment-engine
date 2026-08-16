@@ -43,8 +43,16 @@ class PolicyConfig:
     """
 
     lead_budget_usd_cap: float = field(
-        default_factory=lambda: _env_float("LEAD_BUDGET_USD_CAP", 0.50)
+        default_factory=lambda: _env_float("LEAD_BUDGET_USD_CAP", 1.50)
     )
+    """Hard ceiling on spend per lead.
+
+    Must sit **above** the cost of calling every provider once, or it stops
+    being a backstop and becomes a binding constraint: the policy could never
+    reach full information, so "matches full enrichment at lower cost" would be
+    structurally unattainable rather than empirically false. An earlier default
+    of $0.50 sat below the most expensive provider's price and silently made
+    that provider unbuyable."""
     target_autonomous_error_rate: float = field(
         default_factory=lambda: _env_float("TARGET_AUTONOMOUS_ERROR_RATE", 0.05)
     )
