@@ -76,7 +76,13 @@ def _spreads(runs: list[BenchmarkRun]) -> list[Spread]:
         Spread(
             "agreement gap vs waterfall (pp)", tuple(r.agreement_gap_vs_waterfall_pp for r in runs)
         ),
-        Spread("EVoI saving vs bounds-only", tuple(r.evoi_saving_vs_ablation for r in runs)),
+        Spread("EVoI saving vs production", tuple(r.evoi_saving_vs_production for r in runs)),
+        Spread(
+            "production saving vs waterfall",
+            tuple(r.production_saving_vs_waterfall for r in runs),
+        ),
+        Spread("production agreement gap (pp)", tuple(r.production_agreement_gap_pp for r in runs)),
+        Spread("production autonomy", tuple(r.production.autonomous_rate for r in runs)),
         Spread("adaptive agreement", tuple(r.best_adaptive.decision_agreement for r in runs)),
         Spread("waterfall agreement", tuple(r.best_waterfall.decision_agreement for r in runs)),
         Spread("adaptive api cost/lead", tuple(r.best_adaptive.mean_cost_usd for r in runs)),
@@ -108,7 +114,7 @@ def _total_cost_table(runs: list[BenchmarkRun]) -> list[dict[str, Any]]:
         for label, pick in (
             ("full", lambda r: r.full),
             ("waterfall", lambda r: r.best_waterfall),
-            ("bounds_only", lambda r: r.ablation),
+            ("calibrated_bounds", lambda r: r.production),
             ("adaptive", lambda r: r.best_adaptive),
             # Judged at the same price it was told to assume. `price` is bound
             # as a default rather than captured, so the lambda cannot pick up a
@@ -118,7 +124,7 @@ def _total_cost_table(runs: list[BenchmarkRun]) -> list[dict[str, Any]]:
             totals = [total_cost(pick(r), price).total_usd for r in runs]  # type: ignore[no-untyped-call]
             entry[label] = round(statistics.fmean(totals), 6)
         entry["cheapest"] = min(
-            ("full", "waterfall", "bounds_only", "adaptive", "escalation_aware"),
+            ("full", "waterfall", "calibrated_bounds", "adaptive", "escalation_aware"),
             key=lambda k: entry[k],
         )
         rows.append(entry)
@@ -173,7 +179,7 @@ def main() -> int:
     print("TOTAL COST INCLUDING HUMAN REVIEW (mean across seeds, $/lead)")
     print("=" * 84)
     header = (
-        f"  {'review $':>9}  {'full':>9}  {'waterfall':>10}  {'bounds':>9}  "
+        f"  {'review $':>9}  {'full':>9}  {'waterfall':>10}  {'calib_bnds':>11}  "
         f"{'adaptive':>9}  {'esc_aware':>10}   cheapest"
     )
     print(header)
@@ -181,7 +187,7 @@ def main() -> int:
     for row in _total_cost_table(runs):
         print(
             f"  {row['human_review_usd']:>9.2f}  {row['full']:>9.5f}  {row['waterfall']:>10.5f}  "
-            f"{row['bounds_only']:>9.5f}  {row['adaptive']:>9.5f}  "
+            f"{row['calibrated_bounds']:>11.5f}  {row['adaptive']:>9.5f}  "
             f"{row['escalation_aware']:>10.5f}   {row['cheapest']}"
         )
 
@@ -210,7 +216,9 @@ def main() -> int:
                 "verdict": r.verdict.to_json(),
                 "cost_saving_vs_waterfall": round(r.cost_saving_vs_waterfall, 6),
                 "agreement_gap_vs_waterfall_pp": r.agreement_gap_vs_waterfall_pp,
-                "evoi_saving_vs_ablation": round(r.evoi_saving_vs_ablation, 6),
+                "evoi_saving_vs_production": round(r.evoi_saving_vs_production, 6),
+                "production_saving_vs_waterfall": round(r.production_saving_vs_waterfall, 6),
+                "production_agreement_gap_pp": r.production_agreement_gap_pp,
                 "tau": r.tau,
                 "confidence_ece": r.confidence_ece,
                 "policies": [s.to_json() for s in r.all_summaries],

@@ -159,60 +159,6 @@ class TunedWaterfall:
         )
 
 
-@dataclass
-class BoundsOnlyStopping:
-    """Ablation: deterministic stopping, no expected-value reasoning.
-
-    Buys cheapest-first and stops the moment the decision is provably settled or
-    confidence clears tau. It has every stopping signal the adaptive policy has
-    **except** EVoI-guided ordering.
-
-    This exists to answer the question a sceptical reviewer asks first: the
-    adaptive policy stops most leads on `decision_settled`, so is the
-    value-of-information machinery contributing anything, or are score bounds
-    doing all the work? Without this comparison the headline number could not be
-    attributed to the mechanism it claims.
-    """
-
-    model: ConfidenceModel
-
-    @property
-    def name(self) -> str:
-        return "ablation_bounds_only"
-
-    def run(self, lead: EvalLead, ctx: RunContext) -> PolicyOutcome:
-        marker = len(ctx.ledger.records)
-        results: dict[str, ProviderResult] = {}
-        stop_reason = "all_providers_called"
-
-        for spec in CATALOG:
-            scoring = score_results(results)
-            if scoring.bounds.is_settled:
-                stop_reason = "decision_settled"
-                break
-            if results and self.model.predict(scoring) >= self.model.tau:
-                stop_reason = "confidence_reached"
-                break
-            result, _ = ctx.fetch(spec.name, lead)
-            results[spec.name] = result
-
-        scoring = score_results(results)
-        confidence = self.model.predict(scoring)
-        cost, latency, cache_hits = collect_costs(ctx, marker)
-
-        return PolicyOutcome(
-            decision=scoring.decision,
-            confidence=confidence,
-            autonomous=confidence >= self.model.tau,
-            providers_called=tuple(results),
-            cost_usd=cost,
-            latency_ms=latency,
-            cache_hits=cache_hits,
-            stop_reason=stop_reason,
-            scoring=scoring,
-        )
-
-
 @dataclass(frozen=True)
 class WaterfallTuning:
     max_tier: str

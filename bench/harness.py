@@ -17,12 +17,12 @@ from arie.policy.adaptive import AdaptiveVoI, estimate_disqualifier_rate
 from arie.policy.base import EvidenceCache, RunContext
 from arie.policy.baselines import (
     TIER_ORDER,
-    BoundsOnlyStopping,
     FullEnrichment,
     WaterfallTuning,
     tune_waterfall,
 )
 from arie.policy.escalation_aware import EscalationAwareVoI
+from arie.policy.production import CalibratedBoundsPolicy
 from arie.policy.runner import PolicySummary, evaluate_policy
 from arie.providers.simulated import CallLedger, build_from_leads
 from bench.cost_model import HUMAN_REVIEW_PRICES
@@ -44,7 +44,7 @@ class BenchmarkRun:
     disqualifier_rate: float
 
     full: PolicySummary
-    ablation: PolicySummary
+    production: PolicySummary
     waterfalls: tuple[PolicySummary, ...]
     adaptives: tuple[PolicySummary, ...]
 
@@ -63,7 +63,7 @@ class BenchmarkRun:
     def all_summaries(self) -> list[PolicySummary]:
         return [
             self.full,
-            self.ablation,
+            self.production,
             *self.waterfalls,
             *self.adaptives,
             *self.escalation_aware.values(),
@@ -82,9 +82,22 @@ class BenchmarkRun:
         )
 
     @property
-    def evoi_saving_vs_ablation(self) -> float:
-        base = self.ablation.mean_cost_usd
+    def evoi_saving_vs_production(self) -> float:
+        """Negative means the EVoI layer costs more than the policy without it."""
+        base = self.production.mean_cost_usd
         return (base - self.best_adaptive.mean_cost_usd) / base if base else 0.0
+
+    @property
+    def production_saving_vs_waterfall(self) -> float:
+        base = self.best_waterfall.mean_cost_usd
+        return (base - self.production.mean_cost_usd) / base if base else 0.0
+
+    @property
+    def production_agreement_gap_pp(self) -> float:
+        return round(
+            (self.best_waterfall.decision_agreement - self.production.decision_agreement) * 100,
+            4,
+        )
 
 
 def _context_factory(leads: list[EvalLead]):  # type: ignore[no-untyped-def]
@@ -125,7 +138,7 @@ def run_once(seed: int, model: ConfidenceModel | None = None) -> BenchmarkRun:
     }
 
     full = evaluate_policy(FullEnrichment(model=model), test, make_test_ctx)
-    ablation = evaluate_policy(BoundsOnlyStopping(model=model), test, make_test_ctx)
+    production = evaluate_policy(CalibratedBoundsPolicy(model=model), test, make_test_ctx)
     waterfalls = [
         evaluate_policy(tunings[tier].build(model), test, make_test_ctx) for tier in TIER_ORDER
     ]
@@ -177,7 +190,7 @@ def run_once(seed: int, model: ConfidenceModel | None = None) -> BenchmarkRun:
         tau=model.tau,
         disqualifier_rate=disqualifier_rate,
         full=full,
-        ablation=ablation,
+        production=production,
         waterfalls=tuple(waterfalls),
         adaptives=tuple(adaptives),
         best_waterfall=best_waterfall,
@@ -185,7 +198,7 @@ def run_once(seed: int, model: ConfidenceModel | None = None) -> BenchmarkRun:
         verdict=evaluate_verdict(full, best_waterfall, best_adaptive),
         regrets=(
             counterfactual_regret(full, best_waterfall),
-            counterfactual_regret(full, ablation),
+            counterfactual_regret(full, production),
             counterfactual_regret(full, best_adaptive),
         ),
         tunings=tunings,

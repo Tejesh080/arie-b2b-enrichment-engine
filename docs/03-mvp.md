@@ -55,6 +55,29 @@ Fixed *before* any data exists, so the result cannot be rationalised afterwards.
 These are judgment thresholds, not predictions. Row 3 is a genuine possible
 outcome and will be reported as such.
 
+### Outcome — recorded after the fact
+
+**No policy met these criteria.** Measured across 10 seeds
+([`05-results.md`](05-results.md)):
+
+| policy | cost saving vs waterfall | agreement gap | verdict |
+|---|---|---|---|
+| adaptive EVoI | 33.5% | +1.93pp | fails the ≤1pp bar |
+| calibrated bounds (production) | 41.6% | +2.33pp | fails the ≤1pp bar |
+
+Per-seed verdicts for EVoI: `WEAK 4, THESIS_HOLDS 3, INCONCLUSIVE 2,
+THESIS_FALSIFIED 1`.
+
+Both policies trade more decision quality than the pre-registration allowed.
+They are reported as **frontier points with a stated trade-off**, not as wins.
+The criteria above are left exactly as written — moving them after seeing the
+data is the specific failure this section exists to prevent.
+
+A fourth outcome the pre-registration did not anticipate also occurred: an
+ablation built purely as a control — deterministic bounds with no
+value-of-information reasoning — beat the policy under test, and became the
+product. See [ADR 0004](adr/0004-evoi-is-a-negative-result.md).
+
 **Effort: ~40% of total project time.** Smallest by line count, largest by
 intellectual weight.
 

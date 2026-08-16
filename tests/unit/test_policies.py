@@ -22,11 +22,11 @@ from arie.policy.adaptive import (
 )
 from arie.policy.base import EvidenceCache, RunContext
 from arie.policy.baselines import (
-    BoundsOnlyStopping,
     FullEnrichment,
     TunedWaterfall,
     providers_up_to_tier,
 )
+from arie.policy.production import CalibratedBoundsPolicy
 from arie.policy.runner import evaluate_policy, summarise
 from arie.providers.catalog import BY_NAME, CATALOG
 from arie.providers.simulated import CallLedger, build_from_leads
@@ -66,7 +66,7 @@ def test_full_enrichment_is_the_cost_ceiling(sample, make_ctx, model) -> None:  
     """No policy may cost more than buying everything."""
     full = evaluate_policy(FullEnrichment(model=model), sample, make_ctx)
     for policy in (
-        BoundsOnlyStopping(model=model),
+        CalibratedBoundsPolicy(model=model),
         TunedWaterfall(model=model, max_tier="expensive"),
         AdaptiveVoI(model=model, disqualifier_rate=0.07),
     ):
@@ -220,7 +220,7 @@ def test_policies_are_deterministic(sample, make_ctx, model) -> None:  # type: i
         lambda: FullEnrichment(model=model),
         lambda: TunedWaterfall(model=model, max_tier="mid"),
         lambda: AdaptiveVoI(model=model, disqualifier_rate=0.07),
-        lambda: BoundsOnlyStopping(model=model),
+        lambda: CalibratedBoundsPolicy(model=model),
     ):
         first = evaluate_policy(policy_factory(), sample, make_ctx)
         second = evaluate_policy(policy_factory(), sample, make_ctx)
@@ -253,7 +253,7 @@ def test_every_policy_satisfies_the_interface(model) -> None:  # type: ignore[no
         FullEnrichment(model=model),
         TunedWaterfall(model=model),
         AdaptiveVoI(model=model, disqualifier_rate=0.07),
-        BoundsOnlyStopping(model=model),
+        CalibratedBoundsPolicy(model=model),
     ):
         assert isinstance(policy.name, str)
         assert callable(policy.run)
