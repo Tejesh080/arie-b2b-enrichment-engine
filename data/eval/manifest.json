@@ -12,7 +12,7 @@
     "hard": 1.94,
     "medium": 2.451
   },
-  "content_sha256": "8e3ee5829a9922af944e3386678513d162b03d821938f0dffcc940ac57ede2a5",
+  "content_sha256": "21764b970d02d67ec58c0e0ff1b447f04cfd2ed900b755bc2e2c9871bb2b0138",
   "decision_counts": {
     "auto_route": 157,
     "escalate_human": 39,

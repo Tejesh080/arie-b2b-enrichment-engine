@@ -1,35 +1,161 @@
-"""Reconcile conflicting provider observations into a single fact bundle.
+"""Reconcile conflicting evidence into a single fact bundle.
 
-Providers disagree — that is the point of having several. This module decides
-whose value wins, and it is deliberately deterministic: the same observations
-always produce the same facts, so a benchmark result never depends on dict
-ordering or iteration luck.
+Sources disagree — that is the point of having several. This module decides
+whose value wins and, just as importantly, records *that* they disagreed, since
+unresolved disagreement is one of the strongest signals that a decision is not
+yet safe to make autonomously.
 
-Conflict policy: **highest provider precision for that field wins**, ties broken
-by provider name for stability. Precision here is a static property of the
-catalogue (a premium firmographics source is more trustworthy on employee_count
-than a website scrape), not something inferred at runtime.
+Two things are deliberate here:
+
+**Resolution is deterministic.** The same inputs always produce the same facts,
+so a benchmark result never depends on dict ordering or iteration luck.
+
+**Conflict is measured in score impact, not raw value difference.** Two sources
+reporting 180 and 210 employees both land in the same band and contribute
+identical points — that is not a decision-relevant conflict, and counting it as
+one would flood the confidence model with noise. Two sources reporting 40 and 60
+straddle a band boundary and genuinely disagree about the score.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
-from arie.core.types import ProviderStatus
+from arie.core.types import Evidence, ProviderStatus
 from arie.evalgen.schema import ProviderObservation
 from arie.providers.catalog import BY_NAME
+from arie.scoring.rules import SCORED_FIELDS, field_points
+
+# Disagreements smaller than this many points are treated as agreement. Guards
+# against float noise in continuous fields (e.g. two intent readings of 0.7001
+# and 0.7002) being reported as conflict.
+CONFLICT_EPSILON = 0.5
 
 
-def _field_precision(provider_name: str) -> float:
-    """How much to trust a provider, derived from its declared error rates.
+@dataclass(frozen=True)
+class Candidate:
+    """One source's claim about one field."""
 
-    Deriving this from the catalogue rather than hardcoding a separate table
+    field_name: str
+    value: Any
+    source: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class FieldResolution:
+    """The winning value for a field, plus what was overruled to get there."""
+
+    field_name: str
+    value: Any
+    source: str
+    confidence: float
+    candidate_count: int
+    conflict_points: float
+    """Largest score-relevant disagreement among candidates, in points."""
+
+    @property
+    def contested(self) -> bool:
+        return self.conflict_points > CONFLICT_EPSILON
+
+
+def _conflict_points(candidates: Sequence[Candidate]) -> float:
+    """Widest score gap between any two candidates for a field."""
+    if len(candidates) < 2:
+        return 0.0
+    points = [field_points(c.field_name, c.value) for c in candidates]
+    return max(points) - min(points)
+
+
+def resolve_candidates(candidates: Iterable[Candidate]) -> dict[str, FieldResolution]:
+    """Pick a winner per field: highest confidence, ties broken by source name.
+
+    Tie-breaking on the source name is arbitrary but *stable*, which is what
+    matters — an unstable tiebreak would make scores depend on evidence
+    insertion order.
+    """
+    grouped: dict[str, list[Candidate]] = {}
+    for candidate in candidates:
+        if candidate.field_name not in SCORED_FIELDS or candidate.value is None:
+            # A null from a source is not evidence of absence, just an
+            # unresolved attribute.
+            continue
+        grouped.setdefault(candidate.field_name, []).append(candidate)
+
+    resolutions: dict[str, FieldResolution] = {}
+    for field_name, group in sorted(grouped.items()):
+        winner = max(group, key=lambda c: (c.confidence, c.source))
+        resolutions[field_name] = FieldResolution(
+            field_name=field_name,
+            value=winner.value,
+            source=winner.source,
+            confidence=winner.confidence,
+            candidate_count=len(group),
+            conflict_points=_conflict_points(group),
+        )
+    return resolutions
+
+
+def facts_from(resolutions: Mapping[str, FieldResolution]) -> dict[str, Any]:
+    return {name: resolution.value for name, resolution in resolutions.items()}
+
+
+# --- adapters ----------------------------------------------------------------
+
+
+def _observation_precision(provider_name: str) -> float:
+    """Trust in a provider, derived from its declared error rates.
+
+    Deriving this from the catalogue rather than maintaining a parallel table
     means a provider's trustworthiness cannot drift out of sync with the noise
     actually applied to its observations.
     """
     spec = BY_NAME[provider_name]
     return 1.0 - max(spec.categorical_error, spec.numeric_noise)
+
+
+def candidates_from_observations(
+    observations: Mapping[str, ProviderObservation],
+    allowed_providers: Iterable[str] | None = None,
+) -> list[Candidate]:
+    allowed = set(allowed_providers) if allowed_providers is not None else None
+    candidates: list[Candidate] = []
+
+    for provider_name in sorted(observations):
+        if allowed is not None and provider_name not in allowed:
+            continue
+        observation = observations[provider_name]
+        if observation.status is not ProviderStatus.SUCCESS:
+            continue
+        precision = _observation_precision(provider_name)
+        candidates.extend(
+            Candidate(
+                field_name=field_name, value=value, source=provider_name, confidence=precision
+            )
+            for field_name, value in sorted(observation.fields.items())
+        )
+    return candidates
+
+
+def candidates_from_evidence(evidence: Iterable[Evidence], now: datetime) -> list[Candidate]:
+    """Evidence competes on *staleness-discounted* confidence.
+
+    A cached fact is neither free-and-perfect nor worthless. Decaying its
+    confidence with age is what lets a zero-cost stale value lose honestly to a
+    fresh paid one, instead of being either blindly trusted or discarded.
+    """
+    return [
+        Candidate(
+            field_name=item.field_name,
+            value=item.value,
+            source=item.source,
+            confidence=item.effective_confidence(now),
+        )
+        for item in evidence
+    ]
 
 
 def merge_observations(
@@ -39,33 +165,12 @@ def merge_observations(
     """Collapse observations into the fact dict the scorer consumes.
 
     ``allowed_providers`` restricts which sources are visible — this is how the
-    validity gate evaluates a cheap-tier-only policy against the full-information
-    ceiling using exactly the same code path.
+    validity gate evaluates a cheap-tier-only policy against the
+    full-information ceiling through exactly the same code path.
     """
-    allowed = set(allowed_providers) if allowed_providers is not None else None
-
-    # field -> (precision, provider_name, value)
-    best: dict[str, tuple[float, str, Any]] = {}
-
-    for provider_name in sorted(observations):
-        if allowed is not None and provider_name not in allowed:
-            continue
-
-        obs = observations[provider_name]
-        if obs.status is not ProviderStatus.SUCCESS:
-            continue
-
-        precision = _field_precision(provider_name)
-        for field_name, value in sorted(obs.fields.items()):
-            if value is None:
-                # A provider returning null for a field is not evidence of
-                # absence; it just did not resolve that attribute.
-                continue
-            current = best.get(field_name)
-            if current is None or (precision, provider_name) > (current[0], current[1]):
-                best[field_name] = (precision, provider_name, value)
-
-    return {name: value for name, (_, _, value) in best.items()}
+    return facts_from(
+        resolve_candidates(candidates_from_observations(observations, allowed_providers))
+    )
 
 
 def merged_cost(

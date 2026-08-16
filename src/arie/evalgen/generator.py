@@ -480,11 +480,26 @@ def _generate_person(
 
 
 def _observe_field(rng: random.Random, spec: ProviderSpec, field_name: str, truth: Any) -> Any:
+    # A provider that covers a field always reports *something* about it. For
+    # the trigger event that means either a signal it found, or `False` meaning
+    # "looked, found nothing". `None` is reserved for "this provider does not
+    # cover the field at all".
+    #
+    # The distinction matters for score bounds: "no trigger exists" caps the
+    # reachable score, whereas "unchecked" leaves 10 points in play. Conflating
+    # them would keep leads looking unsettled after they were in fact settled,
+    # making the policy buy more than necessary and understating the savings
+    # adaptive enrichment can achieve.
+    if field_name == "recent_trigger_event":
+        if truth is None:
+            # False positive: a provider occasionally invents a signal.
+            if rng.random() < spec.categorical_error * 0.5:
+                return rng.choice(sorted(_TRIGGER_EVENTS))
+            return False
+        # False negative: it missed a real one, and reports "none found".
+        return False if rng.random() < spec.categorical_error else truth
+
     if truth is None:
-        # An absent trigger event is genuinely absent; a provider may still
-        # falsely report one at its categorical error rate.
-        if field_name == "recent_trigger_event" and rng.random() < spec.categorical_error * 0.5:
-            return rng.choice(sorted(_TRIGGER_EVENTS))
         return None
 
     if field_name == "employee_count":
@@ -509,10 +524,6 @@ def _observe_field(rng: random.Random, spec: ProviderSpec, field_name: str, trut
     if field_name == "disqualifying_flag":
         flipped = rng.random() < spec.categorical_error
         return (not bool(truth)) if flipped else bool(truth)
-
-    if field_name == "recent_trigger_event":
-        # Missing a real signal is far more common than inventing one.
-        return None if rng.random() < spec.categorical_error else truth
 
     return truth
 
