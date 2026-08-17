@@ -149,6 +149,10 @@ class ReceiptProviders:
 
 @dataclass(frozen=True)
 class ReceiptHumanReview:
+    review_id: UUID
+    """Enough for a caller to act on the review — `GET /reviews/{review_id}` for its
+    current `lead_version`, then `POST /reviews/{review_id}/decision` — without any
+    other way to discover the id (there is no `GET /leads/{lead_id}/reviews`)."""
     required: bool
     reviewer: str | None
     original_decision: str | None
@@ -204,7 +208,7 @@ _SELECT_PROVIDER_CALLS = """
 """
 
 _SELECT_HUMAN_REVIEW = """
-    SELECT reviewer, original_decision, final_decision, responded_at
+    SELECT review_id, reviewer, original_decision, final_decision, responded_at
     FROM human_reviews
     WHERE lead_id = %(lead_id)s
     ORDER BY requested_at DESC
@@ -263,6 +267,7 @@ def _human_review(
 
     return (
         ReceiptHumanReview(
+            review_id=row["review_id"],
             required=True,
             reviewer=row["reviewer"],
             original_decision=row["original_decision"],

@@ -726,6 +726,69 @@ phase.
 
 ---
 
+## Post-M1 P2 — One-command demo
+
+**Purpose.** P1 made ARIE's decisions legible through an API; P2 makes that
+legible to a reviewer who doesn't want to construct JSON or call
+`Invoke-RestMethod` by hand. `.\scripts\demo.ps1` starts the stack if needed,
+drives a handful of deterministic corpus leads through ARIE's public HTTP API
+only, and renders a terminal summary plus a static HTML report — see the
+README's [60-second local demo](../README.md#60-second-local-demo) section.
+
+**Files.** `scripts/demo.ps1` is a thin Windows launcher (resolve `.venv`,
+forward `-Fresh`, invoke the Python entry point, propagate the exit code) —
+all the logic lives in the portable, unit-tested `scripts/demo/` package:
+`corpus.py` (selects and verifies deterministic demo identities against the
+policy actually running today, never hardcoding an untested assumption),
+`client.py` (a bounded HTTP client — every request and every polling loop has
+a wall-clock timeout, never hangs), `stack.py` (bounded `docker compose`
+orchestration, `db`/`migrate`/`api`/`worker` only, never `n8n`),
+`scenarios.py` (orchestrates the scenarios below against a `DemoApiClient`
+Protocol both the real client and tests satisfy), `render.py` (receipt dict
+-> presentation mapping — the one place `providers.called` gets split into
+fresh calls vs. cache reuses), `report.py` (HTML/JSON generation, every
+interpolated value escaped), and `cli.py` (orchestration entry point).
+
+**One small API addition, not a demo-only backdoor.** The receipt's
+`human_review` section didn't expose `review_id` in P1 — there is no
+`GET /leads/{lead_id}/reviews` endpoint, so a caller who only reads receipts
+had no way to act on a pending review at all. Adding `review_id` there is
+generally useful (any client of the receipt, not just this demo) and is the
+only way `scenarios.py`'s human-review flow avoids querying Postgres
+directly.
+
+**Scenarios demonstrated:**
+
+- **A — autonomous decision.** `nadia.delacroix@lumen500.com`
+  (`AUTO_ROUTED`), rendered with score/bounds/confidence/tau/stop-reason/cost,
+  and fresh-vs-cache provider activity.
+- **B — human escalation and override.** `nadia.haddad@cobalt500.com`
+  escalates (`recommended_action="reject"`, `autonomous=False`); the demo
+  approves it via `POST /reviews/{review_id}/decision` (reviewer
+  `arie-demo`) and re-fetches the receipt. The frozen recommendation and the
+  live override are shown side by side — never collapsed into "ARIE decided
+  AUTO_ROUTED," the exact failure mode P1's own brief warned against.
+- **C — idempotent redelivery.** Scenario A's exact `(source, external_ref)`
+  is POSTed a second time in the same run; the report shows `created`/
+  `job_created` both `False` on the redelivery.
+- **D — company-level evidence reuse.** Two distinct corpus contacts sharing
+  a company, chosen deterministically (lowest-sorting domain with >=2 people).
+  Only rendered if the second lead's receipt shows at least one measured
+  cache reuse this run — never a fabricated saving; omitted entirely if the
+  corpus has no such pair or no reuse was observed.
+
+**Intentional omissions.** `estimated_cost_avoided_usd` — same reasoning as
+P1, not revisited here. No claim that a `not_called` provider was
+individually evaluated and rejected — `CalibratedBoundsPolicy` doesn't do
+that (see P1's own note above); the report says "not called this run," not
+"skipped because it couldn't change the decision." No M0 benchmark framing
+(cost/quality trade-off numbers) anywhere in the generated report — the
+footer points to `docs/05-results.md` instead of restating or summarizing it.
+No UI framework, no CDN dependency, no build step — plain generated HTML/CSS.
+`n8n` is never started or required.
+
+---
+
 ## Do not
 
 - Resurrect or tune EVoI.

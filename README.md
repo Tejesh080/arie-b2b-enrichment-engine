@@ -167,6 +167,37 @@ byte-for-byte — reproducibility is a design goal enforced in CI, not a claim.
 
 ---
 
+## 60-second local demo
+
+The fastest way to see ARIE decide, escalate, and honor a human override —
+no PowerShell/API knowledge, no raw JSON. Requires
+[Docker](https://www.docker.com/products/docker-desktop/) installed and running.
+
+```powershell
+git clone https://github.com/Tejesh080/Adaptive-Revenue-Intelligence-Engine.git
+cd Adaptive-Revenue-Intelligence-Engine
+.\scripts\demo.ps1
+```
+
+```text
+Demo complete.
+Report: demo-output\arie-demo.html
+```
+
+Open that file directly in a browser — no server required. It starts the
+required Docker services if they aren't already running (`db`, `migrate`,
+`api`, `worker` — never `n8n`), submits a handful of deterministic corpus
+leads, and renders every number in the report from a live
+[`GET /leads/{lead_id}/receipt`](#decision-receipt) response: an autonomous
+decision, a human escalation with the override preserved next to the original
+recommendation, company-level evidence reuse, and proof that redelivering the
+same request doesn't create duplicate work. The run is non-destructive by
+default; `.\scripts\demo.ps1 -Fresh` wipes local Docker volumes first if you
+want a clean-slate run (this deletes local ARIE demo data). See
+[`scripts/demo/`](scripts/demo/) for the Python runner the script wraps.
+
+---
+
 ## n8n edge workflows
 
 Two thin workflows, importable as-is, plus a local helper. No business logic

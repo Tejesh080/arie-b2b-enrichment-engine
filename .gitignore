@@ -43,6 +43,9 @@ bench/out/
 *.png
 !docs/assets/*.png
 
+# One-command demo output (reproducible via `scripts/demo.ps1`)
+demo-output/
+
 # Raw provider payloads (may contain PII)
 data/raw/
 

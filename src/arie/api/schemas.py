@@ -278,6 +278,7 @@ class ReceiptProvidersResponse(BaseModel):
 class ReceiptHumanReviewResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    review_id: UUID
     required: bool
     reviewer: str | None
     original_decision: str | None
