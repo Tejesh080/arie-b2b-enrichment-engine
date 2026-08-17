@@ -92,6 +92,62 @@ TERMINAL: frozenset[LeadStatus] = frozenset(
     }
 )
 
+# --- business-semantic status groups ----------------------------------------
+#
+# A *different axis* from TERMINAL above, which is about whether this
+# module's job-queue mechanism auto-advances a status -- a mechanical
+# property. These are about what a status *means* to a downstream consumer
+# (a cost metric, an outcome-sync webhook): AUTO_ROUTED and MANUAL_REVIEW are
+# both business-finalized outcomes but neither is in TERMINAL, because
+# nothing auto-advances either one yet either way (see TERMINAL's own
+# comment) -- "finalized" and "the graph won't move this further on its own"
+# are related but not the same claim, and conflating them is exactly how
+# three different, silently-drifting definitions of "finalized" (this
+# module's TERMINAL, the n8n outcome-sync gate, and the CI smoke test) ended
+# up disagreeing with each other and with themselves. These groups are the
+# one place that vocabulary is defined; everything else -- SQL views, n8n's
+# JSON, CI -- must be read off these rather than restating the status list.
+
+QUALIFIED: frozenset[LeadStatus] = frozenset(
+    {
+        LeadStatus.AUTO_ROUTED,
+        LeadStatus.ROUTED,
+        LeadStatus.MANUAL_REVIEW,
+    }
+)
+"""The policy or a human decided this lead was worth routing onward --
+`v_pipeline_metrics.cost_per_qualified_lead`'s actual numerator. Deliberately
+excludes SYNCED: that status is `DECISION_OUTCOMES`/`HUMAN_REVIEW_OUTCOMES`'s
+own *reject* terminal (see their comments above), not a qualified lead that
+happened to finish syncing. A metric counting SYNCED as qualified rewards
+rejecting more leads -- the exact inversion 0005 already fixed once for the
+automatic-reject path; MANUAL_REVIEW being excluded from the *old* filter
+was the same bug on the human-review path, just never named as such."""
+
+REJECTED: frozenset[LeadStatus] = frozenset({LeadStatus.SYNCED})
+"""The reject branch's terminal, named for what it means rather than for
+what the status happens to be called -- both the automatic reject
+(DECISION_OUTCOMES) and a human's reject (HUMAN_REVIEW_OUTCOMES) land here."""
+
+AWAITING_REVIEW: frozenset[LeadStatus] = frozenset({LeadStatus.AWAITING_HUMAN})
+"""Paused on a human, not finalized -- distinct from both QUALIFIED/REJECTED
+(ARIE finished deciding) and FAILURE (ARIE broke). A downstream consumer
+polling for "is this lead done" must keep waiting on this one, not treat it
+as either success or failure."""
+
+FAILURE: frozenset[LeadStatus] = frozenset({LeadStatus.FAILED, LeadStatus.DEAD_LETTER})
+"""Processing broke, permanently -- not a business decision at all. A
+downstream consumer polling for "is this lead done" must be told this
+explicitly rather than being left in a "not finalized yet" loop forever,
+since nothing further happens to these leads without manual intervention."""
+
+FINALIZED: frozenset[LeadStatus] = QUALIFIED | REJECTED
+"""Every status ARIE's own decisioning (policy or human review) has finished
+making a call on. This is "finalized" from a downstream consumer's point of
+view -- e.g. what `workflows/n8n/outcome-sync.json`'s own gate means, and
+what `tests/unit/test_n8n_workflows.py` checks that gate's literal status
+list against, so the two can't silently drift apart again."""
+
 
 def job_type_for(status: LeadStatus) -> str | None:
     """The job type that advances a lead out of `status`, or None if nothing does yet."""

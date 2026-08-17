@@ -134,6 +134,81 @@ def test_get_all_fresh_excludes_other_entities(
     assert {e.entity_id for e in fresh} == {entity_id}
 
 
+def test_get_all_fresh_returns_one_row_per_field_and_source_after_a_mixed_ttl_refresh(
+    evidence_store: PostgresEvidenceStore, cleanup_evidence: list[UUID]
+) -> None:
+    """Regression for the M1 audit's evidence-dedup finding: a provider
+    declaring both a 90-day-TTL field (industry) and a 30-day-TTL field
+    (employee_count) gets re-called once the short-TTL field expires, and
+    re-writes *all* its fields -- including the long-TTL one that was still
+    fresh. Before the DISTINCT ON fix, the entity ends up with two
+    simultaneously-fresh 'industry' rows from the same source, and a reader
+    (arie.scoring.merge.candidates_from_evidence, or any future direct
+    consumer of get_all_fresh -- not just today's cache, which happens to
+    dedup defensively on its own) sees them as two independent observations:
+    one source disagreeing with its own earlier reading, not a real conflict.
+    """
+    entity_id = uuid4()
+    cleanup_evidence.append(entity_id)
+    day_zero = NOW - timedelta(days=31)
+    ninety_days = 90 * 86400
+    thirty_days = 30 * 86400
+
+    # Day 0: the provider answers both fields.
+    evidence_store.put_many(
+        [
+            _evidence(
+                entity_id,
+                field_name="industry",
+                value="fintech",
+                ttl_seconds=ninety_days,
+                fetched_at=day_zero,
+            ),
+            _evidence(
+                entity_id,
+                field_name="employee_count",
+                value=250,
+                ttl_seconds=thirty_days,
+                fetched_at=day_zero,
+            ),
+        ]
+    )
+
+    # Day 31: employee_count's TTL expired; the provider is re-called and
+    # answers both fields again. industry's day-0 row is still fresh (90-day
+    # TTL) when this lands, so the entity now holds two fresh industry rows
+    # from the same source.
+    evidence_store.put_many(
+        [
+            _evidence(
+                entity_id,
+                field_name="industry",
+                value="fintech",
+                ttl_seconds=ninety_days,
+                fetched_at=NOW,
+            ),
+            _evidence(
+                entity_id,
+                field_name="employee_count",
+                value=260,
+                ttl_seconds=thirty_days,
+                fetched_at=NOW,
+            ),
+        ]
+    )
+
+    fresh = evidence_store.get_all_fresh("company", entity_id, now=NOW + timedelta(minutes=1))
+
+    by_field_and_source = [(e.field_name, e.source) for e in fresh]
+    assert len(by_field_and_source) == len(set(by_field_and_source)), (
+        f"more than one fresh row for the same field+source: {by_field_and_source}"
+    )
+
+    industry_rows = [e for e in fresh if e.field_name == "industry"]
+    assert len(industry_rows) == 1
+    assert industry_rows[0].fetched_at == NOW, "the newest row must win, not an arbitrary one"
+
+
 def test_put_many_persists_every_item(
     evidence_store: PostgresEvidenceStore, cleanup_evidence: list[UUID]
 ) -> None:

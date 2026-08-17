@@ -88,6 +88,10 @@ class IngestLeadResponse(BaseModel):
     person_id: UUID
     job_id: UUID
     job_created: bool
+    job_requeued: bool
+    """True if this delivery found the job permanently failed (``dead_letter``)
+    and reset it to ``pending`` with a fresh attempt budget, rather than
+    finding a live or completed job untouched."""
 
 
 class LeadCostResponse(BaseModel):

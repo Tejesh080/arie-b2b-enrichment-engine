@@ -276,6 +276,54 @@ def test_worker_cycle_fails_a_job_with_no_registered_handler(
         assert row == ("pending", 1)
 
 
+def test_worker_cycle_reports_lost_lease_when_ownership_moves_mid_handler(
+    job_queue: PostgresJobQueue,
+    worker_pool: ConnectionPool,
+    db_conn: psycopg.Connection,
+    cleanup_jobs: list[UUID],
+) -> None:
+    """The worker-loop-level guarantee behind the ownership-fencing fix
+    (arie.jobs.queue.JobOwnershipError): if this worker's lease moves to
+    another worker while its handler is still running -- the same shape as a
+    real lease expiring mid-handler and being reclaimed -- `complete()` must
+    refuse to write, and the cycle must report `lost_lease` rather than
+    either crashing the whole loop or silently marking the job done out from
+    under whoever now owns it."""
+    enqueued = job_queue.enqueue(lead_id=None, job_type="lease_stolen_mid_handler")
+    cleanup_jobs.append(enqueued.job_id)
+
+    def handler(ctx: JobContext) -> None:
+        # Simulates a concurrent claim() reclaiming this exact job's expired
+        # lease while this handler is still running, on a separate
+        # connection so it's visible to complete()'s own connection after.
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "UPDATE jobs SET locked_by = 'thief', locked_at = now() WHERE job_id = %s",
+                (ctx.job.job_id,),
+            )
+        db_conn.commit()
+        return None
+
+    results = run_worker_cycle(
+        job_queue,
+        worker_pool,
+        {"lease_stolen_mid_handler": handler},
+        worker_id="victim",
+        batch_size=1,
+    )
+
+    assert len(results) == 1
+    assert results[0].outcome == "lost_lease"
+    assert "no longer holds" in (results[0].detail or "")
+
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT status, locked_by FROM jobs WHERE job_id = %s", (enqueued.job_id,))
+        row = cur.fetchone()
+    assert row == ("processing", "thief"), (
+        "the thief's ownership must survive victim's stale report"
+    )
+
+
 def test_reprocessing_after_a_crash_applies_the_transition_exactly_once(
     job_queue: PostgresJobQueue,
     worker_pool: ConnectionPool,

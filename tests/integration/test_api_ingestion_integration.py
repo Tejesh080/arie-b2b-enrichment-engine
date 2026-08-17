@@ -180,6 +180,50 @@ def test_redelivering_the_same_record_creates_no_second_lead_or_job(
     )
 
 
+def test_redelivering_after_the_job_dead_letters_requeues_it(
+    api_client: TestClient, db_conn: psycopg.Connection, cleanup_ingest: IngestCleanup
+) -> None:
+    """The audit's literal reproduction: before this fix, a webhook redelivered
+    after the lead's job permanently failed matched the dead row forever —
+    `job_created: false`, HTTP 200, and no worker would ever claim the lead
+    again, indistinguishable from ordinary successful idempotent redelivery
+    until someone went looking at `jobs.status` directly."""
+    domain, email = _identity(cleanup_ingest)
+    payload = _payload(email, domain)
+
+    first = api_client.post("/leads", json=payload)
+    assert first.status_code == 201
+    lead_id = uuid.UUID(first.json()["lead_id"])
+    job_id = uuid.UUID(first.json()["job_id"])
+    cleanup_ingest.lead_ids.append(lead_id)
+
+    # Simulate the job exhausting its attempt budget, exactly as
+    # arie.jobs.queue.PostgresJobQueue.fail would leave it.
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE jobs SET status = 'dead_letter', attempt_count = 4, "
+            "last_error = 'simulated permanent failure' WHERE job_id = %s",
+            (job_id,),
+        )
+    db_conn.commit()
+
+    # Upstream redelivers the exact same webhook — the only signal it has
+    # that this lead needs processing.
+    second = api_client.post("/leads", json=payload)
+
+    assert second.status_code == 200
+    assert second.json()["created"] is False, "same lead, not a duplicate"
+    assert second.json()["job_id"] == str(job_id), "same job row, requeued in place"
+    assert second.json()["job_created"] is False, "not a *new* job — the dead one came back"
+    assert second.json()["job_requeued"] is True
+
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT status, attempt_count FROM jobs WHERE job_id = %s", (job_id,))
+        row = cur.fetchone()
+    assert row is not None
+    assert row == ("pending", 0), "claimable again, with a fresh attempt budget"
+
+
 def test_lead_without_external_ref_is_not_deduplicated(
     api_client: TestClient, db_conn: psycopg.Connection, cleanup_ingest: IngestCleanup
 ) -> None:
@@ -376,6 +420,29 @@ def test_healthz_reports_degraded_when_schema_is_incomplete(
                 ("0002_metrics_views.sql", checksum_of(real.read_text(encoding="utf-8"))),
             )
         db_conn.commit()
+
+
+def test_healthz_never_reports_ok_when_migration_discovery_fails(
+    api_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The audit-fixed bug: a `pending_migrations` that can't see the
+    migrations directory used to return `[]` (nothing pending), which made
+    this endpoint report `ok` on a database whose actual schema state is
+    unknown. It must report `degraded`, the same as a real pending migration
+    — see `healthz`'s own docstring for why "I can't tell" and "ok" must
+    never be the same response."""
+    import arie.api.main as main_module
+    from arie.migrations import MigrationsDirectoryError
+
+    def _raise(*args: object, **kwargs: object) -> list[str]:
+        raise MigrationsDirectoryError("simulated: migrations directory not found")
+
+    monkeypatch.setattr(main_module, "pending_migrations", _raise)
+
+    response = api_client.get("/healthz")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "degraded", "database": True, "schema_ready": False}
 
 
 # --------------------------------------------------------------- rollback --

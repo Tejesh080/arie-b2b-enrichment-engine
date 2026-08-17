@@ -10,7 +10,9 @@ Written to be read cold, in a fresh session, with no memory of how M0 went.
 result is published — including the part that failed. Everything runs offline
 and deterministically; no credentials, no network.
 
-**M1 Steps 6–13 are complete.** Steps 6–9 (schema/migrations/evidence store,
+**M1 Steps 6–13 are complete, and M1 is frozen as of a post-freeze audit pass
+that found and fixed 7 real defects** — see "Post-M1 audit freeze fixes"
+below for what they were and how each was verified. Steps 6–9 (schema/migrations/evidence store,
 identity resolution, job queue/state machine, ingestion API, cost ledger,
 tracing) are verified against the live production Supabase database. Step 10
 (`arie.llm` — DeepSeek buying-signal extraction) needs no database at all and
@@ -512,6 +514,156 @@ interface.
     (still refuses anything but `simulated`), or the hosted-n8n boundary
     (still nothing connects to one). This step was hardening, not new
     surface area.
+
+---
+
+## Post-M1 audit freeze fixes
+
+An independent audit against commit `0794c62` (Step 13) found 7 genuine
+correctness defects worth fixing before freezing M1, and a separate list of
+things deliberately *not* worth fixing (Category 2/3 — see the audit itself
+for the full list; nothing there was acted on here, on purpose). All 7 are
+fixed, each with a regression test, and each is noted below with how it was
+verified — several were reproduced against a live database or a real
+container before being fixed, not just reasoned about.
+
+1. **Dead-lettered jobs were permanently unrecoverable.** `jobs.idempotency_key`
+   is a plain UNIQUE, not scoped by status, so a webhook redelivered after a
+   job exhausted its attempts matched the dead row forever —
+   `job_created: false`, HTTP 200, and no worker would ever claim the lead
+   again. `arie.jobs.queue._ENQUEUE` now requeues a `dead_letter` match
+   (fresh attempt budget, lease cleared) instead of leaving it alone; every
+   other status keeps the exact prior idempotent behaviour. `EnqueuedJob`
+   and the API response both gained `requeued`/`job_requeued` so a caller can
+   tell "already in flight" apart from "just recovered from permanent
+   failure." **Reproduced twice** — once via a standalone probe script
+   against local Postgres during the audit, once for real inside the rebuilt
+   Docker container afterward (`job_requeued: true`, immediately
+   reprocessed to `AUTO_ROUTED`) — and is now the subject of
+   `tests/integration/test_job_queue_integration.py`'s and
+   `test_api_ingestion_integration.py`'s dead-letter tests.
+
+2. **`complete()`/`fail()` had no ownership check.** Both matched a job by
+   `job_id` alone, so a *stale* worker (lease reclaimed after expiring, or a
+   lost claim race) could resurrect a job another worker already finished,
+   or double-count a single real failure — once via
+   `_RECLAIM_EXPIRED_LEASES`'s own reclaim, again via the stale worker's late
+   report, dead-lettering jobs at roughly half their configured budget.
+   Fixed with a `WHERE status = 'processing' AND locked_by = %(worker_id)s`
+   predicate on every write (`arie.jobs.queue.JobOwnershipError` when it
+   doesn't match — the same compare-and-swap-and-raise shape
+   `OptimisticConcurrencyError`/`ReviewConflictError` already use elsewhere
+   in this codebase, not new infrastructure). `arie.jobs.worker` threads
+   `worker_id` through and reports a `"lost_lease"` outcome rather than
+   crashing the whole cycle. **Reproduced** via two standalone probe scripts
+   against local Postgres (resurrection after completion; double-counted
+   attempt after reclaim) during the audit; both scenarios are now
+   `tests/integration/test_job_queue_integration.py` tests
+   (`test_a_stale_worker_cannot_*`), plus a worker-loop-level test in
+   `test_statemachine_integration.py` proving the cycle reports `lost_lease`
+   instead of raising.
+
+3. **Migration discovery failed open.** `Path.glob()` on a nonexistent
+   directory returns `[]`, not an error, so a wrong `MIGRATIONS_DIR` (e.g.
+   after ever switching the Dockerfile to a non-editable install, where the
+   `parents[2]` arithmetic `arie.migrations` depends on no longer lands in
+   the repo root) made `pending_migrations` report "nothing pending" and
+   `/healthz` report `ok` on a database with no schema at all — a readiness
+   check whose failure mode was "silently always healthy." `migration_files`
+   now raises `MigrationsDirectoryError` if the directory is missing or has
+   zero `*.sql` files (this repo always ships at least `0001_init.sql`, so
+   zero found means the path is wrong); `/healthz` treats that the same as a
+   real pending migration (`degraded`, never `ok`). **Reproduced** — the
+   empty-list return was confirmed directly against a missing path during
+   the audit — and is now `tests/unit/test_migrate.py`'s and
+   `tests/integration/test_api_ingestion_integration.py::
+   test_healthz_never_reports_ok_when_migration_discovery_fails`.
+
+4. **A failed CRM sync reported success.** `outcome-sync.json`'s "POST Mock
+   CRM Sink" node sets `neverError: true` and connected straight to a node
+   hardcoding `synced: true, responseCode: 200` — no status check at all, so
+   a 500 from the sink still answered `{"synced": true}`. A new
+   `Sink Succeeded?` IF node now gates on `statusCode` before responding; a
+   non-2xx routes to a new `Respond (Sink Failed)` node (502, `synced: false`,
+   the sink's real status/body preserved). Verified structurally (parses,
+   the connection graph actually branches, the failure response never
+   contains `synced: true` or a 200) in `tests/unit/test_n8n_workflows.py`
+   — **not** re-verified against a live n8n instance; that would need a
+   deliberately-failing mock sink wired up in the local Docker n8n, which
+   this pass didn't do.
+
+5. **Three inconsistent definitions of "finalized," and permanent failures
+   polled forever.** `arie.statemachine.transitions.TERMINAL`, the CI smoke
+   test, and `outcome-sync.json`'s gate each listed a different status set,
+   and none of them told a `FAILED`/`DEAD_LETTER` lead apart from one still
+   genuinely in progress — `outcome-sync` answered
+   `{"synced": false, "reason": "lead not finalized"}` forever for a lead
+   that would never finalize. `arie.statemachine.transitions` now defines
+   the vocabulary once — `QUALIFIED`, `REJECTED`, `AWAITING_REVIEW`,
+   `FAILURE`, and `FINALIZED = QUALIFIED | REJECTED` — a **different axis**
+   from the pre-existing `TERMINAL` (which is about whether this module's
+   own job-queue mechanism auto-advances a status, not business meaning; see
+   both sets' docstrings). `outcome-sync.json` gained an
+   `Is Permanently Failed?` branch responding `{synced: false, terminal:
+   true, reason: 'lead processing failed permanently'}` — distinguishable
+   from the still-waiting case, which now explicitly says `terminal: false`.
+   `tests/unit/test_n8n_workflows.py` reads the literal status lists back out
+   of the committed JSON and asserts them against the Python vocabulary, so
+   the two can't silently drift apart again the way they already had.
+
+6. **`cost_per_qualified_lead` still had the wrong qualified set.** 0005
+   already fixed this view once (excluding the *reject* terminal `SYNCED`
+   from "qualified"), but that fix predates Step 11's human-review path and
+   used `('AUTO_ROUTED','ROUTED')` — `ROUTED` is not reachable by anything in
+   this codebase (reserved for a future CRM-sync step), and `MANUAL_REVIEW`
+   (the terminal a human's `action=edit` decision reaches) was missing
+   entirely, so every human-edited lead's spend vanished from both sides of
+   the ratio. `migrations/0007_qualified_lead_definition.sql` corrects the
+   filter to `('AUTO_ROUTED','ROUTED','MANUAL_REVIEW')` — the same set
+   `arie.statemachine.transitions.QUALIFIED` now defines once.
+   **Verified as a real regression**, not just reasoned about: the new
+   `tests/integration/test_cost_ledger_integration.py::
+   test_v_pipeline_metrics_counts_manual_reviewed_leads_as_qualified` was run
+   against the pre-fix view definition first (confirmed to fail — a
+   MANUAL_REVIEW lead's cost made the metric `None` instead of reflecting
+   it) and against the corrected one after (confirmed to pass), by directly
+   re-executing both view definitions against the local database, not by
+   inference.
+
+7. **Same-source evidence rows could be simultaneously fresh and treated as
+   conflicting.** `evidence` has no uniqueness constraint on `(entity_type,
+   entity_id, field_name, source)` — deliberate, see `put_many`'s docstring,
+   history is the point — so a provider whose declared fields have different
+   TTLs (e.g. a 90-day field and a 30-day field) gets re-called once the
+   short-TTL field expires and re-writes *all* its fields, including the
+   long-TTL one that was still fresh. `_SELECT_ALL_FRESH` had no `DISTINCT
+   ON`, so a direct reader got both rows and would score one source as
+   disagreeing with its own earlier reading. (The currently-wired production
+   path, `arie.policy.evidence_view.candidates_from_results`, turned out to
+   be structurally immune — it builds from a `Mapping[str, ProviderResult]`,
+   one entry per provider by construction — and `_DurableEvidenceCache.get`
+   already deduped defensively; the exposure was in `get_all_fresh` as a
+   general-purpose read API future callers would inherit, `arie.scoring.
+   merge.candidates_from_evidence` among them.) Fixed with `DISTINCT ON
+   (field_name, source)` in the read query — nothing stored is deleted or
+   upserted over; older rows stay for audit, only what counts as *current*
+   changed. **Verified as a real regression**, the same way as item 6: the
+   new mixed-TTL test in `tests/integration/test_evidence_store_integration.py`
+   was confirmed to fail against the pre-fix query (returned 2 fresh
+   `industry` rows from the same source) and pass against the fix, by
+   directly re-executing both query definitions against the local database.
+
+**What this pass deliberately did not touch:** any Category 2 finding from
+the audit (missing FK indexes, `ON DELETE` policy gaps, timezone-dependent
+`date_trunc` metrics, the `p50`/`p95` latency padding, CI blind spots like
+`docker compose ps -q` returning empty for a crashed container, the broken
+`arie-bench` console script, and more — all real, all deliberately deferred,
+not silently dropped) or any Category 3 item (no distributed locks, no
+outbox pattern, no event sourcing, no Kubernetes/Temporal/Redis/Celery/Kafka
+— see the audit's own reasoning for why each would be the wrong fix). Nothing
+here started Decision Receipts, Policy Lab, the human-review UI, real
+provider integration, or a README redesign — those remain explicitly
+post-M1, not begun.
 
 ---
 

@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from scripts.migrate import checksum_of, migration_files
+import pytest
+from scripts.migrate import MigrationsDirectoryError, checksum_of, migration_files
 
 REAL_MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
@@ -46,3 +47,19 @@ def test_migration_files_ignores_non_sql(tmp_path: Path) -> None:
     files = migration_files(tmp_path)
 
     assert [f.name for f in files] == ["0001_init.sql", "0002_next.sql"]
+
+
+def test_migration_files_fails_closed_on_a_missing_directory(tmp_path: Path) -> None:
+    """The audit-fixed bug: `Path.glob()` on a nonexistent directory returns
+    `[]`, not an error — which used to make a wrong `MIGRATIONS_DIR` read as
+    "nothing pending" instead of "I can't tell." Must raise, not return []."""
+    missing = tmp_path / "does-not-exist"
+    with pytest.raises(MigrationsDirectoryError, match="not found"):
+        migration_files(missing)
+
+
+def test_migration_files_fails_closed_on_an_empty_directory(tmp_path: Path) -> None:
+    """A directory that exists but has zero .sql files is just as suspect as
+    one that doesn't exist — this repo always ships at least 0001_init.sql."""
+    with pytest.raises(MigrationsDirectoryError, match="no \\*\\.sql"):
+        migration_files(tmp_path)

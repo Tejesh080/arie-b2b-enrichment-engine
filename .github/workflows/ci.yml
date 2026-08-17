@@ -118,9 +118,16 @@ jobs:
             status="$(curl -sS "http://localhost:8000/leads/${lead_id}" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")"
             echo "attempt $i: lead status = $status"
             case "$status" in
+              # QUALIFIED (AUTO_ROUTED, ROUTED, MANUAL_REVIEW) | REJECTED (SYNCED)
+              # | AWAITING_REVIEW (AWAITING_HUMAN) -- arie.statemachine.transitions
+              # is the one place this vocabulary is defined; this is a smoke test
+              # for "the async pipeline moved the lead at all", not a claim about
+              # which outcome is correct, so any of these passes.
               AUTO_ROUTED|ROUTED|AWAITING_HUMAN|SYNCED|MANUAL_REVIEW)
                 exit 0
                 ;;
+              # FAILURE (FAILED, DEAD_LETTER) -- a known-good corpus identity
+              # reaching this is a real pipeline break, not an acceptable outcome.
               FAILED|DEAD_LETTER)
                 echo "lead reached a failure status: $status" >&2
                 exit 1

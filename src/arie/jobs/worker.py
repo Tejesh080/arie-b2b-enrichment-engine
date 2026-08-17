@@ -33,7 +33,7 @@ from psycopg_pool import ConnectionPool
 
 from arie.config import DATABASE, RUNTIME
 from arie.core.types import LeadStatus
-from arie.jobs.queue import ClaimedJob, PostgresJobQueue
+from arie.jobs.queue import ClaimedJob, JobOwnershipError, PostgresJobQueue
 from arie.observability.tracing import (
     configure_tracing,
     extract_trace_context,
@@ -83,7 +83,8 @@ class CycleResult:
     job_id: uuid.UUID
     job_type: str
     outcome: str
-    """"done", "retry", or "dead_letter"."""
+    """"done", "retry", "dead_letter", or "lost_lease" (the ownership-fencing
+    guard fired — see `JobOwnershipError` — and this attempt touched nothing)."""
     detail: str | None = None
 
 
@@ -143,7 +144,14 @@ def run_worker_cycle(
         claim_span.set_attribute("arie.jobs_claimed", len(claimed))
 
     return [
-        _process_one(queue, pool, handlers, job, max_attempts=resolved_max_attempts)
+        _process_one(
+            queue,
+            pool,
+            handlers,
+            job,
+            worker_id=resolved_worker_id,
+            max_attempts=resolved_max_attempts,
+        )
         for job in claimed
     ]
 
@@ -154,6 +162,7 @@ def _process_one(
     handlers: dict[str, JobHandler],
     job: ClaimedJob,
     *,
+    worker_id: str,
     max_attempts: int,
 ) -> CycleResult:
     # Reattach to the trace that enqueued this job, if there was one. A missing
@@ -177,7 +186,9 @@ def _process_one(
         if handler is None:
             error = f"no handler registered for job_type {job.job_type!r}"
             record_error(span, error)
-            result = _fail(queue, pool, job, max_attempts=max_attempts, error=error)
+            result = _fail(
+                queue, pool, job, worker_id=worker_id, max_attempts=max_attempts, error=error
+            )
             span.set_attribute("arie.job.outcome", result.outcome)
             return result
 
@@ -197,7 +208,12 @@ def _process_one(
                 )
                 new_status = handler(context)
 
-                queue.complete(conn, job.job_id)
+                # Ownership-fenced: raises JobOwnershipError, caught below,
+                # if this worker's lease was reclaimed while the handler ran.
+                # That must stop everything after it too — including the
+                # lead transition next — which is why it runs before that,
+                # not after.
+                queue.complete(conn, job.job_id, worker_id=worker_id)
 
                 if new_status is not None:
                     if job.lead_id is None or lead_version is None:
@@ -220,13 +236,28 @@ def _process_one(
             span.set_attribute("arie.job.outcome", "done")
             return CycleResult(job_id=job.job_id, job_type=job.job_type, outcome="done")
 
+        except JobOwnershipError as exc:
+            # Not a handler failure to retry -- retrying here would mean
+            # writing to a job row another worker now owns. The transaction
+            # above never committed, so nothing this attempt did (including
+            # anything the handler itself wrote via `ctx.conn`) survives;
+            # whoever holds the lease now is solely responsible for this job.
+            record_error(span, exc)
+            result = CycleResult(
+                job_id=job.job_id, job_type=job.job_type, outcome="lost_lease", detail=str(exc)
+            )
+            span.set_attribute("arie.job.outcome", result.outcome)
+            return result
+
         except Exception as exc:
             # The span is marked ERROR even though the exception stops here: a
             # job that is retried is still a job that failed, and swallowing it
             # for tracing purposes would hide every transient failure until it
             # became a dead letter.
             record_error(span, exc)
-            result = _fail(queue, pool, job, max_attempts=max_attempts, error=str(exc))
+            result = _fail(
+                queue, pool, job, worker_id=worker_id, max_attempts=max_attempts, error=str(exc)
+            )
             span.set_attribute("arie.job.outcome", result.outcome)
             return result
 
@@ -236,12 +267,25 @@ def _fail(
     pool: ConnectionPool,
     job: ClaimedJob,
     *,
+    worker_id: str,
     max_attempts: int,
     error: str,
 ) -> CycleResult:
-    with pool.connection() as conn:
-        outcome = queue.fail(conn, job.job_id, error=error, max_attempts=max_attempts)
-        conn.commit()
+    """The single chokepoint that calls `queue.fail()` — both `_process_one`
+    call sites (no handler registered; the handler raised) go through here,
+    so `JobOwnershipError` from a lease lost between claiming and now only
+    needs handling in one place.
+    """
+    try:
+        with pool.connection() as conn:
+            outcome = queue.fail(
+                conn, job.job_id, worker_id=worker_id, error=error, max_attempts=max_attempts
+            )
+            conn.commit()
+    except JobOwnershipError as exc:
+        return CycleResult(
+            job_id=job.job_id, job_type=job.job_type, outcome="lost_lease", detail=str(exc)
+        )
     result_kind = "dead_letter" if outcome.status == "dead_letter" else "retry"
     return CycleResult(job_id=job.job_id, job_type=job.job_type, outcome=result_kind, detail=error)
 

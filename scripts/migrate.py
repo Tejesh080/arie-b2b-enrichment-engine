@@ -23,9 +23,16 @@ from pathlib import Path
 import psycopg
 
 from arie.config import DATABASE
-from arie.migrations import MIGRATIONS_DIR, checksum_of, migration_files
+from arie.migrations import MIGRATIONS_DIR, MigrationsDirectoryError, checksum_of, migration_files
 
-__all__ = ["MIGRATIONS_DIR", "checksum_of", "main", "migrate", "migration_files"]
+__all__ = [
+    "MIGRATIONS_DIR",
+    "MigrationsDirectoryError",
+    "checksum_of",
+    "main",
+    "migrate",
+    "migration_files",
+]
 
 _BOOTSTRAP_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -96,7 +103,14 @@ def main() -> int:
         )
         return 1
 
-    applied = migrate(DATABASE.direct_url)
+    try:
+        applied = migrate(DATABASE.direct_url)
+    except MigrationsDirectoryError as exc:
+        print(
+            f"{exc} — refusing to report success for schema this process cannot see.",
+            file=sys.stderr,
+        )
+        return 1
 
     if applied:
         print(f"Applied {len(applied)} migration(s):")

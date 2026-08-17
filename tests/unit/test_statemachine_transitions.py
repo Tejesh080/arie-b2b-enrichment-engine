@@ -12,8 +12,13 @@ import pytest
 
 from arie.core.types import LeadStatus
 from arie.statemachine.transitions import (
+    AWAITING_REVIEW,
     DECISION_OUTCOMES,
+    FAILURE,
+    FINALIZED,
     HUMAN_REVIEW_OUTCOMES,
+    QUALIFIED,
+    REJECTED,
     TERMINAL,
     job_type_for,
     next_status,
@@ -149,3 +154,50 @@ def test_every_lead_status_is_classified() -> None:
             or status in branches_on_outcome
         )
         assert classified, f"{status} isn't accounted for in the graph's classification"
+
+
+# --- business-semantic status groups ---------------------------------------
+#
+# A different axis from TERMINAL above -- see the module's own comment.
+# AUTO_ROUTED and MANUAL_REVIEW are QUALIFIED (business-finalized) despite
+# not being in TERMINAL (mechanically, nothing auto-advances them yet).
+
+
+def test_qualified_excludes_the_reject_terminal() -> None:
+    """The audit-fixed ambiguity: SYNCED is DECISION_OUTCOMES/HUMAN_REVIEW_
+    OUTCOMES's own *reject* target, not a qualified lead -- counting it as
+    qualified rewards rejecting more leads, the exact inversion 0005 already
+    fixed once for the automatic path."""
+    assert LeadStatus.SYNCED not in QUALIFIED
+    assert {LeadStatus.AUTO_ROUTED, LeadStatus.ROUTED, LeadStatus.MANUAL_REVIEW} == QUALIFIED
+
+
+def test_rejected_is_exactly_synced() -> None:
+    assert {LeadStatus.SYNCED} == REJECTED
+
+
+def test_finalized_is_qualified_or_rejected() -> None:
+    assert FINALIZED == QUALIFIED | REJECTED
+
+
+def test_semantic_groups_are_pairwise_disjoint() -> None:
+    groups = [QUALIFIED, REJECTED, AWAITING_REVIEW, FAILURE]
+    for i, a in enumerate(groups):
+        for b in groups[i + 1 :]:
+            assert a.isdisjoint(b), f"{a} and {b} overlap"
+
+
+def test_every_decision_and_review_outcome_lands_in_a_semantic_group() -> None:
+    """Every status DECISION_OUTCOMES/HUMAN_REVIEW_OUTCOMES can produce, plus
+    the failure terminals, must be classified somewhere in the vocabulary --
+    the same "nothing falls through unclassified" guarantee
+    test_every_lead_status_is_classified pins for the mechanical axis."""
+    reachable_outcomes = set(DECISION_OUTCOMES.values()) | set(HUMAN_REVIEW_OUTCOMES.values())
+    for status in reachable_outcomes | FAILURE:
+        classified = (
+            status in QUALIFIED
+            or status in REJECTED
+            or status in AWAITING_REVIEW
+            or status in FAILURE
+        )
+        assert classified, f"{status} isn't in any business-semantic group"

@@ -61,36 +61,76 @@ _CLAIM_UPDATE = """
     WHERE job_id = ANY(%(job_ids)s)
 """
 
-# The DO UPDATE deliberately writes nothing (jobs.job_type = jobs.job_type): it
-# exists only so RETURNING fires for the already-existed case, which DO NOTHING
-# would skip. One consequence worth naming: `trace_context` is therefore left at
-# whatever the *first* enqueue stored. That is the wanted behaviour — the job is
-# the one the first request scheduled, so it belongs to that request's trace; a
-# duplicate request gets its own span recording that it deduplicated, and does
-# not get to retroactively reparent work it did not cause.
+# `idempotency_key` is a plain UNIQUE, not scoped by status, so without the
+# CASE WHEN below a job that reached `dead_letter` would claim its key
+# *permanently* — every future redelivery would match the dead row, report
+# `created=False` as if this were ordinary idempotent dedup, and the lead it
+# belongs to would never be claimed by a worker again. That was a real bug:
+# a natural-key redelivery is exactly the "please retry this" signal a
+# dead-lettered job has no other way to receive, so a match against a
+# dead_letter row is the one case this upsert must *not* treat as "nothing to
+# do" — it requeues instead, with a fresh attempt budget (this is an operator-
+# visible recovery, not a continuation of the run that already exhausted its
+# attempts) and its lease cleared. Every other status (pending, processing,
+# done) keeps today's plain-idempotent behaviour: the CASE WHEN's ELSE branch
+# writes each column back to itself, so a match against a live or completed
+# job is untouched, and `trace_context` is *never* in this SET list at all —
+# it stays whatever the row that created the job stored, requeue or not, so a
+# recovered job still belongs to the trace of whichever delivery first
+# scheduled it.
 _ENQUEUE = """
+    WITH existing AS (
+        SELECT status FROM jobs WHERE idempotency_key = %(idempotency_key)s
+    )
     INSERT INTO jobs (lead_id, job_type, idempotency_key, trace_context)
     VALUES (%(lead_id)s, %(job_type)s, %(idempotency_key)s, %(trace_context)s)
-    ON CONFLICT (idempotency_key) DO UPDATE SET job_type = jobs.job_type
-    RETURNING job_id, (xmax = 0) AS created
+    ON CONFLICT (idempotency_key) DO UPDATE SET
+        status        = CASE WHEN jobs.status = 'dead_letter' THEN 'pending' ELSE jobs.status END,
+        attempt_count = CASE WHEN jobs.status = 'dead_letter' THEN 0 ELSE jobs.attempt_count END,
+        next_retry_at = CASE WHEN jobs.status = 'dead_letter' THEN now() ELSE jobs.next_retry_at END,
+        locked_by     = CASE WHEN jobs.status = 'dead_letter' THEN NULL ELSE jobs.locked_by END,
+        locked_at     = CASE WHEN jobs.status = 'dead_letter' THEN NULL ELSE jobs.locked_at END
+    RETURNING job_id, (xmax = 0) AS created,
+        COALESCE((SELECT status FROM existing) = 'dead_letter', false) AS requeued
 """
 
-_COMPLETE = "UPDATE jobs SET status = 'done' WHERE job_id = %(job_id)s"
+# Every one of complete/fail's statements below carries `AND status = 'processing'
+# AND locked_by = %(worker_id)s` — the fencing predicate that stops a *stale*
+# worker (one whose lease was reclaimed after expiring, or that otherwise lost
+# a claim it thinks it still holds) from mutating a job it no longer owns. Two
+# concrete failure modes this closes, both previously reproducible: a worker
+# that reports completion after its lease was reclaimed would otherwise
+# resurrect a job another worker already finished (`fail()` matching by
+# job_id alone could set a `done` row back to `pending`); a worker that
+# reports failure after reclaim would otherwise double-count the same
+# real-world failure — once via `_RECLAIM_EXPIRED_LEASES`'s own
+# `attempt_count + 1`, again via this call's `attempt_count = row[0] + 1` —
+# dead-lettering a job at roughly half its configured attempt budget. Zero
+# rows affected means the lease moved; the caller must not touch the row
+# further, which is exactly what `JobOwnershipError` signals.
+_COMPLETE = """
+    UPDATE jobs SET status = 'done'
+    WHERE job_id = %(job_id)s AND status = 'processing' AND locked_by = %(worker_id)s
+"""
 
-_SELECT_ATTEMPT_COUNT = "SELECT attempt_count FROM jobs WHERE job_id = %(job_id)s FOR UPDATE"
+_SELECT_ATTEMPT_COUNT = """
+    SELECT attempt_count FROM jobs
+    WHERE job_id = %(job_id)s AND status = 'processing' AND locked_by = %(worker_id)s
+    FOR UPDATE
+"""
 
 _RESCHEDULE = """
     UPDATE jobs
     SET status = 'pending', attempt_count = %(attempt_count)s,
         next_retry_at = %(next_retry_at)s, last_error = %(error)s,
         locked_by = NULL, locked_at = NULL
-    WHERE job_id = %(job_id)s
+    WHERE job_id = %(job_id)s AND status = 'processing' AND locked_by = %(worker_id)s
 """
 
 _DEAD_LETTER = """
     UPDATE jobs
     SET status = 'dead_letter', attempt_count = %(attempt_count)s, last_error = %(error)s
-    WHERE job_id = %(job_id)s
+    WHERE job_id = %(job_id)s AND status = 'processing' AND locked_by = %(worker_id)s
 """
 
 
@@ -102,11 +142,40 @@ class JobStatus(StrEnum):
     DEAD_LETTER = "dead_letter"
 
 
+class JobOwnershipError(RuntimeError):
+    """Raised when the caller no longer holds the processing lease it thinks it does.
+
+    Both `complete()` and `fail()` require `status = 'processing' AND locked_by
+    = <worker_id>` to still hold at the moment they write — see the comment
+    above `_COMPLETE` for the two concrete corruption modes that predicate
+    closes. Reaching this means the row moved out from under the caller
+    (reclaimed by another worker after this one's lease expired, or already
+    completed/failed by whoever claimed it next); it is never something to
+    retry blindly, since retrying is exactly the action that would race
+    whoever owns the job now.
+    """
+
+    def __init__(self, job_id: UUID, worker_id: str) -> None:
+        self.job_id = job_id
+        self.worker_id = worker_id
+        super().__init__(
+            f"worker {worker_id!r} no longer holds the processing lease for job {job_id} "
+            "— it was reclaimed, completed, or failed by someone else"
+        )
+
+
 @dataclass(frozen=True)
 class EnqueuedJob:
     job_id: UUID
     created: bool
     """False if an existing job with the same idempotency_key was found instead."""
+    requeued: bool = False
+    """True if the existing job `created=False` refers to was `dead_letter` and
+    has just been reset to `pending` with a fresh attempt budget. A caller
+    that cares to distinguish "this was already in flight" from "this had
+    permanently failed and is now retrying" reads this; every other caller
+    can ignore it and treat `created=False` as ordinary idempotent dedup,
+    exactly as before."""
 
 
 @dataclass(frozen=True)
@@ -169,6 +238,12 @@ class PostgresJobQueue:
         worker will ever claim, and nothing downstream would ever notice
         because a lead with no job looks exactly like a lead whose job hasn't
         run yet.
+
+        A redelivery matching a ``dead_letter`` job is requeued rather than
+        left alone — see ``_ENQUEUE``'s own comment for why leaving it alone
+        was a permanent-stranding bug, not correct idempotency. Matching a
+        ``pending``/``processing``/``done`` job is unchanged: nothing is
+        touched, `created=False`, `requeued=False`.
         """
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -182,7 +257,7 @@ class PostgresJobQueue:
             )
             row = cur.fetchone()
             assert row is not None
-        return EnqueuedJob(job_id=row["job_id"], created=row["created"])
+        return EnqueuedJob(job_id=row["job_id"], created=row["created"], requeued=row["requeued"])
 
     def enqueue(
         self,
@@ -263,31 +338,53 @@ class PostgresJobQueue:
             for row in rows
         ]
 
-    def complete(self, conn: psycopg.Connection, job_id: UUID) -> None:
-        """Mark a job done. Does not commit — see the module docstring."""
+    def complete(self, conn: psycopg.Connection, job_id: UUID, *, worker_id: str) -> None:
+        """Mark a job done. Does not commit — see the module docstring.
+
+        Raises `JobOwnershipError` if `worker_id` no longer holds this job's
+        processing lease — see the exception's own docstring and the
+        `_COMPLETE` comment for why that must stop the caller cold rather
+        than writing anyway.
+        """
         with conn.cursor() as cur:
-            cur.execute(_COMPLETE, {"job_id": job_id})
+            cur.execute(_COMPLETE, {"job_id": job_id, "worker_id": worker_id})
+            if cur.rowcount == 0:
+                raise JobOwnershipError(job_id, worker_id)
 
     def fail(
         self,
         conn: psycopg.Connection,
         job_id: UUID,
         *,
+        worker_id: str,
         error: str,
         max_attempts: int,
     ) -> FailOutcome:
         """Record a failed attempt: reschedule with backoff, or dead-letter if
         the attempt budget is spent. Does not commit — see the module docstring.
+
+        Raises `JobOwnershipError` if `worker_id` no longer holds this job's
+        processing lease — the same fencing `complete()` applies, checked
+        here via the `SELECT ... FOR UPDATE`'s own `WHERE` clause rather than
+        a separate query, so the ownership check and the row lock that makes
+        the rest of this method race-free are the same statement.
         """
         with conn.cursor() as cur:
-            cur.execute(_SELECT_ATTEMPT_COUNT, {"job_id": job_id})
+            cur.execute(_SELECT_ATTEMPT_COUNT, {"job_id": job_id, "worker_id": worker_id})
             row = cur.fetchone()
-            assert row is not None
+            if row is None:
+                raise JobOwnershipError(job_id, worker_id)
             attempt_count = row[0] + 1
 
             if attempt_count >= max_attempts:
                 cur.execute(
-                    _DEAD_LETTER, {"job_id": job_id, "attempt_count": attempt_count, "error": error}
+                    _DEAD_LETTER,
+                    {
+                        "job_id": job_id,
+                        "worker_id": worker_id,
+                        "attempt_count": attempt_count,
+                        "error": error,
+                    },
                 )
                 return FailOutcome(
                     status=JobStatus.DEAD_LETTER, next_retry_at=None, attempt_count=attempt_count
@@ -299,6 +396,7 @@ class PostgresJobQueue:
                 _RESCHEDULE,
                 {
                     "job_id": job_id,
+                    "worker_id": worker_id,
                     "attempt_count": attempt_count,
                     "next_retry_at": next_retry_at,
                     "error": error,

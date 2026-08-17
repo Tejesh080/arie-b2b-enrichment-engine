@@ -44,13 +44,31 @@ _SELECT_FRESH = """
     LIMIT 1
 """
 
+# DISTINCT ON (field_name, source) is the fix for a real bug: `evidence` has
+# no uniqueness constraint on (entity_type, entity_id, field_name, source) —
+# see put_many's own docstring for why one isn't added — so a provider whose
+# declared fields have different TTLs can end up with two simultaneously-
+# fresh rows for the same field from the same source. Concretely: a provider
+# returning both a 90-day-TTL field and a 30-day-TTL field gets re-called
+# once the short-TTL field expires, and re-writes *all* its fields,
+# including the long-TTL one that was still fresh — the entity now has two
+# fresh rows for that field, both from the same source. Without this, a
+# reader gets both and mistakes one source disagreeing with its own earlier
+# reading for two independent (and therefore contested) observations, which
+# is exactly the inflated-conflict, depressed-confidence failure mode
+# arie.scoring.merge exists to measure honestly. DISTINCT ON keeps only the
+# newest row per (field_name, source) — Postgres requires its columns to be
+# a prefix of ORDER BY, which is also what makes "newest" well-defined here.
+# Every row older than that stays in the table untouched; this changes what
+# a *read* considers current, not what's stored.
 _SELECT_ALL_FRESH = """
-    SELECT entity_type, entity_id, field_name, value, signal_description,
+    SELECT DISTINCT ON (field_name, source)
+           entity_type, entity_id, field_name, value, signal_description,
            source, confidence, effect_on_score, ttl_seconds, fetched_at
     FROM evidence
     WHERE entity_type = %(entity_type)s AND entity_id = %(entity_id)s
       AND expires_at > %(now)s
-    ORDER BY field_name, fetched_at DESC
+    ORDER BY field_name, source, fetched_at DESC
 """
 
 _INSERT = """
@@ -181,6 +199,19 @@ class PostgresEvidenceStore:
 
         A single ``executemany`` in one transaction: a provider call either
         lands as evidence in full or not at all, never partially cached.
+
+        Deliberately a plain append, not an upsert: there is no uniqueness
+        constraint on ``(entity_type, entity_id, field_name, source)``, so a
+        provider re-called after a *different* field's TTL expired writes a
+        fresh row for every field it returns, including ones still fresh from
+        an earlier call — the table can and does hold more than one
+        simultaneously-fresh row per field/source. That is intentional
+        history, not a bug to prevent here: it is what "evidence IS the
+        cache" (this module's own docstring) means to preserve for audit —
+        deleting or upserting over an older-but-still-fresh row would erase a
+        real observation the system actually made. ``_SELECT_ALL_FRESH``'s
+        ``DISTINCT ON`` is where "current" gets decided instead, at read
+        time, once, rather than every caller needing to remember to dedup.
         """
         rows = [_row_for_insert(item) for item in items]
         if not rows:

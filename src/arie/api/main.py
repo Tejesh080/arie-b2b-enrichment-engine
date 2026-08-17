@@ -54,7 +54,7 @@ from arie.config import DATABASE, OBSERVABILITY
 from arie.identity.resolver import IdentityResolver
 from arie.jobs.queue import PostgresJobQueue
 from arie.ledger.store import PostgresCostLedger
-from arie.migrations import pending_migrations
+from arie.migrations import MigrationsDirectoryError, pending_migrations
 from arie.observability.tracing import configure_tracing, shutdown_tracing
 from arie.statemachine.apply import OptimisticConcurrencyError
 
@@ -172,6 +172,15 @@ def register_routes(app: FastAPI) -> None:
         too for deployments that don't go through Compose. Collapsing both
         into one boolean would tell an operator to restart the process for a
         problem restarting it can't fix.
+
+        A third failure mode lands in the same ``degraded`` bucket:
+        ``pending_migrations`` raising ``MigrationsDirectoryError`` means this
+        process cannot even tell what should be applied — reporting ``ok`` in
+        that case would be worse than reporting ``degraded`` for a real
+        pending migration, because there would be no signal to act on at all.
+        ``database_up`` is already ``True`` by the time that can happen, so
+        the result is indistinguishable from "migrating" from the outside,
+        which is the conservative direction to be wrong in.
         """
         database_up = False
         schema_ready = False
@@ -181,7 +190,7 @@ def register_routes(app: FastAPI) -> None:
                     cur.execute("SELECT 1")
                 database_up = True
                 schema_ready = not pending_migrations(conn)
-        except psycopg.Error:
+        except (psycopg.Error, MigrationsDirectoryError):
             pass
 
         if database_up and schema_ready:
@@ -229,6 +238,7 @@ def register_routes(app: FastAPI) -> None:
             person_id=result.person_id,
             job_id=result.job_id,
             job_created=result.job_created,
+            job_requeued=result.job_requeued,
         )
 
     @app.get("/leads/{lead_id}", response_model=LeadResponse)

@@ -91,6 +91,11 @@ class IngestResult:
     job_id: UUID
     job_created: bool
     """False when the lead's first job was already enqueued by an earlier delivery."""
+    job_requeued: bool
+    """True when this delivery found the lead's job permanently failed
+    (``dead_letter``) and reset it to ``pending`` with a fresh attempt
+    budget — the recovery path a redelivered webhook is the natural trigger
+    for. Always False alongside ``job_created=True``."""
 
 
 def ingest_lead(
@@ -190,6 +195,7 @@ def ingest_lead(
             )
             enqueue_span.set_attribute("arie.job_id", str(enqueued.job_id))
             enqueue_span.set_attribute("arie.job_created", enqueued.created)
+            enqueue_span.set_attribute("arie.job_requeued", enqueued.requeued)
 
         return IngestResult(
             lead_id=lead_id,
@@ -200,4 +206,5 @@ def ingest_lead(
             person_id=person.person_id,
             job_id=enqueued.job_id,
             job_created=enqueued.created,
+            job_requeued=enqueued.requeued,
         )

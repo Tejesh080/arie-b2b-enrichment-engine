@@ -28,6 +28,7 @@ from tests.integration.conftest import IngestCleanup
 from arie.core.types import LeadStatus, ProviderStatus
 from arie.ledger.pricing import UnknownModelError
 from arie.ledger.store import PostgresCostLedger
+from arie.statemachine.transitions import QUALIFIED
 
 pytestmark = pytest.mark.integration
 
@@ -457,6 +458,50 @@ def test_v_pipeline_metrics_does_not_count_rejected_leads_as_qualified(
     # below could pass simply because nothing was measured.
     assert leads_after == leads_before + 1
     assert cost_per_qualified_after == cost_per_qualified_before
+
+
+def test_v_pipeline_metrics_counts_manual_reviewed_leads_as_qualified(
+    cost_ledger: PostgresCostLedger, db_conn: psycopg.Connection, cleanup_ingest: IngestCleanup
+) -> None:
+    """Regression for the M1 post-freeze audit finding: 0005's fix above
+    narrowed "qualified" to `('AUTO_ROUTED','ROUTED')`, written before Step 11
+    existed. A human's `action=edit` decision lands a lead on MANUAL_REVIEW
+    (`arie.approval.workflow._FINAL_DECISION` -> `HUMAN_REVIEW_OUTCOMES`) — a
+    genuinely qualified outcome, a human routed it — but that status was in
+    neither the numerator nor the denominator, so every human-edited lead's
+    spend silently vanished from the metric, inflating it exactly as the
+    human-review path got used.
+
+    Computed independently from `v_lead_cost` using
+    `arie.statemachine.transitions.QUALIFIED` (not the 3 status literals
+    retyped a second time) and compared against what `v_pipeline_metrics`
+    actually reports — if the view's filter drifts from that vocabulary
+    again, this fails on the value, not merely on "did something change".
+    """
+    manual_review = _make_lead(db_conn, cleanup_ingest, status=LeadStatus.MANUAL_REVIEW)
+    cost_ledger.record_provider_call(
+        idempotency_key=_key(cleanup_ingest),
+        provider="deep_research",
+        entity_type="company",
+        entity_id=uuid.uuid4(),
+        status=ProviderStatus.SUCCESS,
+        cost_usd=Decimal("12.50"),
+        latency_ms=100,
+        lead_id=manual_review,
+    )
+
+    _, cost_per_qualified = _pipeline_today(db_conn)
+
+    qualified_values = ", ".join(f"'{status}'" for status in sorted(QUALIFIED))
+    expected = _scalar(
+        db_conn,
+        f"SELECT SUM(total_cost_usd) / NULLIF(COUNT(*), 0) FROM v_lead_cost "
+        f"WHERE status IN ({qualified_values}) AND date_trunc('day', created_at) = {_TODAY}",
+    )
+
+    assert cost_per_qualified is not None, "the MANUAL_REVIEW lead must make the metric computable"
+    assert expected is not None
+    assert cost_per_qualified == expected
 
 
 def test_v_escalation_rate_counts_a_twice_reviewed_lead_once(

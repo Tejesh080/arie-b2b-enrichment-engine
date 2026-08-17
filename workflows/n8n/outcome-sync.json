@@ -106,10 +106,49 @@
       "name": "Respond (Not Finalized Yet)",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.5,
-      "position": [1180, 340],
+      "position": [1420, 340],
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ { synced: false, reason: 'lead not finalized', lead_id: $json.body.lead_id, status: $json.body.status } }}",
+        "responseBody": "={{ { synced: false, terminal: false, reason: 'lead not finalized', lead_id: $json.body.lead_id, status: $json.body.status } }}",
+        "options": { "responseCode": 200 }
+      }
+    },
+    {
+      "id": "e2b2c002-2222-4000-8000-00000000000c",
+      "name": "Is Permanently Failed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [1180, 480],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ ['FAILED', 'DEAD_LETTER'].includes($json.body.status) }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ]
+        },
+        "looseTypeValidation": false,
+        "options": {}
+      }
+    },
+    {
+      "id": "e2b2c002-2222-4000-8000-00000000000d",
+      "name": "Respond (Terminal Failure)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1420, 600],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { synced: false, terminal: true, reason: 'lead processing failed permanently', lead_id: $json.body.lead_id, status: $json.body.status } }}",
         "options": { "responseCode": 200 }
       }
     },
@@ -151,7 +190,7 @@
               "id": "f2000000-0000-4000-8000-000000000005",
               "name": "qualified",
               "type": "boolean",
-              "value": "={{ ['AUTO_ROUTED', 'ROUTED'].includes($json.body.status) }}"
+              "value": "={{ ['AUTO_ROUTED', 'ROUTED', 'MANUAL_REVIEW'].includes($json.body.status) }}"
             },
             {
               "id": "f2000000-0000-4000-8000-000000000006",
@@ -202,15 +241,59 @@
       }
     },
     {
+      "id": "e2b2c002-2222-4000-8000-00000000000e",
+      "name": "Sink Succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [1620, 60],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 200,
+              "operator": { "type": "number", "operation": "gte" }
+            },
+            {
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 300,
+              "operator": { "type": "number", "operation": "lt" }
+            }
+          ]
+        },
+        "looseTypeValidation": false,
+        "options": {}
+      }
+    },
+    {
       "id": "e2b2c002-2222-4000-8000-000000000009",
       "name": "Respond (Synced)",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.5,
-      "position": [1620, 60],
+      "position": [1860, -20],
       "parameters": {
         "respondWith": "json",
         "responseBody": "={{ { synced: true, lead_id: $('Webhook').item.json.body.lead_id, sink_status: $json.statusCode, sink_response: $json.body } }}",
         "options": { "responseCode": 200 }
+      }
+    },
+    {
+      "id": "e2b2c002-2222-4000-8000-00000000000f",
+      "name": "Respond (Sink Failed)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1860, 160],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { synced: false, reason: 'crm sink rejected the sync', lead_id: $('Webhook').item.json.body.lead_id, sink_status: $json.statusCode, sink_response: $json.body } }}",
+        "options": { "responseCode": 502 }
       }
     },
     {
@@ -232,9 +315,9 @@
       "typeVersion": 1,
       "position": [1180, -180],
       "parameters": {
-        "content": "`qualified` and the finalized-status set both restate labels ARIE already computed (the same AUTO_ROUTED/ROUTED split `migrations/0002_metrics_views.sql`'s `cost_per_qualified_lead` uses) — relabeling for the CRM shape, not a new decision.",
-        "height": 160,
-        "width": 320
+        "content": "`qualified`, the finalized-status set, and the permanently-failed set all restate the same vocabulary `arie.statemachine.transitions` defines once (QUALIFIED/REJECTED/FAILURE) and `v_pipeline_metrics.cost_per_qualified_lead` reads from — relabeling for the CRM shape, not a second decision made in a second language. `tests/unit/test_n8n_workflows.py` checks these literal lists against that module so the two can't drift apart again.",
+        "height": 180,
+        "width": 340
       }
     }
   ],
@@ -254,6 +337,12 @@
     "Is Finalized?": {
       "main": [
         [{ "node": "Map to CRM Payload", "type": "main", "index": 0 }],
+        [{ "node": "Is Permanently Failed?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Permanently Failed?": {
+      "main": [
+        [{ "node": "Respond (Terminal Failure)", "type": "main", "index": 0 }],
         [{ "node": "Respond (Not Finalized Yet)", "type": "main", "index": 0 }]
       ]
     },
@@ -261,7 +350,13 @@
       "main": [[{ "node": "POST Mock CRM Sink", "type": "main", "index": 0 }]]
     },
     "POST Mock CRM Sink": {
-      "main": [[{ "node": "Respond (Synced)", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "Sink Succeeded?", "type": "main", "index": 0 }]]
+    },
+    "Sink Succeeded?": {
+      "main": [
+        [{ "node": "Respond (Synced)", "type": "main", "index": 0 }],
+        [{ "node": "Respond (Sink Failed)", "type": "main", "index": 0 }]
+      ]
     }
   },
   "active": false,

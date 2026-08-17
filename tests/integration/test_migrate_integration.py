@@ -7,6 +7,7 @@ DATABASE_URL / DATABASE_DIRECT_URL; skipped otherwise (see conftest.py).
 
 from __future__ import annotations
 
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import psycopg
@@ -14,7 +15,7 @@ import pytest
 from scripts.migrate import checksum_of, migrate, migration_files
 
 from arie.config import DatabaseConfig
-from arie.migrations import pending_migrations
+from arie.migrations import MigrationsDirectoryError, pending_migrations
 
 pytestmark = pytest.mark.integration
 
@@ -118,6 +119,17 @@ def test_pending_migrations_reports_an_unrecorded_migration(
                 ("0002_metrics_views.sql", checksum_of(real.read_text(encoding="utf-8"))),
             )
         db_conn.commit()
+
+
+def test_pending_migrations_fails_closed_on_a_bad_migrations_dir(
+    migrated_database: str, db_conn: psycopg.Connection, tmp_path: Path
+) -> None:
+    """The audit-fixed bug, against a real connection: a wrong MIGRATIONS_DIR
+    must never read as "fully migrated" — even though the database really is
+    fully migrated here, `pending_migrations` cannot know that if it can't
+    see the directory describing what "fully migrated" means."""
+    with pytest.raises(MigrationsDirectoryError):
+        pending_migrations(db_conn, migrations_dir=tmp_path / "does-not-exist")
 
 
 def test_reapplying_a_changed_migration_raises(
