@@ -17,15 +17,15 @@ ran somewhere.
 
 from __future__ import annotations
 
-import hashlib
 import sys
 from pathlib import Path
 
 import psycopg
 
 from arie.config import DATABASE
+from arie.migrations import MIGRATIONS_DIR, checksum_of, migration_files
 
-MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
+__all__ = ["MIGRATIONS_DIR", "checksum_of", "main", "migrate", "migration_files"]
 
 _BOOTSTRAP_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -37,19 +37,6 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 _ALREADY_APPLIED_SQL = "SELECT checksum FROM schema_migrations WHERE filename = %s"
 _RECORD_APPLIED_SQL = "INSERT INTO schema_migrations (filename, checksum) VALUES (%s, %s)"
-
-
-def checksum_of(sql: str) -> str:
-    return hashlib.sha256(sql.encode("utf-8")).hexdigest()
-
-
-def migration_files(migrations_dir: Path = MIGRATIONS_DIR) -> list[Path]:
-    """Migrations in application order.
-
-    Lexical order on the numeric filename prefix (``0001_``, ``0002_``, ...) —
-    the same ordering convention the migrations directory already uses.
-    """
-    return sorted(migrations_dir.glob("*.sql"))
 
 
 def migrate(

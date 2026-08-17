@@ -20,11 +20,13 @@ row and nowhere else.
 
 from __future__ import annotations
 
+import signal
 import socket
-import time
+import threading
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from types import FrameType
 
 import psycopg
 from psycopg_pool import ConnectionPool
@@ -244,6 +246,29 @@ def _fail(
     return CycleResult(job_id=job.job_id, job_type=job.job_type, outcome=result_kind, detail=error)
 
 
+def install_graceful_shutdown(stop: threading.Event) -> None:
+    """Route SIGTERM the same way SIGINT already is: set `stop` and let the
+    current cycle finish, rather than each signal's own default disposition.
+
+    SIGTERM's default disposition is immediate termination — no exception, no
+    unwind, no `finally`. Left unhandled, `docker stop`/`compose down` (which
+    send SIGTERM, not Ctrl-C) would kill the process before ``main``'s
+    ``finally`` block below ever ran, leaking the pool's open connections
+    however the container runtime cleans them up rather than closing them
+    deliberately. Registering the same handler for SIGINT too means Ctrl-C
+    and SIGTERM now behave identically, and neither raises ``KeyboardInterrupt``
+    mid-cycle the way Python's default SIGINT handler could — the loop below
+    always finishes processing whatever ``run_worker_cycle`` already claimed
+    before checking whether to stop.
+    """
+
+    def _handler(signum: int, frame: FrameType | None) -> None:
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+
+
 def main() -> int:
     if not DATABASE.url:
         print("DATABASE_URL is not set — see .env.example")
@@ -264,21 +289,26 @@ def main() -> int:
     print(
         f"Worker starting (poll interval {RUNTIME.worker_poll_interval_sec}s, "
         f"{len(handlers)} handler(s) registered: {', '.join(sorted(handlers))}). "
-        "Ctrl-C to stop."
+        "Ctrl-C or SIGTERM to stop."
     )
+
+    stop = threading.Event()
+    install_graceful_shutdown(stop)
+
     try:
-        while True:
+        while not stop.is_set():
             for result in run_worker_cycle(queue, pool, handlers):
                 suffix = f" ({result.detail})" if result.detail else ""
                 print(f"{result.job_type} {result.job_id}: {result.outcome}{suffix}")
-            time.sleep(RUNTIME.worker_poll_interval_sec)
-    except KeyboardInterrupt:
-        print("Worker stopping.")
-        return 0
+            # Interruptible: returns as soon as a signal sets `stop`, instead
+            # of finishing out the full poll interval before noticing.
+            stop.wait(RUNTIME.worker_poll_interval_sec)
     finally:
+        print("Worker stopping.")
         queue.close()
         pool.close()
         shutdown_tracing()
+    return 0
 
 
 if __name__ == "__main__":

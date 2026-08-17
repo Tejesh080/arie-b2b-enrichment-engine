@@ -25,12 +25,22 @@ ProviderMode = Literal["simulated", "live"]
 
 def _env_float(key: str, default: float) -> float:
     raw = os.getenv(key)
-    return float(raw) if raw else default
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{key}={raw!r} is not a valid number") from exc
 
 
 def _env_int(key: str, default: int) -> int:
     raw = os.getenv(key)
-    return int(raw) if raw else default
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{key}={raw!r} is not a valid integer") from exc
 
 
 @dataclass(frozen=True)

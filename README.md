@@ -339,6 +339,7 @@ Two migration directories, one source of truth: see
 | [`04-eval-dataset.md`](docs/04-eval-dataset.md) | Dataset generation and validity testing |
 | [`05-results.md`](docs/05-results.md) | **Measured results, 10 seeds, honest verdict** |
 | [`06-m1-handoff.md`](docs/06-m1-handoff.md) | What M1 needs to know |
+| [`07-deployment.md`](docs/07-deployment.md) | Migrations, config, health checks, shutdown — deploying the API and worker |
 | [`ASSUMPTIONS.md`](docs/ASSUMPTIONS.md) | Every parameter and its justification |
 | [`adr/`](docs/adr/) | Architecture decision records |
 

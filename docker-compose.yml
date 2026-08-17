@@ -13,6 +13,7 @@
 services:
   db:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: arie
       POSTGRES_PASSWORD: arie_local_dev
@@ -47,6 +48,7 @@ services:
 
   api:
     build: .
+    restart: unless-stopped
     command: uvicorn arie.api.main:app --host 0.0.0.0 --port 8000
     environment:
       DATABASE_URL: postgresql://arie:arie_local_dev@db:5432/arie
@@ -58,9 +60,13 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+    # Inherits the image's HEALTHCHECK (Dockerfile) — /healthz, reachable +
+    # schema fully migrated. Lets other services (n8n, below) gate on
+    # `condition: service_healthy` instead of merely "the process started."
 
   worker:
     build: .
+    restart: unless-stopped
     command: python -m arie.jobs.worker
     environment:
       DATABASE_URL: postgresql://arie:arie_local_dev@db:5432/arie
@@ -74,6 +80,11 @@ services:
     # horizontally with no coordination.
     deploy:
       replicas: 2
+    # The image's HEALTHCHECK probes :8000/healthz (see Dockerfile) — the
+    # API's port, not this command's. The worker serves no HTTP port, so that
+    # check would just fail forever; disabled rather than left to do that.
+    healthcheck:
+      disable: true
 
   # M1 Step 12 — the thin transport edge, not part of the default stack.
   # SQLite-backed (n8n's own zero-config default): a second Postgres database
@@ -93,6 +104,7 @@ services:
   n8n:
     image: docker.n8n.io/n8nio/n8n:latest
     profiles: ["n8n"]
+    restart: unless-stopped
     environment:
       N8N_SECURE_COOKIE: "false"
     ports:
@@ -100,7 +112,11 @@ services:
     volumes:
       - n8n_data:/home/node/.n8n
     depends_on:
-      - api
+      api:
+        # Not just "started" — `lead-ingestion.json` calls the API on
+        # activation-adjacent requests, and a started-but-not-yet-ready API
+        # (database reachable, schema still migrating) would 503 them.
+        condition: service_healthy
 
 volumes:
   pgdata:

@@ -10,7 +10,7 @@ Written to be read cold, in a fresh session, with no memory of how M0 went.
 result is published — including the part that failed. Everything runs offline
 and deterministically; no credentials, no network.
 
-**M1 Steps 6–12 are complete.** Steps 6–9 (schema/migrations/evidence store,
+**M1 Steps 6–13 are complete.** Steps 6–9 (schema/migrations/evidence store,
 identity resolution, job queue/state machine, ingestion API, cost ledger,
 tracing) are verified against the live production Supabase database. Step 10
 (`arie.llm` — DeepSeek buying-signal extraction) needs no database at all and
@@ -443,6 +443,75 @@ interface.
     the local Docker service once a hosted one exists — they serve different
     purposes (reproducible local demo vs. a real integration target) and both
     are wanted.
+12. ✅ **Production-readiness hardening (Step 13).** `/healthz` now reports
+    three states, not one — `database` (a real round trip) and `schema_ready`
+    (every file in `migrations/` has a `schema_migrations` row, checked by
+    the new `arie.migrations.pending_migrations`, factored out of
+    `scripts/migrate.py` so a read-only readiness check doesn't depend on
+    `scripts/` being importable from wherever the API happens to be launched
+    — see the module's own docstring for why that dependency direction
+    matters). A reachable-but-not-yet-migrated database used to read
+    identically to "database is down"; it no longer does, and both the
+    Dockerfile's new `HEALTHCHECK` and `docker-compose.yml`'s `n8n` service
+    (now gated on `condition: service_healthy` rather than merely "started")
+    read the distinction.
+
+    `arie.jobs.worker` didn't handle `SIGTERM` at all — Docker's actual stop
+    signal, not `SIGINT`/Ctrl-C — so the raw polling loop's default
+    disposition was immediate termination, skipping cleanup entirely.
+    `install_graceful_shutdown` now routes both signals through one
+    `threading.Event`; the loop always finishes whatever `run_worker_cycle`
+    already claimed before checking whether to stop. Verified against a real
+    container, not just read: `docker stop -t 10` on both api and worker
+    exits 0 in under a second, worker's own "Worker stopping." reaching its
+    logs before it does.
+
+    Compose's clean-start ordering (Step 12's own fix) is now proven on a
+    genuinely clean machine every push, not just asserted as YAML. CI's new
+    `compose-smoke` job builds and starts the real stack on a GitHub-hosted
+    runner that has never seen this image or a `pgdata` volume, waits for the
+    API's own `HEALTHCHECK` to report `healthy`, POSTs the same corpus
+    identity (`nadia.delacroix@lumen500.com`) the README's Quick Start uses,
+    and fails the build if the lead doesn't reach a terminal/escalated status.
+    A second new job, `integration`, runs the full `pytest -m integration`
+    suite against a disposable `postgres:16-alpine` service container — CI
+    had never run these tests at all before Step 13, meaning `arie.evidence`,
+    `arie.identity`, `arie.jobs`/`arie.statemachine`, `arie.api`, and
+    `arie.ledger` were untested by CI end to end, exactly the gap this doc's
+    own warning about `make test` alone was flagging. Neither new job touches
+    the shared Supabase database Steps 6–12's manual verification used —
+    both are disposable, born and destroyed with their own CI run.
+
+    The escalation path had a real coverage gap: `test_pipeline_integration.py`
+    drove a lead to a pending human review and stopped there, and
+    `test_human_review_integration.py` exercises the review API against a
+    hand-built lead row rather than one that arrived via ingestion and the
+    worker — nothing closed the loop.
+    `test_the_m1_smoke_path_ingestion_through_human_review_decision` does:
+    ingestion → queue → worker → escalation → `GET /reviews/{id}` →
+    `POST .../decision` → `AUTO_ROUTED`, the path this milestone is named
+    for, driven through the real HTTP surface end to end.
+
+    Smaller fixes alongside these: `_env_float`/`_env_int` used to raise a
+    bare Python `ValueError` on a malformed environment value, naming neither
+    the variable nor the bad value — both now are. No `.dockerignore`
+    existed; one now excludes `.git`, `.venv`, caches, and `.env*` from the
+    build context (the Dockerfile never `COPY`s any of them, but an
+    unfiltered context still uploads them to the daemon). `db`, `api`, and
+    `worker` now `restart: unless-stopped`; `migrate` deliberately does not
+    (still pinned by `test_migrate_is_one_shot`).
+
+    New: [`docs/07-deployment.md`](07-deployment.md) — migration ordering for
+    a non-Compose target, required environment variables, the `/healthz`
+    contract, and the shutdown behaviour above, written for whoever picks a
+    hosting platform next (deliberately unprescribed — see ADR 0002 for why
+    Kubernetes/Temporal/Redis aren't it).
+
+    **What Step 13 did not change:** the architecture, the Supabase
+    production/preview migration split (ADR 0005, untouched), `PROVIDER_MODE`
+    (still refuses anything but `simulated`), or the hosted-n8n boundary
+    (still nothing connects to one). This step was hardening, not new
+    surface area.
 
 ---
 
@@ -517,7 +586,10 @@ against a real database — that needs `make test-all` with
 `DATABASE_URL`/`DATABASE_DIRECT_URL` set, which is opt-in specifically because
 it writes to whatever database those point at (see
 `tests/integration/conftest.py`'s own warning). Don't infer "the M1 pieces are
-covered" from a green `make test` alone.
+covered" from a green `make test` alone locally — as of Step 13, CI's
+`integration` job does run this suite on every push, against a disposable
+`postgres:16-alpine` service container it creates and destroys itself, never
+the shared Supabase database. Locally the distinction above still holds.
 
 **Two things about the integration tests worth knowing before adding more.**
 

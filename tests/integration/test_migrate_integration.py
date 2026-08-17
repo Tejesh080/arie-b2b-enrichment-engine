@@ -14,6 +14,7 @@ import pytest
 from scripts.migrate import checksum_of, migrate, migration_files
 
 from arie.config import DatabaseConfig
+from arie.migrations import pending_migrations
 
 pytestmark = pytest.mark.integration
 
@@ -87,6 +88,36 @@ def test_evidence_expires_at_is_generated_from_fetched_at_and_ttl(
     db_conn.commit()
 
     assert (expires_at - fetched_at).total_seconds() == pytest.approx(3600, abs=1)
+
+
+def test_pending_migrations_is_empty_once_fully_migrated(
+    migrated_database: str, db_conn: psycopg.Connection
+) -> None:
+    assert pending_migrations(db_conn) == []
+
+
+def test_pending_migrations_reports_an_unrecorded_migration(
+    migrated_database: str, db_conn: psycopg.Connection
+) -> None:
+    # Same mutate-then-restore shape as test_reapplying_a_changed_migration_raises
+    # below: this is a live, shared database, so the change this test makes has
+    # to be invisible to every other test once it finishes.
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM schema_migrations WHERE filename = %s", ("0002_metrics_views.sql",)
+        )
+    db_conn.commit()
+
+    try:
+        assert pending_migrations(db_conn) == ["0002_metrics_views.sql"]
+    finally:
+        real = next(f for f in migration_files() if f.name == "0002_metrics_views.sql")
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO schema_migrations (filename, checksum) VALUES (%s, %s)",
+                ("0002_metrics_views.sql", checksum_of(real.read_text(encoding="utf-8"))),
+            )
+        db_conn.commit()
 
 
 def test_reapplying_a_changed_migration_raises(

@@ -342,10 +342,40 @@ def test_get_unknown_lead_is_404(api_client: TestClient) -> None:
     assert response.status_code == 404
 
 
-def test_healthz_reports_the_database_reachable(api_client: TestClient) -> None:
+def test_healthz_reports_the_database_reachable_and_schema_ready(api_client: TestClient) -> None:
+    # `api_client` builds on `migrated_database`, so every migration has
+    # already been applied — the "ok" case, not just "database reachable".
     response = api_client.get("/healthz")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "database": True}
+    assert response.json() == {"status": "ok", "database": True, "schema_ready": True}
+
+
+def test_healthz_reports_degraded_when_schema_is_incomplete(
+    api_client: TestClient, db_conn: psycopg.Connection
+) -> None:
+    """A reachable database with a migration missing is a different failure
+    than an unreachable one — see the handler's own docstring — and must
+    report as such rather than as "ok"."""
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM schema_migrations WHERE filename = %s", ("0002_metrics_views.sql",)
+        )
+    db_conn.commit()
+
+    try:
+        response = api_client.get("/healthz")
+        assert response.status_code == 503
+        assert response.json() == {"status": "degraded", "database": True, "schema_ready": False}
+    finally:
+        from scripts.migrate import checksum_of, migration_files
+
+        real = next(f for f in migration_files() if f.name == "0002_metrics_views.sql")
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO schema_migrations (filename, checksum) VALUES (%s, %s)",
+                ("0002_metrics_views.sql", checksum_of(real.read_text(encoding="utf-8"))),
+            )
+        db_conn.commit()
 
 
 # --------------------------------------------------------------- rollback --

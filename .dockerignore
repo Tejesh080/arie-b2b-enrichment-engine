@@ -1,0 +1,56 @@
+# Keeps the build context small and out of the Docker daemon's cache layers —
+# none of this is ever COPYed by the Dockerfile, and .env/.git have no
+# business leaving the host at all. Mirrors .gitignore's secrets section.
+
+# Secrets — never send to the build context
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Version control
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+
+# Testing / coverage / linting
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+
+# Generated / large local artifacts
+data/eval/*.jsonl
+data/eval/*.parquet
+data/raw/
+bench/out/
+*.png
+!docs/assets/*.png
+
+# n8n / Supabase local state
+supabase/.branches/
+supabase/.temp/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Claude Code local settings
+.claude/

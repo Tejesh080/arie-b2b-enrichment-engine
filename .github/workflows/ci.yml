@@ -28,6 +28,117 @@ jobs:
       - name: Unit tests
         run: pytest -m "not integration" --cov=src/arie --cov-report=term-missing
 
+  integration:
+    # A disposable Postgres service container, born and destroyed with this
+    # job — never the shared Supabase database `docs/06-m1-handoff.md`'s
+    # integration tests describe running against for local dev. That
+    # database holds real rows and is opt-in for a reason; nothing here
+    # touches it. This is what actually exercises arie.evidence, arie.identity,
+    # arie.jobs/arie.statemachine, arie.api, and arie.ledger against a real
+    # database on every push — `make test` alone (the "quality" job above)
+    # does not, per the handoff's own warning not to infer otherwise.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: arie
+          POSTGRES_PASSWORD: arie_ci
+          POSTGRES_DB: arie
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U arie"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://arie:arie_ci@localhost:5432/arie
+      # Locally distinct from DATABASE_URL only against Supabase's pooler
+      # (see scripts/migrate.py's docstring) — this service container is the
+      # same Postgres either way.
+      DATABASE_DIRECT_URL: postgresql://arie:arie_ci@localhost:5432/arie
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e ".[dev,service]"
+      - name: Apply migrations (the canonical runner — ADR 0005)
+        run: python scripts/migrate.py
+      - name: Integration tests
+        run: pytest -m integration --cov=src/arie --cov-report=term-missing
+
+  compose-smoke:
+    # Proves the Compose stack is reproducible from a clean machine by
+    # actually building and running it on one — this runner has never seen
+    # this repo's image or a pgdata volume before. `docker compose build` and
+    # `up` exercise exactly the sequence README.md's Quick Start and the
+    # clean-start ordering contract (tests/unit/test_compose_clean_start.py)
+    # describe; this job is what actually runs it end to end rather than
+    # only asserting the YAML says the right thing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the stack
+        run: docker compose build
+
+      - name: Start the stack (default profile — n8n stays opt-in)
+        run: docker compose up -d
+
+      - name: Wait for the API to report healthy
+        run: |
+          set -e
+          api_container=$(docker compose ps -q api)
+          for i in $(seq 1 30); do
+            status=$(docker inspect --format='{{.State.Health.Status}}' "$api_container" 2>/dev/null || echo "starting")
+            echo "attempt $i: api health = $status"
+            if [ "$status" = "healthy" ]; then exit 0; fi
+            sleep 2
+          done
+          echo "API never reported healthy within the timeout" >&2
+          docker compose logs
+          exit 1
+
+      - name: Ingest a known corpus identity and drive it to a terminal status
+        # nadia.delacroix@lumen500.com is the same seed-42 corpus identity
+        # README.md's own curl example uses — simulated providers can only
+        # answer for identities the frozen corpus actually contains.
+        run: |
+          set -e
+          response="$(curl -sS -X POST http://localhost:8000/leads \
+            -H "Content-Type: application/json" \
+            -d "{\"source\": \"ci-compose-smoke\", \"email\": \"nadia.delacroix@lumen500.com\", \"company_domain\": \"lumen500.com\", \"full_name\": \"Nadia Delacroix\", \"external_ref\": \"ci-smoke-${GITHUB_RUN_ID}\"}")"
+          echo "$response"
+          lead_id="$(python3 -c "import json,sys; print(json.load(sys.stdin)['lead_id'])" <<< "$response")"
+
+          for i in $(seq 1 30); do
+            status="$(curl -sS "http://localhost:8000/leads/${lead_id}" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")"
+            echo "attempt $i: lead status = $status"
+            case "$status" in
+              AUTO_ROUTED|ROUTED|AWAITING_HUMAN|SYNCED|MANUAL_REVIEW)
+                exit 0
+                ;;
+              FAILED|DEAD_LETTER)
+                echo "lead reached a failure status: $status" >&2
+                exit 1
+                ;;
+            esac
+            sleep 2
+          done
+          echo "lead never left NEW/processing within the timeout" >&2
+          exit 1
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
   benchmark:
     # The benchmark runs on every push because it needs no credentials and no
     # network. Reproducibility is a feature of this project, so it is enforced

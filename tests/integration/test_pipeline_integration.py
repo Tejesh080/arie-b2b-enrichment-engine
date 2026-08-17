@@ -270,6 +270,89 @@ def test_a_low_confidence_lead_escalates_and_opens_a_pending_review(
     assert events[-1] == "lead:escalated"
 
 
+def test_the_m1_smoke_path_ingestion_through_human_review_decision(
+    api_client: TestClient,
+    db_conn: psycopg.Connection,
+    cleanup_ingest: IngestCleanup,
+    cleanup_evidence: list[uuid.UUID],
+    runtime: SimulatedEnrichmentRuntime,
+    handlers: dict[str, JobHandler],
+    job_queue: PostgresJobQueue,
+    pipeline_pool: ConnectionPool,
+    leads: list[EvalLead],
+) -> None:
+    """The M1 smoke test: ingestion -> queue -> worker -> decision -> human
+    review, driven end to end through the real HTTP surface. Everything up to
+    the pending review is exactly `test_a_low_confidence_lead_escalates_and_
+    opens_a_pending_review` above; this test is the one that keeps going —
+    `GET /reviews/{review_id}` then `POST /reviews/{review_id}/decision` —
+    because nothing else in the suite exercises that leg of the path Step 11
+    built (`test_human_review_integration.py` opens its own bare lead+review
+    rather than arriving via ingestion and the worker, and the escalation test
+    above stops at the pending review)."""
+    corpus_lead, expected = _corpus_lead_with_route(runtime, leads, "escalate_human")
+    body = _ingest_corpus_lead(api_client, cleanup_ingest, corpus_lead)
+
+    job_status = _drive_job_to_completion(
+        job_queue, pipeline_pool, handlers, db_conn, body["job_id"]
+    )
+    assert job_status == "done"
+    _register_ledger_and_evidence_cleanup(db_conn, cleanup_ingest, cleanup_evidence, body)
+
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT review_id FROM human_reviews WHERE lead_id = %s", (body["lead_id"],))
+        review_row = cur.fetchone()
+    assert review_row is not None, "the escalation branch must have opened exactly one review"
+    review_id = review_row[0]
+
+    get_response = api_client.get(f"/reviews/{review_id}")
+    assert get_response.status_code == 200
+    review_body = get_response.json()
+    assert review_body["is_pending"] is True
+    assert review_body["lead_status"] == LeadStatus.AWAITING_HUMAN
+    assert review_body["original_decision"] == str(expected.decision)
+
+    decision_response = api_client.post(
+        f"/reviews/{review_id}/decision",
+        json={
+            "action": "approve",
+            "reviewer": "smoke-test-reviewer",
+            "expected_lead_version": review_body["lead_version"],
+        },
+    )
+    assert decision_response.status_code == 200
+    decision_body = decision_response.json()
+    assert decision_body["already_applied"] is False
+    assert decision_body["final_decision"] == "auto_route"
+    assert decision_body["lead_status"] == LeadStatus.AUTO_ROUTED
+
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT status, version FROM leads WHERE lead_id = %s", (body["lead_id"],))
+        final_lead = cur.fetchone()
+        cur.execute(
+            "SELECT final_decision, reviewer, responded_at FROM human_reviews WHERE review_id = %s",
+            (review_id,),
+        )
+        final_review = cur.fetchone()
+        cur.execute(
+            "SELECT event_type FROM lead_events WHERE lead_id = %s ORDER BY event_id",
+            (body["lead_id"],),
+        )
+        events = [row[0] for row in cur.fetchall()]
+
+    assert final_lead is not None
+    assert final_lead[0] == LeadStatus.AUTO_ROUTED, (
+        "a human 'approve' resolves to the same terminal status the automatic "
+        "auto_route branch would have used"
+    )
+    assert final_lead[1] == decision_body["lead_version"]
+    assert final_review is not None
+    assert final_review[0] == "auto_route"
+    assert final_review[1] == "smoke-test-reviewer"
+    assert final_review[2] is not None, "responded_at must be set once decided"
+    assert events[-1] == "human_review:decided"
+
+
 def test_an_off_corpus_lead_fails_into_the_ordinary_retry_path(
     api_client: TestClient,
     db_conn: psycopg.Connection,

@@ -117,7 +117,14 @@ class LeadResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+    """``"ok"``, ``"degraded"`` (database reachable, schema not fully applied
+    yet), or ``"down"`` (database unreachable)."""
     database: bool
+    schema_ready: bool
+    """Every migration in ``migrations/`` has a matching ``schema_migrations``
+    row. False while a deploy's migration step is still running, or hasn't
+    run — a state that looks identical to ``database: True`` alone but needs
+    a different fix (wait for migrations, not restart the process)."""
 
 
 class ReviewResponse(BaseModel):

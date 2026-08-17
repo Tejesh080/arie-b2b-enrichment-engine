@@ -54,6 +54,7 @@ from arie.config import DATABASE, OBSERVABILITY
 from arie.identity.resolver import IdentityResolver
 from arie.jobs.queue import PostgresJobQueue
 from arie.ledger.store import PostgresCostLedger
+from arie.migrations import pending_migrations
 from arie.observability.tracing import configure_tracing, shutdown_tracing
 from arie.statemachine.apply import OptimisticConcurrencyError
 
@@ -159,24 +160,40 @@ StateDep = Annotated[AppState, Depends(get_state)]
 def register_routes(app: FastAPI) -> None:
     @app.get("/healthz", response_model=HealthResponse)
     def healthz(state: StateDep) -> Response:
-        """Liveness plus a real database round trip.
+        """Liveness, database connectivity, and schema readiness — reported
+        separately, because they call for different fixes.
 
         A health check that doesn't touch the database would report healthy
         while every request 500s, which is worse than having no check at all —
-        it actively suppresses the alert.
+        it actively suppresses the alert. But a *reachable* database with an
+        *incomplete* schema is a different failure than an unreachable one:
+        it's the clean-start race the Compose ``migrate`` service's
+        ``service_completed_successfully`` gate exists to close, caught here
+        too for deployments that don't go through Compose. Collapsing both
+        into one boolean would tell an operator to restart the process for a
+        problem restarting it can't fix.
         """
+        database_up = False
+        schema_ready = False
         try:
-            with state.pool.connection() as conn, conn.cursor() as cur:
-                cur.execute("SELECT 1")
-            database_up = True
+            with state.pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                database_up = True
+                schema_ready = not pending_migrations(conn)
         except psycopg.Error:
-            database_up = False
+            pass
 
-        body = HealthResponse(status="ok" if database_up else "degraded", database=database_up)
+        if database_up and schema_ready:
+            overall, code = "ok", status.HTTP_200_OK
+        elif database_up:
+            overall, code = "degraded", status.HTTP_503_SERVICE_UNAVAILABLE
+        else:
+            overall, code = "down", status.HTTP_503_SERVICE_UNAVAILABLE
+
+        body = HealthResponse(status=overall, database=database_up, schema_ready=schema_ready)
         return Response(
-            content=body.model_dump_json(),
-            media_type="application/json",
-            status_code=status.HTTP_200_OK if database_up else status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=body.model_dump_json(), media_type="application/json", status_code=code
         )
 
     @app.post(
