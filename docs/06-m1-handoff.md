@@ -667,6 +667,65 @@ post-M1, not begun.
 
 ---
 
+## Post-M1 P1 — Decision Receipt
+
+M1 is still frozen; this is the first post-M1 product feature, scoped to
+exactly one thing: `GET /leads/{lead_id}/receipt`, which answers *why did
+ARIE stop spending money and make this decision* from persisted state, for a
+reviewer who hasn't read the source.
+
+**Purpose.** Make ARIE's internal decision intelligence legible: the
+recommendation, score and bounds, why acquisition stopped, what was spent,
+provider activity and cache reuse, and — kept structurally separate — whether
+a human overrode the recommendation and what actually happened. See the
+README's [Decision Receipt](../README.md#decision-receipt) section for the
+worked example and full field-by-field shape.
+
+**Persistence model.** An audit of `leads`, `lead_events`, `scores`,
+`evidence`, `provider_calls`, `human_reviews`, and the job queue found most of
+the receipt reconstructable live from tables that are already durable and
+lead-scoped — `provider_calls`, `human_reviews`, and the `human_review:
+decided` event payload never change after being written, so reading them for
+an old lead is reading history, not today's state. Three things are neither
+durable nor lead-scoped: score bounds (computed transiently in
+`arie.scoring.engine.ScoreBounds`, never persisted), the
+policy/scorer/confidence-calibration identifiers in effect, and which
+evidence source won each field. That last one matters most: `evidence` is
+keyed by `(entity_type, entity_id)` — company/person, not lead — and is
+shared and mutated by every other lead at that company, so reading it "now"
+to explain an old decision would describe today's cache, not what was known
+when the decision was made — exactly the trap this section exists to avoid.
+
+Migration `0008_decision_receipts.sql` adds one small table,
+`decision_receipts`, holding only those three things plus the decision label,
+confidence, and stop reason. `arie.jobs.handlers.compute_score` writes it
+once, inside its existing work transaction, right beside the `scores` insert
+it sits next to — same atomicity, no new commit boundary. It is never updated
+afterward; a later human decision is layered on top by reading
+`human_reviews` live at request time, not by rewriting the snapshot. This is
+"model machine receipt + human disposition separately" (the simpler of the
+two historically-truthful options), not a snapshot-plus-patch design.
+
+**Endpoint.** `GET /leads/{lead_id}/receipt` — 404 for an unknown lead;
+otherwise always 200, with `status` distinguishing `"decided"` (a
+`decision_receipts` row exists), `"pending"` (still mid-pipeline — nothing to
+report yet, not an error), and `"processing_failed"` (dead-lettered before
+ever deciding, told apart from "pending" via `arie.statemachine.transitions.
+FAILURE`). `arie.api.receipt.build_receipt` composes it; `arie.api.schemas.
+ReceiptResponse` is the Pydantic surface.
+
+**Intentionally deferred.** `estimated_cost_avoided_usd` — no per-lead
+full-enrichment counterfactual is reliably available yet (would need to
+account for cache hits the counterfactual itself would have had); actual
+spend is reported instead, per this feature's own scoping note. A per-provider
+"why was this one skipped" verdict — `CalibratedBoundsPolicy` doesn't evaluate
+the remaining catalogue when it stops, so `providers.not_called` is reported
+as a set difference against the catalogue with the shared stop reason, never
+as an individually-reasoned skip. No UI — the API is the deliverable for this
+phase.
+
+---
+
 ## Do not
 
 - Resurrect or tune EVoI.

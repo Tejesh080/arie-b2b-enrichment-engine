@@ -265,6 +265,79 @@ canonical runner before the API or workers are allowed to start.
 
 ---
 
+## Decision Receipt
+
+`GET /leads/{lead_id}/receipt` answers, from persisted state only, *why did
+ARIE stop spending money and make this decision?* — the recommendation, the
+score and its bounds, why the acquisition loop stopped, what was spent, which
+providers were called (and which weren't), and — separately — whether a human
+overrode the recommendation and what actually happened.
+
+```bash
+curl http://localhost:8000/leads/<lead_id>/receipt | python3 -m json.tool
+```
+
+```json
+{
+  "receipt_version": "1",
+  "status": "decided",
+  "lead_status": "AUTO_ROUTED",
+  "decision": {
+    "recommended_action": "reject",
+    "autonomous": false,
+    "final_status": "AUTO_ROUTED",
+    "human_override": true
+  },
+  "score": {
+    "value": 51.0,
+    "bounds": { "lower": 0.0, "upper": 81.0 },
+    "confidence": 0.248,
+    "tau": 0.8038
+  },
+  "stopping": {
+    "reason_code": "all_providers_called",
+    "explanation": "Every available data provider was called; there was no further evidence left to purchase."
+  },
+  "cost": { "provider_cost_usd": "0.34", "total_cost_usd": "0.34", "budget_usd_cap": "1.5" },
+  "human_review": {
+    "original_decision": "reject", "action": "approve", "final_decision": "auto_route"
+  }
+}
+```
+
+That example is real, not illustrative — the same `nadia.haddad@cobalt500.com`
+corpus identity below, escalated (confidence 0.248 against τ 0.804) and then
+approved by a reviewer. `recommended_action` and the score/stopping snapshot
+stay exactly as they were the moment the policy decided; `final_status` and
+`human_review` are read live, which is how the receipt shows a human override
+without rewriting what ARIE actually recommended.
+
+Three response shapes, distinguished by `status`: `"decided"` (a
+`decision_receipts` row exists — see below), `"pending"` (still mid-pipeline,
+`decision`/`score`/`stopping` are `null`), and `"processing_failed"` (dead-
+lettered before ever deciding). Unknown `lead_id` is a 404, not a shape.
+
+**Persistence model.** Most of the receipt is read live from tables that were
+already durable and lead-scoped (`provider_calls`, `human_reviews`,
+`lead_events`) — they don't change after being written, so reading them now is
+reading history. A few facts are neither durable nor lead-scoped in the
+existing schema — score bounds, the policy/scorer/calibration identifiers in
+effect, and which evidence source won each field — because `evidence` (M1's
+cache table) is keyed by company/person and mutates as later leads reuse it.
+Migration `0008_decision_receipts.sql` adds one small table,
+`decision_receipts`, written once inside `compute_score`'s own work
+transaction, that freezes exactly those facts at decision time. Full reasoning
+in [`docs/06-m1-handoff.md`](docs/06-m1-handoff.md#post-m1-p1--decision-receipt).
+
+**Deliberately deferred:** `estimated_cost_avoided_usd` (no defensible
+per-lead counterfactual baseline yet — actual spend is reported instead), a
+per-provider "why was this one skipped" verdict (the production policy
+doesn't evaluate skipped providers individually; `providers.not_called` is an
+honest set difference against the catalogue, not a claim about reasoning that
+didn't happen), and any UI.
+
+---
+
 ## Evaluation design
 
 Each synthetic lead carries a **latent truth vector** never visible to the

@@ -15,9 +15,10 @@ from decimal import Decimal
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from arie.api.ingest import LeadIngestCommand
+from arie.api.receipt import DecisionReceipt
 from arie.approval.workflow import ReviewAction
 from arie.core.types import LeadStatus
 from arie.identity.normalize import normalize_domain, normalize_email
@@ -187,3 +188,135 @@ class ReviewDecisionResponse(BaseModel):
     already_applied: bool
     """True if this exact decision was already recorded by an earlier,
     identical submission — the idempotent-retry path, not an error."""
+
+
+# --------------------------------------------------------------- receipt --
+#
+# One-to-one with `arie.api.receipt`'s dataclasses — `from_attributes=True`
+# lets `ReceiptResponse.model_validate(receipt)` convert the dataclass tree
+# directly rather than this module restating every field assignment.
+
+
+class ReceiptDecisionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    recommended_action: str
+    autonomous: bool
+    final_status: LeadStatus
+    human_override: bool
+
+
+class ReceiptScoreBoundsResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    lower: float
+    upper: float
+
+
+class ReceiptScoreResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    value: float
+    threshold_qualify: float
+    threshold_reject: float
+    bounds: ReceiptScoreBoundsResponse
+    confidence: float
+    tau: float
+
+
+class ReceiptStoppingResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    reason_code: str
+    explanation: str
+
+
+class ReceiptCostResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    provider_cost_usd: Decimal
+    model_cost_usd: Decimal
+    total_cost_usd: Decimal
+    budget_usd_cap: Decimal
+
+
+class ReceiptEvidenceItemResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    field: str
+    source: str
+    confidence: float
+    contested: bool
+
+
+class ReceiptEvidenceResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    cache_hits: int
+    provider_calls: int
+    items: list[ReceiptEvidenceItemResponse]
+    unknown_fields: list[str]
+
+
+class ReceiptProviderCallResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    provider: str
+    status: str
+    cost_usd: Decimal
+    latency_ms: int | None
+    cache_hit: bool
+
+
+class ReceiptProvidersResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    called: list[ReceiptProviderCallResponse]
+    not_called: list[str]
+
+
+class ReceiptHumanReviewResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    required: bool
+    reviewer: str | None
+    original_decision: str | None
+    action: str | None
+    final_decision: str | None
+    responded_at: datetime | None
+
+
+class ReceiptVersionsResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    policy: str
+    scorer: str
+    confidence_calibration: str
+
+
+class ReceiptResponse(BaseModel):
+    """`GET /leads/{lead_id}/receipt` — see `arie.api.receipt.DecisionReceipt`
+    for what each field can and can't truthfully claim."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    receipt_version: str
+    lead_id: UUID
+    status: str
+    """"pending", "processing_failed", or "decided" — see `DecisionReceipt.status`."""
+    lead_status: LeadStatus
+    created_at: datetime | None
+
+    decision: ReceiptDecisionResponse | None
+    score: ReceiptScoreResponse | None
+    stopping: ReceiptStoppingResponse | None
+    versions: ReceiptVersionsResponse | None
+
+    cost: ReceiptCostResponse
+    evidence: ReceiptEvidenceResponse
+    providers: ReceiptProvidersResponse
+    human_review: ReceiptHumanReviewResponse | None
+
+    @classmethod
+    def from_receipt(cls, receipt: DecisionReceipt) -> ReceiptResponse:
+        return cls.model_validate(receipt)

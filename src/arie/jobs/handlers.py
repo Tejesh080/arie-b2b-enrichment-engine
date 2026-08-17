@@ -221,6 +221,39 @@ _INSERT_SCORE = """
             %(model_version)s)
 """
 
+_INSERT_DECISION_RECEIPT = """
+    INSERT INTO decision_receipts (
+        lead_id, decision, autonomous, confidence, tau,
+        score_value, score_lower, score_upper, stop_reason,
+        policy_name, scorer_version, confidence_calibration, evidence_snapshot
+    ) VALUES (
+        %(lead_id)s, %(decision)s, %(autonomous)s, %(confidence)s, %(tau)s,
+        %(score_value)s, %(score_lower)s, %(score_upper)s, %(stop_reason)s,
+        %(policy_name)s, %(scorer_version)s, %(confidence_calibration)s, %(evidence_snapshot)s
+    )
+"""
+
+
+def _evidence_snapshot(outcome: PolicyOutcome) -> dict[str, Any]:
+    """What `decision_receipts.evidence_snapshot` freezes — the winning source per
+    field and which fields were still unknown, as they stood at decision time. See
+    `arie.api.receipt`'s module docstring for why this can't be reconstructed later
+    from the (company/person-keyed, mutable) `evidence` table."""
+    resolutions = outcome.scoring.resolutions
+    return {
+        "known": [
+            {
+                "field": field_name,
+                "source": resolution.source,
+                "confidence": resolution.confidence,
+                "candidate_count": resolution.candidate_count,
+                "contested": resolution.contested,
+            }
+            for field_name, resolution in sorted(resolutions.items())
+        ],
+        "unknown": list(outcome.scoring.signals.unknown_fields),
+    }
+
 
 def _load_identity(conn: psycopg.Connection, lead_id: UUID) -> _LeadIdentity:
     with conn.cursor(row_factory=dict_row) as cur:
@@ -467,6 +500,24 @@ def build_handlers(
                         "decision_confidence": outcome.confidence,
                         "component_breakdown": Jsonb(outcome.scoring.breakdown.components),
                         "model_version": outcome.scoring.breakdown.model_version,
+                    },
+                )
+                cur.execute(
+                    _INSERT_DECISION_RECEIPT,
+                    {
+                        "lead_id": job.lead_id,
+                        "decision": str(outcome.decision),
+                        "autonomous": outcome.autonomous,
+                        "confidence": outcome.confidence,
+                        "tau": tau,
+                        "score_value": outcome.scoring.bounds.current,
+                        "score_lower": outcome.scoring.bounds.lower,
+                        "score_upper": outcome.scoring.bounds.upper,
+                        "stop_reason": outcome.stop_reason,
+                        "policy_name": resolved_runtime.policy.name,
+                        "scorer_version": outcome.scoring.breakdown.model_version,
+                        "confidence_calibration": resolved_runtime.policy.model.method,
+                        "evidence_snapshot": Jsonb(_evidence_snapshot(outcome)),
                     },
                 )
 

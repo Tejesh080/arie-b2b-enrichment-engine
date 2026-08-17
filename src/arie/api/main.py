@@ -34,12 +34,14 @@ from psycopg_pool import ConnectionPool
 
 from arie.api.ingest import ingest_lead
 from arie.api.reads import fetch_lead
+from arie.api.receipt import build_receipt
 from arie.api.schemas import (
     HealthResponse,
     IngestLeadRequest,
     IngestLeadResponse,
     LeadCostResponse,
     LeadResponse,
+    ReceiptResponse,
     ReviewDecisionRequest,
     ReviewDecisionResponse,
     ReviewResponse,
@@ -271,6 +273,21 @@ def register_routes(app: FastAPI) -> None:
                 provider_latency_ms=cost.provider_latency_ms,
             ),
         )
+
+    @app.get("/leads/{lead_id}/receipt", response_model=ReceiptResponse)
+    def get_lead_receipt(lead_id: UUID, state: StateDep) -> ReceiptResponse:
+        """The Decision Receipt — why ARIE stopped spending and what it decided.
+
+        Never 404s for a lead that exists but hasn't reached a decision yet;
+        ``status`` distinguishes "pending" (still mid-pipeline), "processing_failed"
+        (dead-lettered before a decision), and "decided" — see
+        ``arie.api.receipt.DecisionReceipt``.
+        """
+        with state.pool.connection() as conn:
+            receipt = build_receipt(conn, state.ledger, lead_id)
+        if receipt is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no lead {lead_id}")
+        return ReceiptResponse.from_receipt(receipt)
 
     @app.get("/reviews/{review_id}", response_model=ReviewResponse)
     def get_review_endpoint(review_id: UUID, state: StateDep) -> ReviewResponse:
