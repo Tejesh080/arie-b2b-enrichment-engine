@@ -369,6 +369,32 @@ didn't happen), and any UI.
 
 ---
 
+## Policy Lab
+
+```powershell
+.\scripts\policy-lab.ps1
+```
+
+```text
+Policy Lab generated.
+Report: demo-output\policy-lab.html
+```
+
+A static, offline report that turns the frozen M0 benchmark
+([`docs/05-results.md`](docs/05-results.md)) into a Pareto chart of API cost
+per lead versus synthetic-oracle agreement, computes which evaluated policies
+are actually non-dominated from the data (never a hardcoded list), and walks
+through why `CalibratedBoundsPolicy` shipped to production despite scoring
+lower on raw agreement than full enrichment or the tuned waterfall — a
+measured trade-off, not the most sophisticated policy winning by default. It
+reads the already-frozen `bench/out/multi_seed.json` and never re-runs the
+benchmark; pass `-Regenerate` if that artifact doesn't exist yet (a fresh
+clone won't have it — `bench/out/` is gitignored). See
+[`docs/06-m1-handoff.md`](docs/06-m1-handoff.md#post-m1-p3--policy-lab) for
+what it does and does not claim.
+
+---
+
 ## Evaluation design
 
 Each synthetic lead carries a **latent truth vector** never visible to the

@@ -789,6 +789,101 @@ No UI framework, no CDN dependency, no build step — plain generated HTML/CSS.
 
 ---
 
+## Post-M1 P3 — Policy Lab
+
+**Purpose.** P1 and P2 made individual decisions legible; P3 makes the M0
+benchmark's aggregate result legible — *why* `CalibratedBoundsPolicy` is the
+production policy, visually, for a reviewer who won't read
+`docs/05-results.md` end to end. `.\scripts\policy-lab.ps1` reads the frozen
+10-seed benchmark artifact and renders a static Pareto chart plus narrative —
+see the README's [Policy Lab](../README.md#policy-lab) section. This is
+visualization and interpretation of already-frozen M0 results, not a new
+benchmark run: it does not touch scoring, calibration, provider simulation,
+the dataset generator, or any policy, and it does not retune EVoI.
+
+**Canonical source of truth.** `bench/out/multi_seed.json`, written by
+`python -m bench.multi_seed` (`bench/multi_seed.py`'s `DEFAULT_SEEDS`, 42–51).
+Confirmed byte-for-byte against every figure in `docs/05-results.md` before
+building anything on top of it. **`bench/out/` is gitignored** — the artifact
+only exists locally once the benchmark has been run at least once; a fresh
+clone does not have it. `scripts/policy_lab/cli.py`'s default mode fails with
+a clear "run `python -m bench.multi_seed`" message rather than silently
+regenerating a ~15-minute benchmark; `-Regenerate` is the explicit, separate
+opt-in that does. `data/eval/manifest.json` (tracked) supplies dataset
+generator/rules version for the report's provenance section; it describes
+seed 42's dataset specifically; every seed in the sweep shares the same
+generator and rules version.
+
+**Why the artifact's own `stability` array isn't the source for
+`adaptive_voi_x1`.** Its precomputed "adaptive" rows summarize
+`best_adaptive` (the best-of-seven `value_scale` variant *for that seed*),
+not the single un-scaled `adaptive_voi_x1` policy this report names — the
+same distinction `docs/05-results.md` calls out for its own headline table.
+`scripts/policy_lab/stats.py` recomputes mean/stdev/min/max directly from
+`per_seed[].policies[]`'s raw rows for exactly the four named policies
+(`full_enrichment`, `waterfall_expensive`, `calibrated_bounds`,
+`adaptive_voi_x1`), using the same method (`statistics.fmean`/`stdev`)
+`bench/multi_seed.py` uses — self-contained and independently checkable
+against the artifact rather than trusting a convenience field that means
+something subtly different.
+
+**Pareto frontier is computed, not asserted.** `scripts/policy_lab/pareto.py`
+implements dominance directly (no more expensive, no worse agreement,
+strictly better on at least one axis) and derives frontier membership from
+whatever the four policies' mean cost/agreement actually are. On the current
+frozen numbers: `full_enrichment`, `waterfall_expensive`, and
+`calibrated_bounds` are each other's cheaper-but-worse / pricier-but-better
+trade-off and all sit on the frontier; `adaptive_voi_x1` is dominated
+outright by `calibrated_bounds` (cheaper *and* better agreement, on this
+benchmark's means) — the same "adaptive EVoI did not establish a win"
+finding `docs/adr/0004-evoi-is-a-negative-result.md` reports, arrived at
+independently by a different computation over the same data.
+
+**Wording discipline.** The report never says "cheaper with the same
+quality," "no accuracy loss," "highest quality," "human-level," or "EVoI
+won," never calls a frontier point "Pareto optimal" casually (always
+"Pareto-efficient" / "on the Pareto frontier," and only for policies the
+dominance computation actually places there), and never states a cost saving
+without the paired agreement decrease in the same sentence. Calibrated
+Bounds is labeled "Production policy," never "Best policy" — it has neither
+the highest agreement (full enrichment and the tuned waterfall both score
+higher, at higher cost) nor is it framed as such; it's cheapest at every
+human-review price tested and reaches the highest autonomous rate of any
+evaluated policy. `tests/unit/test_policy_lab_report.py` pins the prohibited
+phrases' absence and the cost/agreement pairing as regression tests, not just
+a review-time check.
+
+**Variability shown honestly.** Min–max range across the ten seeds, drawn as
+whiskers on the chart and as explicit ranges in the comparison table — no
+fabricated confidence interval. The whiskers overlap substantially between
+policies, which is itself the finding `docs/05-results.md`'s stability table
+already reports in prose ("the variance is large relative to the effect");
+the chart just makes that visible instead of restating it as text.
+
+**Files.** `scripts/policy_lab/artifacts.py` (locate/parse/validate the
+artifact, `ArtifactError` for anything malformed), `stats.py` (per-policy
+`SeedSeries`/`PolicyStats` from raw per-seed rows), `pareto.py`
+(`ParetoPoint`/`dominates`/`compute_frontier`, pure), `comparison.py`
+(Calibrated Bounds vs. tuned waterfall — both the mean-of-ratios and
+ratio-of-means cost readings, matching `docs/05-results.md`'s own convention
+of reporting both), `chart.py` (hand-built inline SVG, deterministic
+bounding-box collision avoidance for point labels and the production
+callout — no charting library, no CDN), `report.py` (HTML/JSON assembly,
+every interpolated value escaped), and `cli.py` (orchestration entry point;
+`-Regenerate` is the only path that shells out to `bench.multi_seed`).
+
+**Intentional omissions.** No policy tuning, no new benchmark run by default,
+no server, no database, no React/Next.js/Streamlit — plain generated
+HTML/CSS/SVG, same posture as P2. The main chart compares exactly the four
+policies the brief named; the raw artifact's other 14 tuning variants
+(per-tier waterfalls, the EVoI `value_scale` sweep, the escalation-aware
+review-price sweep) are named by count in the provenance section for
+auditability, not plotted — diluting the four-policy comparison with tuning
+internals was judged to work against the "understand this in under a minute"
+goal.
+
+---
+
 ## Do not
 
 - Resurrect or tune EVoI.
