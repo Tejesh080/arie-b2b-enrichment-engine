@@ -154,6 +154,41 @@ class LLMConfig:
 
 
 @dataclass(frozen=True)
+class LiveProviderConfig:
+    """Config for the one real enrichment adapter (P5) — ``arie.providers.live_abstract``.
+
+    Abstract API's Company Enrichment endpoint (``docs.abstractapi.com/api/company-enrichment``):
+    a plain ``GET`` with ``api_key``/``domain`` query params, returning firmographic
+    fields including ``employee_count`` and ``industry`` — the same two fields the
+    simulated ``firmographics_basic``/``firmographics_premium`` providers model.
+    """
+
+    api_key: str = field(default_factory=lambda: os.getenv("ABSTRACT_COMPANY_API_KEY", ""))
+    base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "ABSTRACT_COMPANY_BASE_URL", "https://companyenrichment.abstractapi.com/v2"
+        ).rstrip("/")
+    )
+    timeout_seconds: float = field(
+        default_factory=lambda: _env_float("ABSTRACT_COMPANY_TIMEOUT_SECONDS", 10.0)
+    )
+    cost_usd_per_call: float = field(
+        default_factory=lambda: _env_float("ABSTRACT_COMPANY_COST_USD_PER_CALL", 0.00165)
+    )
+    """An ESTIMATED unit cost, not a per-call price Abstract's response reports.
+
+    Derived from the Standard plan's list price at time of writing ($99/month
+    for 60,000 requests/month => ~$0.00165/request) — see ``docs/06-m1-handoff.md``'s
+    P5 section. Configurable because a list price changes; never presented as
+    an exact, provider-reported cost the way ``arie.ledger.store`` treats a
+    vendor's own billed figure."""
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key)
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     provider_mode: ProviderMode = field(
         default_factory=lambda: cast(ProviderMode, os.getenv("PROVIDER_MODE", "simulated"))
@@ -182,3 +217,4 @@ DATABASE = DatabaseConfig()
 RUNTIME = RuntimeConfig()
 OBSERVABILITY = ObservabilityConfig()
 LLM = LLMConfig()
+LIVE_PROVIDER = LiveProviderConfig()

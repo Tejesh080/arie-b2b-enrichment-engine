@@ -81,7 +81,7 @@ def test_evidence_snapshot_records_the_winning_source_per_field() -> None:
             conflict_points=0.0,
         ),
     }
-    snapshot = _evidence_snapshot(_outcome(resolutions))
+    snapshot = _evidence_snapshot(_outcome(resolutions).scoring)
 
     assert snapshot["known"] == [
         {
@@ -105,7 +105,7 @@ def test_evidence_snapshot_flags_contested_fields() -> None:
             conflict_points=10.0,  # > CONFLICT_EPSILON
         ),
     }
-    snapshot = _evidence_snapshot(_outcome(resolutions))
+    snapshot = _evidence_snapshot(_outcome(resolutions).scoring)
 
     assert snapshot["known"][0]["contested"] is True
 
@@ -113,7 +113,7 @@ def test_evidence_snapshot_flags_contested_fields() -> None:
 def test_evidence_snapshot_lists_unknown_fields() -> None:
     """Every SCORED_FIELDS entry not resolved is reported as unknown — what
     ARIE decided it didn't need to find out, not silently dropped."""
-    snapshot = _evidence_snapshot(_outcome({}))
+    snapshot = _evidence_snapshot(_outcome({}).scoring)
     assert "buying_intent" in snapshot["unknown"]
     assert "disqualifying_flag" in snapshot["unknown"]
     assert snapshot["known"] == []
@@ -134,7 +134,7 @@ def test_evidence_snapshot_is_json_serializable() -> None:
             conflict_points=0.0,
         ),
     }
-    snapshot = _evidence_snapshot(_outcome(resolutions))
+    snapshot = _evidence_snapshot(_outcome(resolutions).scoring)
     json.dumps(snapshot)  # must not raise
 
 

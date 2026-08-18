@@ -33,9 +33,27 @@ deliberate guard ("a wiring error must not masquerade as poor provider
 coverage"). This module honours that instead of working around it: the handler
 looks the ingested lead's person up in the corpus by normalized email, and a
 lead that isn't there fails with a clear error into the normal
-retry/dead-letter path. That is the honest shape of "production" while the
-only provider backend is the simulator; a live adapter (``PROVIDER_MODE=live``)
-is refused outright below rather than half-supported.
+retry/dead-letter path. That is the honest shape of "production" while
+``PROVIDER_MODE=simulated`` is in effect.
+
+**Post-M1 P5 — ``PROVIDER_MODE=live`` has a real backend now, built and
+registered by a separate function, ``_build_live_handlers``.** It has no
+corpus restriction at all (any ingested lead can be enriched) and does not run
+``CalibratedBoundsPolicy`` — see that function's own docstring for exactly why
+not and what it runs instead. ``build_handlers`` dispatches to one builder or
+the other by ``provider_mode``; both share ``_finalize_decision`` (the
+DECISION-node branch, including the shadow-mode suppression below) and
+``_walk_to_decision``/``_evidence_snapshot`` so the two paths can't drift
+apart on those.
+
+**Post-M1 P5 — shadow mode.** A lead ingested with ``mode="shadow"``
+(``leads.is_shadow``, set once at ingestion, never updated after) still runs
+the full acquisition loop and still gets a `decision_receipts` row with a real
+recommendation/confidence/cost/stop-reason — but ``_finalize_decision`` routes
+it to ``LeadStatus.SHADOW_EVALUATED`` instead of an authoritative branch,
+skipping ``request_review`` entirely. This applies uniformly to both provider
+modes: a shadow lead can run over the simulated corpus or the real live
+provider, and either way it never controls a routing outcome.
 
 **Durable cache and ledger are write-through subclasses, not replacements.**
 ``RunContext`` takes the benchmark's own ``EvidenceCache``/``CallLedger`` types;
@@ -79,9 +97,14 @@ from arie.identity.normalize import normalize_domain, normalize_email
 from arie.ledger.store import PostgresCostLedger
 from arie.observability.tracing import get_tracer, set_attributes, traced
 from arie.policy.base import EvidenceCache, PolicyOutcome, RunContext
-from arie.providers.base import ProviderRegistry
+from arie.providers.base import EnrichmentProvider, ProviderRegistry
 from arie.providers.catalog import BY_NAME
+from arie.providers.live_abstract import (
+    LIVE_POLICY_NAME,
+    AbstractCompanyEnrichmentProvider,
+)
 from arie.providers.simulated import CallLedger, build_from_leads
+from arie.scoring.engine import ScoringResult, score_evidence
 from arie.statemachine.apply import apply_transition
 from arie.statemachine.transitions import next_status
 
@@ -94,13 +117,18 @@ _TRACER = get_tracer("arie.jobs.handlers")
 
 
 class UnsupportedProviderModeError(RuntimeError):
-    """Raised when handlers are built for a provider mode that has no backend.
+    """Raised when handlers are built for a provider mode this module doesn't
+    recognise at all (anything other than ``'simulated'`` or ``'live'``).
 
-    ``PROVIDER_MODE=live`` names a thing that does not exist yet: no real
-    provider adapter has been written (ADR 0003 — real adapters go alongside
-    the simulator, and none have). Refusing at build time keeps that fact
-    loud; a worker silently falling back to the simulator would report costs
-    and coverage for vendors it never called.
+    Post-M1 P5: ``PROVIDER_MODE=live`` is now backed by one real adapter
+    (``arie.providers.live_abstract``, ADR 0003's "real adapters go alongside
+    the simulator" finally exercised) and no longer raises this — a missing
+    ``ABSTRACT_COMPANY_API_KEY`` instead raises
+    ``AbstractCompanyConfigurationError`` at the same build-time point, a
+    distinct failure ("live mode is misconfigured") from "live mode doesn't
+    exist". Refusing an unrecognised mode string at build time keeps
+    misconfiguration loud rather than silently falling back to the simulator,
+    which would report costs and coverage for vendors it never called.
     """
 
 
@@ -205,10 +233,14 @@ class _LeadIdentity:
     person_id: UUID
     canonical_email: str
     canonical_domain: str | None
+    is_shadow: bool
+    """Post-M1 P5. Fixed at ingestion — see ``arie.api.ingest``'s idempotency
+    semantics. Read here so a single ``compute_score`` variant (simulated or
+    live) can branch its own DECISION-node outcome without a second query."""
 
 
 _SELECT_LEAD_IDENTITY = """
-    SELECT l.company_id, l.person_id, c.canonical_domain, p.canonical_email
+    SELECT l.company_id, l.person_id, l.is_shadow, c.canonical_domain, p.canonical_email
     FROM leads l
     LEFT JOIN companies c ON c.company_id = l.company_id
     LEFT JOIN persons  p ON p.person_id  = l.person_id
@@ -234,12 +266,18 @@ _INSERT_DECISION_RECEIPT = """
 """
 
 
-def _evidence_snapshot(outcome: PolicyOutcome) -> dict[str, Any]:
+def _evidence_snapshot(scoring: ScoringResult) -> dict[str, Any]:
     """What `decision_receipts.evidence_snapshot` freezes — the winning source per
     field and which fields were still unknown, as they stood at decision time. See
     `arie.api.receipt`'s module docstring for why this can't be reconstructed later
-    from the (company/person-keyed, mutable) `evidence` table."""
-    resolutions = outcome.scoring.resolutions
+    from the (company/person-keyed, mutable) `evidence` table.
+
+    Takes the bare `ScoringResult` rather than a `PolicyOutcome` deliberately:
+    both the simulated (corpus/`EvalLead`) and live (real `Entity`) handlers
+    below produce one, and this is the one place their receipt-writing code is
+    shared.
+    """
+    resolutions = scoring.resolutions
     return {
         "known": [
             {
@@ -251,7 +289,7 @@ def _evidence_snapshot(outcome: PolicyOutcome) -> dict[str, Any]:
             }
             for field_name, resolution in sorted(resolutions.items())
         ],
-        "unknown": list(outcome.scoring.signals.unknown_fields),
+        "unknown": list(scoring.signals.unknown_fields),
     }
 
 
@@ -271,6 +309,7 @@ def _load_identity(conn: psycopg.Connection, lead_id: UUID) -> _LeadIdentity:
         person_id=row["person_id"],
         canonical_email=row["canonical_email"],
         canonical_domain=row["canonical_domain"],
+        is_shadow=row["is_shadow"],
     )
 
 
@@ -416,12 +455,96 @@ def _scaffold_payloads(outcome: PolicyOutcome, tau: float) -> dict[str, dict[str
     }
 
 
+def _finalize_decision(
+    conn: psycopg.Connection,
+    *,
+    lead_id: UUID,
+    version: int,
+    decision: Decision,
+    autonomous: bool,
+    is_shadow: bool,
+) -> LeadStatus:
+    """The DECISION node's branch — shared by every ``compute_score`` variant
+    (simulated/corpus and live/real) so shadow semantics can't drift between
+    them.
+
+    **Post-M1 P5 shadow branch.** A shadow lead never reaches an authoritative
+    outcome regardless of what `decision`/`autonomous` say: no
+    ``request_review`` (no fake human action), no AUTO_ROUTED/REJECT/
+    MANUAL_REVIEW (nothing ``workflows/n8n/outcome-sync.json``'s FINALIZED
+    gate or a real CRM sync would ever see), and no overwrite of any existing
+    business outcome — there is none, because a shadow lead was never routed
+    in the first place. It lands on ``LeadStatus.SHADOW_EVALUATED`` instead,
+    which ``arie.statemachine.transitions.TERMINAL`` includes (nothing further
+    auto-advances it) but every business-semantic group
+    (QUALIFIED/REJECTED/AWAITING_REVIEW/FAILURE/FINALIZED) deliberately
+    excludes. `decision`/`autonomous` are still frozen into `decision_receipts`
+    by the caller before this runs, so the receipt reports "ARIE would have
+    escalated this" rather than losing the recommendation.
+    """
+    if is_shadow:
+        apply_transition(
+            conn,
+            lead_id=lead_id,
+            expected_version=version,
+            new_status=LeadStatus.SHADOW_EVALUATED,
+            event_type="policy:shadow_evaluated",
+            payload={"decision": str(decision), "autonomous": autonomous},
+        )
+        return LeadStatus.SHADOW_EVALUATED
+
+    route = decision_route(decision, autonomous)
+    if route == "escalate_human":
+        request_review(
+            conn, lead_id=lead_id, expected_version=version, original_decision=str(decision)
+        )
+        return LeadStatus.AWAITING_HUMAN
+
+    final = next_status(LeadStatus.DECISION, outcome=route)
+    assert final is not None  # route is a DECISION_OUTCOMES key by construction
+    apply_transition(
+        conn,
+        lead_id=lead_id,
+        expected_version=version,
+        new_status=final,
+        event_type="policy:decided",
+        payload={"decision": str(decision), "route": route},
+    )
+    return final
+
+
+def _walk_to_decision(conn: psycopg.Connection, *, lead_id: UUID, version: int) -> int:
+    """Advance NEW -> SCORING -> FETCHING_EVIDENCE -> INTEGRATING -> DECISION.
+
+    Shared scaffold walk for every ``compute_score`` variant. Payloads are
+    intentionally minimal (``{}``) here — the simulated handler still records
+    its richer per-hop payloads itself (providers called, cost, stop reason)
+    because those facts only exist once its policy has actually run; the live
+    handler does the same for the hops where it has something to say.
+    """
+    status = LeadStatus.NEW
+    while status is not LeadStatus.DECISION:
+        advanced = next_status(status)
+        assert advanced is not None  # NEW..INTEGRATING always advance; see transitions.py
+        status = advanced
+        version = apply_transition(
+            conn,
+            lead_id=lead_id,
+            expected_version=version,
+            new_status=status,
+            event_type=f"policy:{status.lower()}",
+            payload={},
+        ).new_version
+    return version
+
+
 def build_handlers(
     pool: ConnectionPool,
     *,
     runtime: SimulatedEnrichmentRuntime | None = None,
     leads: list[EvalLead] | None = None,
     provider_mode: str | None = None,
+    live_provider: EnrichmentProvider | None = None,
 ) -> dict[str, JobHandler]:
     """The worker's production handler registry.
 
@@ -429,16 +552,35 @@ def build_handlers(
     lead — and deliberately nothing else; see the module docstring for why the
     other scaffold job types stay unclaimed. Pass `runtime` (or `leads`) to
     skip the dataset generation + model fit, which tests holding the session
-    dataset do.
+    dataset do; both provider modes need the fitted confidence model, only
+    `simulated` needs the corpus/registry.
+
+    `live_provider` lets a caller (tests, ``scripts/live_provider_smoke.py``)
+    inject an already-built adapter instead of paying
+    ``AbstractCompanyEnrichmentProvider.build()``'s API-key check — mirroring
+    ``arie.llm.deepseek.DeepSeekSignalExtractor``'s own injectable-client
+    pattern.
     """
     mode = provider_mode if provider_mode is not None else RUNTIME.provider_mode
-    if mode != "simulated":
+    if mode not in ("simulated", "live"):
         raise UnsupportedProviderModeError(
-            f"PROVIDER_MODE={mode!r} has no provider adapters — none have been written "
-            "(ADR 0003). Only 'simulated' is currently runnable."
+            f"PROVIDER_MODE={mode!r} is not a recognised provider mode — only 'simulated' and "
+            "'live' are runnable."
         )
 
     resolved_runtime = runtime if runtime is not None else build_runtime(leads)
+
+    if mode == "simulated":
+        return _build_simulated_handlers(pool, resolved_runtime)
+    return _build_live_handlers(pool, resolved_runtime, live_provider=live_provider)
+
+
+def _build_simulated_handlers(
+    pool: ConnectionPool, resolved_runtime: SimulatedEnrichmentRuntime
+) -> dict[str, JobHandler]:
+    """``PROVIDER_MODE=simulated`` — replays the frozen corpus, unchanged from
+    before P5. Only identities in ``resolved_runtime.corpus_by_email`` can be
+    enriched; see ``UnknownCorpusIdentityError``."""
     evidence_store = PostgresEvidenceStore(pool)
     cost_ledger = PostgresCostLedger(pool)
 
@@ -452,7 +594,9 @@ def build_handlers(
             )
 
         with traced(
-            _TRACER, "handler.compute_score", attributes={"arie.lead_id": job.lead_id}
+            _TRACER,
+            "handler.compute_score",
+            attributes={"arie.lead_id": job.lead_id, "arie.provider_mode": "simulated"},
         ) as span:
             identity = _load_identity(ctx.conn, job.lead_id)
             corpus_lead = resolved_runtime.corpus_lead_for(
@@ -517,32 +661,18 @@ def build_handlers(
                         "policy_name": resolved_runtime.policy.name,
                         "scorer_version": outcome.scoring.breakdown.model_version,
                         "confidence_calibration": resolved_runtime.policy.model.method,
-                        "evidence_snapshot": Jsonb(_evidence_snapshot(outcome)),
+                        "evidence_snapshot": Jsonb(_evidence_snapshot(outcome.scoring)),
                     },
                 )
 
-            route = decision_route(outcome.decision, outcome.autonomous)
-            final: LeadStatus
-            if route == "escalate_human":
-                request_review(
-                    ctx.conn,
-                    lead_id=job.lead_id,
-                    expected_version=version,
-                    original_decision=str(outcome.decision),
-                )
-                final = LeadStatus.AWAITING_HUMAN
-            else:
-                branched = next_status(LeadStatus.DECISION, outcome=route)
-                assert branched is not None  # route is a DECISION_OUTCOMES key by construction
-                final = branched
-                apply_transition(
-                    ctx.conn,
-                    lead_id=job.lead_id,
-                    expected_version=version,
-                    new_status=final,
-                    event_type="policy:decided",
-                    payload={"decision": str(outcome.decision), "route": route},
-                )
+            final = _finalize_decision(
+                ctx.conn,
+                lead_id=job.lead_id,
+                version=version,
+                decision=outcome.decision,
+                autonomous=outcome.autonomous,
+                is_shadow=identity.is_shadow,
+            )
 
             set_attributes(
                 span,
@@ -553,10 +683,206 @@ def build_handlers(
                     "arie.lead.final_status": str(final),
                     "arie.cost_usd": outcome.cost_usd,
                     "arie.stop_reason": outcome.stop_reason,
+                    "arie.shadow": identity.is_shadow,
                 },
             )
         # Transitions were applied here, hop by hop; None tells the worker
         # there is no further transition for it to apply.
+        return None
+
+    return {"compute_score": compute_score}
+
+
+def _build_live_handlers(
+    pool: ConnectionPool,
+    resolved_runtime: SimulatedEnrichmentRuntime,
+    *,
+    live_provider: EnrichmentProvider | None = None,
+) -> dict[str, JobHandler]:
+    """``PROVIDER_MODE=live`` (post-M1 P5) — one real adapter, any ingested
+    lead (no corpus restriction).
+
+    **Why this can't reuse `CalibratedBoundsPolicy.run`.** That method's
+    signature takes an `EvalLead` and walks `arie.providers.catalog.CATALOG`
+    (8 simulated providers) via `RunContext.fetch`, which resolves an entity
+    from `lead.company.canonical_domain`/`lead.person.email` and looks the
+    provider up in `arie.providers.catalog.BY_NAME` — a real lead has neither
+    an `EvalLead` nor a catalogue entry, and adding one would perturb frozen
+    dataset generation (`arie.evalgen.generator` iterates `CATALOG` to freeze
+    observations) and the M0 benchmark it feeds. So this handler is a second,
+    much smaller acquisition loop — trivial because there is exactly one
+    provider to decide about, not eight — built from the same *lead-
+    independent* primitives the simulated handler's policy sits on top of:
+    `arie.scoring.engine.score_evidence` (facts -> score/bounds/signals) and
+    `ConfidenceModel.predict` (both take a bare `ScoringResult`, never an
+    `EvalLead`). It reuses the exact same `PostgresEvidenceStore`/
+    `PostgresCostLedger`, the same `_finalize_decision` shadow/normal branch,
+    and the same `decision_receipts`/`scores` inserts as the simulated path —
+    only the acquisition loop above them differs.
+
+    **The confidence model is the corpus-calibrated one, reused as-is.** No
+    other calibration data exists. `ConfidenceModel.predict` only reads
+    `ScoringResult.signals` (completeness, conflict, boundary distance, ...),
+    which are well-defined for any evidence bundle — but applying a model
+    fitted on synthetic corpus signals to real evidence is an unvalidated
+    assumption, stated here and in `docs/06-m1-handoff.md`'s P5 section, not
+    quietly treated as equivalent to the simulated path's own guarantee.
+    """
+    provider = (
+        live_provider if live_provider is not None else AbstractCompanyEnrichmentProvider.build()
+    )
+    evidence_store = PostgresEvidenceStore(pool)
+    cost_ledger = PostgresCostLedger(pool)
+    model = resolved_runtime.policy.model
+
+    def compute_score(ctx: JobContext) -> None:
+        job = ctx.job
+        if job.lead_id is None:
+            raise ValueError("compute_score requires a lead_id on the job")
+        if ctx.lead_status is not LeadStatus.NEW or ctx.lead_version is None:
+            raise ValueError(
+                f"compute_score expects a NEW lead; lead {job.lead_id} is {ctx.lead_status}"
+            )
+
+        with traced(
+            _TRACER,
+            "handler.compute_score",
+            attributes={"arie.lead_id": job.lead_id, "arie.provider_mode": "live"},
+        ) as span:
+            identity = _load_identity(ctx.conn, job.lead_id)
+            version = _walk_to_decision(ctx.conn, lead_id=job.lead_id, version=ctx.lead_version)
+
+            now = datetime.now(UTC)
+            fresh = evidence_store.get_all_fresh("company", identity.company_id, now=now)
+            scoring = score_evidence(fresh, now)
+            already_has_fields = set(provider.provides_fields) <= {e.field_name for e in fresh}
+            can_call_provider = identity.canonical_domain is not None and not already_has_fields
+
+            if scoring.bounds.is_settled:
+                stop_reason = "decision_settled"
+            elif fresh and model.predict(scoring) >= model.tau:
+                stop_reason = "confidence_reached"
+            elif can_call_provider:
+                assert identity.canonical_domain is not None  # can_call_provider guarantees this
+                entity = Entity(
+                    entity_type="company",
+                    entity_id=identity.company_id,
+                    canonical_key=identity.canonical_domain,
+                )
+                result = provider.fetch(entity)
+                cost_ledger.record_provider_call(
+                    idempotency_key=f"job:{job.job_id}:{provider.name}:{entity.canonical_key}",
+                    provider=provider.name,
+                    entity_type="company",
+                    entity_id=identity.company_id,
+                    status=result.status,
+                    cost_usd=result.cost_usd,
+                    latency_ms=result.latency_ms,
+                    lead_id=job.lead_id,
+                    cache_hit=False,
+                )
+                if result.status is ProviderStatus.SUCCESS and result.fields:
+                    evidence_store.put_many(
+                        Evidence(
+                            entity_type="company",
+                            entity_id=identity.company_id,
+                            field_name=field_name,
+                            value=value,
+                            source=provider.name,
+                            confidence=result.confidence,
+                            ttl_seconds=ttl_for_field(field_name),
+                            fetched_at=now,
+                        )
+                        for field_name, value in result.fields.items()
+                    )
+                    fresh = evidence_store.get_all_fresh("company", identity.company_id, now=now)
+                    scoring = score_evidence(fresh, now)
+
+                if scoring.bounds.is_settled:
+                    stop_reason = "decision_settled"
+                elif fresh and model.predict(scoring) >= model.tau:
+                    stop_reason = "confidence_reached"
+                else:
+                    stop_reason = "all_providers_called"
+            elif identity.canonical_domain is None:
+                # Nothing to enrich by at all -- the one real provider
+                # requires a domain this lead never resolved one for.
+                stop_reason = "no_domain_available"
+            else:
+                # already_has_fields: the one provider's fields are already
+                # fresh in the evidence store -- "ARIE decided it didn't need
+                # to call a real paid API because enough evidence already
+                # exists" (P5's own point), not a failure. Recorded as a
+                # zero-cost cache hit, not silently skipped -- handoff item
+                # #5: "cache hits must be recorded, not skipped", the same
+                # rule _DurableCallLedger.record already follows for the
+                # simulated path.
+                cost_ledger.record_provider_call(
+                    idempotency_key=f"job:{job.job_id}:{provider.name}:{identity.canonical_domain}",
+                    provider=provider.name,
+                    entity_type="company",
+                    entity_id=identity.company_id,
+                    status=ProviderStatus.SUCCESS,
+                    cost_usd=0.0,
+                    latency_ms=0.0,
+                    lead_id=job.lead_id,
+                    cache_hit=True,
+                )
+                stop_reason = "all_providers_called"
+
+            confidence = model.predict(scoring)
+            autonomous = confidence >= model.tau
+
+            with ctx.conn.cursor() as cur:
+                cur.execute(
+                    _INSERT_SCORE,
+                    {
+                        "lead_id": job.lead_id,
+                        "total_score": scoring.breakdown.total_score,
+                        "decision_confidence": confidence,
+                        "component_breakdown": Jsonb(scoring.breakdown.components),
+                        "model_version": scoring.breakdown.model_version,
+                    },
+                )
+                cur.execute(
+                    _INSERT_DECISION_RECEIPT,
+                    {
+                        "lead_id": job.lead_id,
+                        "decision": str(scoring.decision),
+                        "autonomous": autonomous,
+                        "confidence": confidence,
+                        "tau": model.tau,
+                        "score_value": scoring.bounds.current,
+                        "score_lower": scoring.bounds.lower,
+                        "score_upper": scoring.bounds.upper,
+                        "stop_reason": stop_reason,
+                        "policy_name": LIVE_POLICY_NAME,
+                        "scorer_version": scoring.breakdown.model_version,
+                        "confidence_calibration": model.method,
+                        "evidence_snapshot": Jsonb(_evidence_snapshot(scoring)),
+                    },
+                )
+
+            final = _finalize_decision(
+                ctx.conn,
+                lead_id=job.lead_id,
+                version=version,
+                decision=scoring.decision,
+                autonomous=autonomous,
+                is_shadow=identity.is_shadow,
+            )
+
+            set_attributes(
+                span,
+                {
+                    "arie.decision": str(scoring.decision),
+                    "arie.confidence": confidence,
+                    "arie.autonomous": autonomous,
+                    "arie.lead.final_status": str(final),
+                    "arie.stop_reason": stop_reason,
+                    "arie.shadow": identity.is_shadow,
+                },
+            )
         return None
 
     return {"compute_score": compute_score}

@@ -33,6 +33,14 @@ class LeadStatus(StrEnum):
     SYNCED = "SYNCED"
     FAILED = "FAILED"
     DEAD_LETTER = "DEAD_LETTER"
+    SHADOW_EVALUATED = "SHADOW_EVALUATED"
+    """Post-M1 P5. A shadow-mode lead's terminal: ARIE computed a full
+    recommendation but never branched into an authoritative outcome (no
+    ``request_review``, no AUTO_ROUTED/REJECT/MANUAL_REVIEW). Deliberately
+    excluded from every business-semantic group in ``arie.statemachine.
+    transitions`` (QUALIFIED/REJECTED/AWAITING_REVIEW/FAILURE/FINALIZED) — a
+    shadow evaluation is not a business decision, so it must never be counted
+    as one."""
 
 
 class Decision(StrEnum):

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -52,6 +52,16 @@ class IngestLeadRequest(BaseModel):
     budget_usd_cap: Annotated[Decimal | None, Field(default=None, gt=0)] = None
     """Per-lead spend ceiling. Defaults to ``PolicyConfig.lead_budget_usd_cap``."""
 
+    mode: Literal["normal", "shadow"] = "normal"
+    """Post-M1 P5. ``"shadow"`` tells ARIE to compute its full recommendation
+    (evidence, cost, confidence, stop reason) without taking any authoritative
+    action — no autonomous routing, no human review opened, nothing an n8n
+    outcome-sync consumer would treat as finalized. Fixed at creation: a
+    redelivery of the same ``(source, external_ref)`` with a different `mode`
+    does not change it, the same "first write wins" rule every other optional
+    ingestion field already follows — the persisted value is always in the
+    response's `is_shadow`."""
+
     @field_validator("email")
     @classmethod
     def _email_is_normalizable(cls, value: str) -> str:
@@ -75,6 +85,7 @@ class IngestLeadRequest(BaseModel):
             full_name=self.full_name,
             title=self.title,
             budget_usd_cap=self.budget_usd_cap,
+            is_shadow=self.mode == "shadow",
         )
 
 
@@ -93,6 +104,9 @@ class IngestLeadResponse(BaseModel):
     """True if this delivery found the job permanently failed (``dead_letter``)
     and reset it to ``pending`` with a fresh attempt budget, rather than
     finding a live or completed job untouched."""
+    is_shadow: bool
+    """The persisted shadow flag — may differ from this request's own `mode`
+    if `(source, external_ref)` already existed under a different mode."""
 
 
 class LeadCostResponse(BaseModel):
@@ -115,6 +129,7 @@ class LeadResponse(BaseModel):
     company_id: UUID | None
     person_id: UUID | None
     budget_usd_cap: Decimal
+    is_shadow: bool
     created_at: datetime
     updated_at: datetime
     cost: LeadCostResponse
@@ -307,6 +322,8 @@ class ReceiptResponse(BaseModel):
     """"pending", "processing_failed", or "decided" — see `DecisionReceipt.status`."""
     lead_status: LeadStatus
     created_at: datetime | None
+    shadow: bool
+    """Post-M1 P5 — see `arie.api.receipt.DecisionReceipt.shadow`."""
 
     decision: ReceiptDecisionResponse | None
     score: ReceiptScoreResponse | None

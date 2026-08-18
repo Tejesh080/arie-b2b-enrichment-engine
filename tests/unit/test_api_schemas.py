@@ -146,6 +146,7 @@ def test_to_command_carries_every_field_through() -> None:
         full_name="Ada Lovelace",
         title="VP Engineering",
         budget_usd_cap=Decimal("2.50"),
+        mode="shadow",
     )
     command = request.to_command()
 
@@ -157,3 +158,15 @@ def test_to_command_carries_every_field_through() -> None:
     assert command.full_name == "Ada Lovelace"
     assert command.title == "VP Engineering"
     assert command.budget_usd_cap == Decimal("2.50")
+    assert command.is_shadow is True
+
+
+def test_mode_defaults_to_normal_and_is_not_shadow() -> None:
+    request = IngestLeadRequest(**_minimal())  # type: ignore[arg-type]
+    assert request.mode == "normal"
+    assert request.to_command().is_shadow is False
+
+
+def test_unrecognised_mode_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        IngestLeadRequest(**_minimal(mode="dry-run"))  # type: ignore[arg-type]

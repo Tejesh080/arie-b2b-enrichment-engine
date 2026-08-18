@@ -101,12 +101,32 @@ def test_awaiting_human_without_a_recognised_outcome_raises(bad_outcome: str | N
 
 @pytest.mark.parametrize(
     "status",
-    [LeadStatus.ROUTED, LeadStatus.SYNCED, LeadStatus.FAILED, LeadStatus.DEAD_LETTER],
+    [
+        LeadStatus.ROUTED,
+        LeadStatus.SYNCED,
+        LeadStatus.FAILED,
+        LeadStatus.DEAD_LETTER,
+        LeadStatus.SHADOW_EVALUATED,
+    ],
 )
 def test_terminal_statuses_have_no_next_action(status: LeadStatus) -> None:
     assert status in TERMINAL
     assert job_type_for(status) is None
     assert next_status(status) is None
+
+
+def test_shadow_evaluated_is_not_a_business_semantic_group() -> None:
+    """Post-M1 P5: a shadow evaluation is not a business decision. It must be
+    mechanically terminal (nothing auto-advances it) without being counted as
+    qualified, rejected, awaiting review, or a failure -- see arie.jobs.
+    handlers' shadow-branch docstring for why (v_pipeline_metrics/
+    v_escalation_rate must never be inflated by shadow-run activity, and
+    outcome-sync.json's FINALIZED gate must never treat one as synced)."""
+    assert LeadStatus.SHADOW_EVALUATED not in QUALIFIED
+    assert LeadStatus.SHADOW_EVALUATED not in REJECTED
+    assert LeadStatus.SHADOW_EVALUATED not in AWAITING_REVIEW
+    assert LeadStatus.SHADOW_EVALUATED not in FAILURE
+    assert LeadStatus.SHADOW_EVALUATED not in FINALIZED
 
 
 @pytest.mark.parametrize(

@@ -21,7 +21,7 @@ from arie.core.types import LeadStatus
 
 _SELECT_LEAD = """
     SELECT lead_id, status, version, source, external_ref,
-           company_id, person_id, budget_usd_cap, created_at, updated_at
+           company_id, person_id, budget_usd_cap, is_shadow, created_at, updated_at
     FROM leads
     WHERE lead_id = %(lead_id)s
 """
@@ -37,6 +37,10 @@ class LeadRecord:
     company_id: UUID | None
     person_id: UUID | None
     budget_usd_cap: Decimal
+    is_shadow: bool
+    """Post-M1 P5. Fixed at ingestion, never updated afterward — see
+    ``arie.api.ingest``'s idempotency semantics for why a redelivery can't
+    change it."""
     created_at: datetime
     updated_at: datetime
 
@@ -56,6 +60,7 @@ def fetch_lead(conn: psycopg.Connection, lead_id: UUID) -> LeadRecord | None:
         company_id=row["company_id"],
         person_id=row["person_id"],
         budget_usd_cap=row["budget_usd_cap"],
+        is_shadow=row["is_shadow"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

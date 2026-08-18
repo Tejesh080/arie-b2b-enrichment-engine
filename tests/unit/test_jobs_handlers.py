@@ -9,10 +9,13 @@ tests/integration/test_pipeline_integration.py.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import pytest
 from psycopg_pool import ConnectionPool
 
-from arie.core.types import Decision, LeadStatus
+from arie.config import LiveProviderConfig
+from arie.core.types import Decision, Entity, EntityType, LeadStatus, ProviderResult, ProviderStatus
 from arie.evalgen.schema import EvalLead
 from arie.jobs.handlers import (
     SimulatedEnrichmentRuntime,
@@ -22,6 +25,7 @@ from arie.jobs.handlers import (
     build_runtime,
     decision_route,
 )
+from arie.providers.live_abstract import AbstractCompanyConfigurationError
 from arie.statemachine.transitions import job_type_for
 
 
@@ -67,12 +71,69 @@ def test_every_registered_handler_names_a_job_type_the_graph_defines(
     assert set(handlers) <= graph_job_types
 
 
-def test_live_provider_mode_is_refused_loudly(
+def test_an_unrecognised_provider_mode_is_refused_loudly(
     runtime: SimulatedEnrichmentRuntime, unopened_pool: ConnectionPool
 ) -> None:
-    """No real provider adapter exists (ADR 0003). A worker silently falling
-    back to the simulator would report coverage for vendors it never called."""
+    """Post-M1 P5: only 'simulated' and 'live' are recognised now. A worker
+    silently falling back to the simulator for a typo'd mode would report
+    coverage for vendors it never called."""
     with pytest.raises(UnsupportedProviderModeError):
+        build_handlers(unopened_pool, runtime=runtime, provider_mode="lyve")
+
+
+@dataclass(frozen=True)
+class _FakeLiveProvider:
+    """Satisfies `EnrichmentProvider` structurally, with no network at all —
+    for tests that only need live mode to *build*, not to call anything real."""
+
+    name: str = "fake_live_provider"
+    entity_type: EntityType = "company"
+    provides_fields: tuple[str, ...] = ("employee_count", "industry")
+    base_cost_usd: float = 0.001
+    p50_latency_ms: int = 100
+    p95_latency_ms: int = 500
+    result: ProviderResult = field(
+        default_factory=lambda: ProviderResult(
+            fields={"employee_count": 250, "industry": "software"},
+            confidence=0.8,
+            cost_usd=0.001,
+            latency_ms=42.0,
+            status=ProviderStatus.SUCCESS,
+        )
+    )
+
+    def fetch(self, entity: Entity) -> ProviderResult:
+        return self.result
+
+
+def test_live_provider_mode_builds_a_handler_with_an_injected_provider(
+    runtime: SimulatedEnrichmentRuntime, unopened_pool: ConnectionPool
+) -> None:
+    """Post-M1 P5: PROVIDER_MODE=live now has a real backend. Injecting a fake
+    adapter (mirroring DeepSeekSignalExtractor's own test-injection pattern)
+    proves the dispatch and registration without any network or database."""
+    handlers = build_handlers(
+        unopened_pool,
+        runtime=runtime,
+        provider_mode="live",
+        live_provider=_FakeLiveProvider(),
+    )
+    assert "compute_score" in handlers
+
+
+def test_live_provider_mode_without_a_configured_key_fails_clearly(
+    runtime: SimulatedEnrichmentRuntime,
+    unopened_pool: ConnectionPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing ABSTRACT_COMPANY_API_KEY must fail at build time, not silently
+    fall back to the simulator — the same boundary DeepSeekConfigurationError
+    draws for arie.llm. Patches the module-level config singleton directly so
+    this is deterministic regardless of the ambient environment/.env."""
+    monkeypatch.setattr(
+        "arie.providers.live_abstract.LIVE_PROVIDER", LiveProviderConfig(api_key="")
+    )
+    with pytest.raises(AbstractCompanyConfigurationError):
         build_handlers(unopened_pool, runtime=runtime, provider_mode="live")
 
 

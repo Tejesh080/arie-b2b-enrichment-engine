@@ -241,6 +241,7 @@ def register_routes(app: FastAPI) -> None:
             job_id=result.job_id,
             job_created=result.job_created,
             job_requeued=result.job_requeued,
+            is_shadow=result.is_shadow,
         )
 
     @app.get("/leads/{lead_id}", response_model=LeadResponse)
@@ -262,6 +263,7 @@ def register_routes(app: FastAPI) -> None:
             company_id=record.company_id,
             person_id=record.person_id,
             budget_usd_cap=record.budget_usd_cap,
+            is_shadow=record.is_shadow,
             created_at=record.created_at,
             updated_at=record.updated_at,
             cost=LeadCostResponse(

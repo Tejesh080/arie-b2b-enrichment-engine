@@ -40,8 +40,12 @@ from arie.api.reads import fetch_lead
 from arie.core.types import LeadStatus
 from arie.ledger.store import LeadCost, PostgresCostLedger
 from arie.providers.catalog import ALL_PROVIDERS
+from arie.providers.live_abstract import LIVE_POLICY_NAME
+from arie.providers.live_abstract import PROVIDER_NAME as LIVE_PROVIDER_NAME
 from arie.scoring.rules import QUALIFY_THRESHOLD, REJECT_THRESHOLD
 from arie.statemachine.transitions import FAILURE
+
+LIVE_PROVIDER_NAMES: tuple[str, ...] = (LIVE_PROVIDER_NAME,)
 
 RECEIPT_VERSION = "1"
 
@@ -57,6 +61,11 @@ _STOP_REASON_EXPLANATIONS: dict[str, str] = {
     ),
     "all_providers_called": (
         "Every available data provider was called; there was no further evidence left to purchase."
+    ),
+    "no_domain_available": (
+        "Post-M1 P5, live provider mode. This lead had no company domain to enrich by, so the "
+        "one real provider (which requires a domain) could never be called. The decision "
+        "reflects whatever evidence was already known, not certainty that none exists."
     ),
 }
 
@@ -181,6 +190,14 @@ class DecisionReceipt:
     created_at: datetime | None
     """When the decision was made — `None` while `status` is not "decided"."""
 
+    shadow: bool
+    """Post-M1 P5. True for a lead ingested with `mode="shadow"` — `decision`
+    is ARIE's full recommendation, but `lead_status`/`decision.final_status`
+    will never be an authoritative routing outcome (AUTO_ROUTED/AWAITING_HUMAN/
+    MANUAL_REVIEW/SYNCED) and `human_review` will always be `None`: shadow
+    evaluation never opens a real review. See `arie.jobs.handlers`' shadow
+    branch for what is and isn't suppressed."""
+
     decision: ReceiptDecision | None
     score: ReceiptScore | None
     stopping: ReceiptStopping | None
@@ -304,12 +321,26 @@ def build_receipt(
 
     calls = _provider_calls(conn, lead_id)
     called_names = {call.provider for call in calls}
-    not_called = tuple(name for name in ALL_PROVIDERS if name not in called_names)
     human_review, human_override = _human_review(conn, lead_id)
 
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(_SELECT_DECISION_RECEIPT, {"lead_id": lead_id})
         receipt_row = cur.fetchone()
+
+    # Which catalogue "not_called" is a set difference against depends on which
+    # policy actually ran — the 8-provider simulated catalogue for a corpus
+    # lead, or the one real provider for a live-mode lead. Getting this wrong
+    # would claim the 7 simulated providers were "available but not called"
+    # for a live lead that never had access to any of them, or vice versa.
+    # Before a decision exists (no `receipt_row`) neither catalogue is known
+    # yet, so this keeps the pre-P5 behaviour (ALL_PROVIDERS) rather than
+    # guessing.
+    catalogue = (
+        LIVE_PROVIDER_NAMES
+        if receipt_row is not None and receipt_row["policy_name"] == LIVE_POLICY_NAME
+        else ALL_PROVIDERS
+    )
+    not_called = tuple(name for name in catalogue if name not in called_names)
 
     receipt_cost = ReceiptCost(
         provider_cost_usd=cost.provider_cost_usd,
@@ -326,6 +357,7 @@ def build_receipt(
             status=status,
             lead_status=lead.status,
             created_at=None,
+            shadow=lead.is_shadow,
             decision=None,
             score=None,
             stopping=None,
@@ -348,6 +380,7 @@ def build_receipt(
         status="decided",
         lead_status=lead.status,
         created_at=receipt_row["created_at"],
+        shadow=lead.is_shadow,
         decision=ReceiptDecision(
             recommended_action=receipt_row["decision"],
             autonomous=receipt_row["autonomous"],

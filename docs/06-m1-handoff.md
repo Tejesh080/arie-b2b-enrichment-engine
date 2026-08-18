@@ -884,6 +884,124 @@ goal.
 
 ---
 
+## Post-M1 P5 — One real provider + shadow mode
+
+**Purpose.** P1–P3 made ARIE's decisions and the M0 result legible; P5 proves
+two narrower things: (1) the provider abstraction built for the simulator
+holds up against one real vendor, and (2) ARIE can safely observe a real
+enrichment workflow without controlling it. Both are deliberately narrow —
+see "Non-goals" below and the P5 task brief's own scoping.
+
+**Provider selected: Abstract API — Company Enrichment.** Chosen over
+Hunter.io (API access gated behind a paid tier) and other candidates because
+its response fields (`employee_count`, `industry`) are an exact match for two
+of `arie.scoring.rules.SCORED_FIELDS`, its auth is a plain query parameter, and
+its free tier (100 requests/month, no card) supports both this handoff's
+failure-path unit tests and one deliberately controlled live call. See
+`docs/adr/0003-simulator-first-providers.md`'s "When to revisit" — comparing
+this adapter's observed behaviour against the simulator's assumed profile
+remains future work, not done here.
+
+**Why the live handler can't reuse `CalibratedBoundsPolicy.run`.** That
+method takes an `EvalLead` and walks the frozen `CATALOG` via
+`arie.providers.catalog.BY_NAME` — a real lead has neither. Adding the live
+provider to `CATALOG` was rejected outright: `arie.evalgen.generator` iterates
+that tuple to freeze the M0 dataset, so touching it would perturb the frozen
+benchmark this project has already published. Instead,
+`arie.jobs.handlers._build_live_handlers` is a second, much smaller
+acquisition loop (trivial with one provider instead of eight) built from the
+same *lead-independent* primitives the simulated policy already sits on —
+`arie.scoring.engine.score_evidence` and `ConfidenceModel.predict` both take a
+bare `ScoringResult`, never an `EvalLead`. It reuses the exact same
+`PostgresEvidenceStore`/`PostgresCostLedger`/`decision_receipts`/`scores`
+writes as the simulated path. One explicitly stated, unvalidated assumption:
+the confidence model applied to live evidence is the same one calibrated on
+synthetic corpus signals — no other calibration data exists, and this is
+named rather than treated as equivalent to the simulated path's own
+guarantee.
+
+**`PROVIDER_MODE=live` no longer refuses outright.** `build_handlers` now
+dispatches on `provider_mode` to `_build_simulated_handlers` (unchanged) or
+`_build_live_handlers` (new); an unrecognised mode string still raises
+`UnsupportedProviderModeError`. A configured-but-keyless live mode raises
+`AbstractCompanyConfigurationError` instead — a different failure ("live mode
+is misconfigured") from "live mode doesn't exist," both loud, neither a
+silent fallback to the simulator.
+
+**Shadow semantics.** `leads.is_shadow` (migration `0009`, plain boolean,
+default `false`) is set once at ingestion — `POST /leads {"mode": "shadow"}`
+— and never updated after; a redelivery of the same `(source, external_ref)`
+with a different requested mode keeps whatever was persisted the first time,
+the same rule every other optional ingestion field already follows. A shadow
+lead runs the identical acquisition loop and gets a real `decision_receipts`
+row (recommendation, confidence, cost, stop reason, evidence snapshot — all
+of it), but `arie.jobs.handlers._finalize_decision` — the one function both
+provider-mode handlers share for the DECISION-node branch — routes it to a
+new terminal, `LeadStatus.SHADOW_EVALUATED`, instead of calling
+`request_review` or applying `DECISION_OUTCOMES`. `SHADOW_EVALUATED` is in
+`arie.statemachine.transitions.TERMINAL` (nothing auto-advances it) but
+deliberately excluded from every business-semantic group
+(`QUALIFIED`/`REJECTED`/`AWAITING_REVIEW`/`FAILURE`/`FINALIZED`) — so
+`workflows/n8n/outcome-sync.json`'s FINALIZED-gated sync, `v_pipeline_metrics`,
+and `v_escalation_rate` all treat a shadow lead as exactly what it is: not a
+business outcome. `v_lead_cost` stays universal (a shadow lead's own receipt
+still needs its own cost row); `v_pipeline_metrics`/`v_escalation_rate` gained
+a `WHERE NOT is_shadow` filter in the same migration. Zero changes to
+`workflows/n8n/*.json` were needed — a status outside their hardcoded
+FINALIZED list already falls into the safe "not finalized" branch.
+
+**Cache hits must still be recorded, not skipped — item #5 all over again.**
+The live handler's "evidence already fresh, don't call the real API" branch
+records a zero-cost, `cache_hit=True` `provider_calls` row rather than
+silently doing nothing, mirroring `_DurableCallLedger`'s existing rule for the
+simulated path exactly. This is the actual interesting live-provider story:
+ARIE deciding it does *not* need to spend real money, not merely that it can
+make one real HTTP call — measurable in the receipt, not just asserted.
+
+**Schema.** Migration `0009_live_provider_and_shadow_mode.sql`: one column
+(`leads.is_shadow`), and `v_lead_cost`/`v_pipeline_metrics`/`v_escalation_rate`
+replaced (additive filter only, no column removed or retyped).
+`decision_receipts` (0008) is untouched — the live handler writes
+`policy_name = "live_single_provider"` into the same columns the simulated
+path already writes, which is also how `arie.api.receipt` decides whether
+`providers.not_called` is a set difference against the 8-provider simulated
+catalogue or the one-provider live catalogue.
+
+**Test status.** `tests/unit/test_live_abstract_provider.py` covers every
+adapter failure mode (missing key, timeout, connection error, 401/403/429/422,
+5xx, malformed JSON, a non-dict JSON body, a miss, a partially-unusable field)
+against `httpx.MockTransport` — no network, no key, no spend.
+`tests/unit/test_jobs_handlers.py` covers build-time dispatch (unrecognised
+mode, an injected fake live provider, a missing key via a monkeypatched
+config singleton). `tests/integration/test_live_provider_integration.py`
+drives a non-corpus lead through the real pipeline with the HTTP layer mocked
+(never a real Abstract API call in CI) and pins cache reuse and the no-domain
+case. `tests/integration/test_shadow_mode_integration.py` is item 22's
+deterministic demonstration: the same corpus lead, once normal (authoritative
+`AWAITING_HUMAN` + a real pending review) and once shadow
+(`SHADOW_EVALUATED`, zero reviews, identical frozen recommendation), plus a
+metrics-exclusion test paired with a normal-mode control so "unchanged" can't
+pass vacuously.
+
+**Live verification status.** Depends on whether `ABSTRACT_COMPANY_API_KEY`
+was available when this phase's final gate ran — see the session's own final
+report for whether `scripts/live_provider_smoke.py` actually executed a real
+call, or stopped cleanly with "implementation complete; live verification
+blocked pending that key," per the task brief's own explicit instruction not
+to fabricate this section.
+
+**Deliberately deferred / non-goals**, restated because they're easy to drift
+back into: a second real provider, a provider registry/marketplace, dynamic
+provider discovery or an LLM provider-selector, CRM OAuth
+(HubSpot/Salesforce), a hosted n8n deployment, frontend changes (`arie-web` is
+untouched), authentication, multi-tenancy, billing, Kafka/Redis/Celery/
+Temporal/Kubernetes, RAG/vector DB, and any claim of production savings,
+better-than-human quality, or shadow-mode superiority — P5 proves the adapter
+abstraction works against something real and that ARIE can measure its own
+behaviour safely, nothing about real-world economic superiority.
+
+---
+
 ## Do not
 
 - Resurrect or tune EVoI.

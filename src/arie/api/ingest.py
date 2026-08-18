@@ -51,12 +51,19 @@ _TRACER = get_tracer("arie.api.ingest")
 # this codebase: DO NOTHING skips RETURNING, and a duplicate request still needs
 # the existing lead_id to answer with. `updated_at` is a genuine update here —
 # the upstream system did re-send this record, and that is worth timestamping.
+# `is_shadow` is written only on the INSERT path, never in the ON CONFLICT's
+# DO UPDATE -- a redelivery of the same (source, external_ref) with a
+# different requested mode does not change what was already persisted, the
+# same "first write wins" rule every other optional ingestion field here
+# already follows. RETURNING it lets the caller report the *actual* persisted
+# value rather than assuming the request's own.
 _INSERT_LEAD = """
-    INSERT INTO leads (person_id, company_id, source, external_ref, budget_usd_cap)
-    VALUES (%(person_id)s, %(company_id)s, %(source)s, %(external_ref)s, %(budget_usd_cap)s)
+    INSERT INTO leads (person_id, company_id, source, external_ref, budget_usd_cap, is_shadow)
+    VALUES (%(person_id)s, %(company_id)s, %(source)s, %(external_ref)s, %(budget_usd_cap)s,
+            %(is_shadow)s)
     ON CONFLICT (source, external_ref) WHERE external_ref IS NOT NULL
         DO UPDATE SET updated_at = now()
-    RETURNING lead_id, status, version, (xmax = 0) AS created
+    RETURNING lead_id, status, version, is_shadow, (xmax = 0) AS created
 """
 
 _INSERT_INGEST_EVENT = """
@@ -77,6 +84,8 @@ class LeadIngestCommand:
     full_name: str | None = None
     title: str | None = None
     budget_usd_cap: Decimal | None = None
+    is_shadow: bool = False
+    """Post-M1 P5. See ``arie.api.schemas.IngestLeadRequest.mode``."""
 
 
 @dataclass(frozen=True)
@@ -96,6 +105,9 @@ class IngestResult:
     (``dead_letter``) and reset it to ``pending`` with a fresh attempt
     budget — the recovery path a redelivered webhook is the natural trigger
     for. Always False alongside ``job_created=True``."""
+    is_shadow: bool
+    """The persisted value — may differ from this command's own `is_shadow` on
+    a redelivery under a different requested mode; see `_INSERT_LEAD`."""
 
 
 def ingest_lead(
@@ -151,6 +163,7 @@ def ingest_lead(
                     "source": command.source,
                     "external_ref": command.external_ref,
                     "budget_usd_cap": budget_cap,
+                    "is_shadow": command.is_shadow,
                 },
             )
             lead_row = cur.fetchone()
@@ -159,6 +172,7 @@ def ingest_lead(
         lead_id: UUID = lead_row["lead_id"]
         created: bool = lead_row["created"]
         status = LeadStatus(lead_row["status"])
+        is_shadow: bool = lead_row["is_shadow"]
 
         ingest_span.set_attribute("arie.lead_id", str(lead_id))
         ingest_span.set_attribute("arie.lead_created", created)
@@ -170,6 +184,7 @@ def ingest_lead(
                 "company_id": str(company.company_id),
                 "person_id": str(person.person_id),
                 "budget_usd_cap": str(budget_cap),
+                "is_shadow": is_shadow,
             }
             with conn.cursor() as cur:
                 cur.execute(_INSERT_INGEST_EVENT, {"lead_id": lead_id, "payload": Jsonb(payload)})
@@ -207,4 +222,5 @@ def ingest_lead(
             job_id=enqueued.job_id,
             job_created=enqueued.created,
             job_requeued=enqueued.requeued,
+            is_shadow=is_shadow,
         )

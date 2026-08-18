@@ -82,13 +82,19 @@ HUMAN_REVIEW_OUTCOMES: dict[str, LeadStatus] = {
 # workflows), and MANUAL_REVIEW is a resting state for an overridden lead with
 # no further auto-advancement defined. AWAITING_HUMAN is no longer in this
 # category as of M1 Step 11 -- see HUMAN_REVIEW_OUTCOMES and next_status below.
-# ROUTED has nowhere further to go without the sync path either.
+# ROUTED has nowhere further to go without the sync path either. SHADOW_EVALUATED
+# (post-M1 P5) joins this set for the same mechanical reason -- nothing
+# auto-advances it -- but is deliberately absent from every group below: a
+# shadow evaluation is not a business outcome, so it must not read as one to
+# v_pipeline_metrics, v_escalation_rate, or workflows/n8n/outcome-sync.json's
+# FINALIZED-gated sync (see arie.jobs.handlers' shadow-branch docstring).
 TERMINAL: frozenset[LeadStatus] = frozenset(
     {
         LeadStatus.ROUTED,
         LeadStatus.SYNCED,
         LeadStatus.FAILED,
         LeadStatus.DEAD_LETTER,
+        LeadStatus.SHADOW_EVALUATED,
     }
 )
 
