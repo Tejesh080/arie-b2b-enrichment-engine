@@ -166,9 +166,17 @@ class LiveProviderConfig:
     api_key: str = field(default_factory=lambda: os.getenv("ABSTRACT_COMPANY_API_KEY", ""))
     base_url: str = field(
         default_factory=lambda: os.getenv(
-            "ABSTRACT_COMPANY_BASE_URL", "https://companyenrichment.abstractapi.com/v2"
-        ).rstrip("/")
+            "ABSTRACT_COMPANY_BASE_URL", "https://companyenrichment.abstractapi.com/v2/"
+        )
     )
+    """The exact endpoint URL, used verbatim (not an httpx `base_url` a path
+    gets joined onto) — unlike ``LLMConfig.deepseek_base_url``, there is
+    nothing to strip a trailing slash *for*. Keep the trailing slash: Abstract
+    canonicalizes `/v2` -> `/v2/` with a 301 that preserves the query string,
+    confirmed by a live request during P5's verification — harmless if
+    ``AbstractCompanyEnrichmentProvider``'s ``follow_redirects=True`` client
+    ever needs to correct a misconfigured value, but avoiding the redirect
+    round-trip entirely is better than relying on that."""
     timeout_seconds: float = field(
         default_factory=lambda: _env_float("ABSTRACT_COMPANY_TIMEOUT_SECONDS", 10.0)
     )

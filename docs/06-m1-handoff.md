@@ -983,12 +983,30 @@ deterministic demonstration: the same corpus lead, once normal (authoritative
 metrics-exclusion test paired with a normal-mode control so "unchanged" can't
 pass vacuously.
 
-**Live verification status.** Depends on whether `ABSTRACT_COMPANY_API_KEY`
-was available when this phase's final gate ran — see the session's own final
-report for whether `scripts/live_provider_smoke.py` actually executed a real
-call, or stopped cleanly with "implementation complete; live verification
-blocked pending that key," per the task brief's own explicit instruction not
-to fabricate this section.
+**Live verification — done, and it found a real bug.** Once
+`ABSTRACT_COMPANY_API_KEY` was supplied, `scripts/live_provider_smoke.py
+--domain github.com --confirm-live-spend --api-base-url ...` surfaced a
+genuine defect on its first real call: Abstract 301-redirects the documented
+`/v2` path to `/v2/` (query string preserved), and httpx does not follow
+redirects by default, so the adapter reported `status: "error",
+error_kind: "unexpected_status:301"` instead of ever reaching the real
+response. Diagnosed with one additional `follow_redirects=False` request
+(Location header redacted before being read) rather than guessing.
+`LiveProviderConfig.base_url`'s default now carries the trailing slash (no
+more `.rstrip("/")` — that normalization made sense for
+`LLMConfig.deepseek_base_url`, which paths get joined onto, but this URL is
+used verbatim), and `AbstractCompanyEnrichmentProvider.build()`'s client sets
+`follow_redirects=True` as defense-in-depth for a future misconfigured
+override. Re-run after the fix: a real `github.com` lookup returned
+`employee_count: 2579`, `industry: "computer software"` at $0.00165, and — a
+live, unplanned demonstration of the README's own stated taxonomy caveat —
+`"computer software"` doesn't exactly match `arie.scoring.rules`'s closed
+`_INDUSTRY_POINTS` vocabulary (`"software"`), so it scored zero industry
+points; `employee_count` alone (8 points, >1000 band) left the lead at
+`total_score=8.0`, confidently rejected (`confidence=0.854 >= tau=0.804`),
+landing on `SYNCED` — the reject-branch terminal — autonomously. Both demo
+leads and their evidence/provider_calls rows were deleted from the shared
+Supabase project afterward; nothing from this verification run persists.
 
 **Deliberately deferred / non-goals**, restated because they're easy to drift
 back into: a second real provider, a provider registry/marketplace, dynamic

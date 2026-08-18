@@ -436,6 +436,14 @@ vendor, without touching the frozen M0 catalogue or benchmark.
   Decision Receipt — a second real call, which the script says out loud
   before making it.
 
+  Run for real against `github.com`: `employee_count: 2579`,
+  `industry: "computer software"`, cost `$0.00165`, autonomously rejected
+  (score 8.0 — Abstract's free-text industry string doesn't match ARIE's
+  closed vocabulary, the exact caveat above, seen live). Also caught a real
+  bug worth knowing about: Abstract 301-redirects the documented `/v2` path
+  to `/v2/`; the adapter's `base_url` now carries the trailing slash and its
+  client sets `follow_redirects=True` as a backstop.
+
 **Deliberately not built:** a second provider, a provider registry/marketplace,
 retries beyond one bounded attempt, or any claim that this adapter's accuracy
 matches the simulator's declared assumptions — that comparison is exactly what

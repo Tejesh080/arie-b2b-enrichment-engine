@@ -116,7 +116,14 @@ class AbstractCompanyEnrichmentProvider:
                 "ABSTRACT_COMPANY_API_KEY is not set — see .env.example. Pass an explicit "
                 "`client` (e.g. in tests) to bypass this check."
             )
-        resolved_client = client or httpx.Client(timeout=resolved_config.timeout_seconds)
+        # follow_redirects=True as defense-in-depth: a live request during P5's
+        # own verification found Abstract 301-redirects a trailing-slash
+        # mismatch (query string preserved) rather than erroring, and
+        # LiveProviderConfig.base_url's own default now avoids that
+        # round-trip anyway — this only matters for a misconfigured override.
+        resolved_client = client or httpx.Client(
+            timeout=resolved_config.timeout_seconds, follow_redirects=True
+        )
         return AbstractCompanyEnrichmentProvider(config=resolved_config, client=resolved_client)
 
     @property
