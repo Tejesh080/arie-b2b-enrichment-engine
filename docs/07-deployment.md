@@ -272,6 +272,15 @@ to survive an `arie-worker` redeploy: the same lead and receipt, refetched
 afterward, were unchanged — proof the state lives in Supabase, not the
 worker container.
 
+**One small concurrency check**, deliberately bounded (this is not load
+testing — see [`08-portfolio.md`](08-portfolio.md) for what that limitation
+does and doesn't mean): 5 leads at the same identity, submitted
+simultaneously against the public API. All 5 reached `AUTO_ROUTED`, each
+with a consistent version history (no lost or duplicated transitions) and
+identical evidence — 2 fresh provider calls plus 5 cache hits each — proving
+`SKIP LOCKED` correctly serialized the concurrent claims and the evidence
+cache stayed consistent under concurrent access, not just sequential.
+
 ---
 
 ## What this deliberately doesn't cover

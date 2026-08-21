@@ -624,6 +624,7 @@ Two migration directories, one source of truth: see
 | [`05-results.md`](docs/05-results.md) | **Measured results, 10 seeds, honest verdict** |
 | [`06-m1-handoff.md`](docs/06-m1-handoff.md) | What M1 needs to know |
 | [`07-deployment.md`](docs/07-deployment.md) | Migrations, config, health checks, shutdown — deploying the API and worker |
+| [`08-portfolio.md`](docs/08-portfolio.md) | 30s/2min explanations, resume bullets, interview Q&A, safe claims vs. claims to avoid |
 | [`ASSUMPTIONS.md`](docs/ASSUMPTIONS.md) | Every parameter and its justification |
 | [`adr/`](docs/adr/) | Architecture decision records |
 
