@@ -101,6 +101,25 @@ regression test.
 
 ## Architecture
 
+```mermaid
+flowchart TD
+    A["Lead source<br/>CRM / n8n / API client"] --> B["Ingestion API — FastAPI<br/>POST /leads"]
+    B -->|"identity resolution + lead row<br/>+ first job, one transaction"| C[("Postgres / Supabase<br/>leads, jobs, evidence")]
+    C -->|"SKIP LOCKED claim"| D["Worker"]
+    D --> E["Deterministic scorer<br/>score bounds"]
+    E --> F{"Settled?<br/>no unbought evidence<br/>could change it"}
+    F -->|no| G["Buy next provider"]
+    G --> C
+    F -->|yes| H["Calibrated confidence<br/>vs. autonomy threshold τ"]
+    H -->|"confidence ≥ τ"| I["Auto-route / Reject<br/>(autonomous)"]
+    H -->|"confidence < τ"| J["Human review"]
+    J --> K["Human action<br/>approve / reject / edit"]
+    I --> L["Decision Receipt<br/>machine rec. + human action<br/>+ final outcome, kept separate"]
+    K --> L
+```
+
+The same shape, annotated with what's built where:
+
 ```
    n8n (thin edge: ingest webhook, outcome sync)          [M1, BUILT]
                      |
@@ -135,12 +154,14 @@ through the worker: schema and migrations, evidence store, identity
 resolution, the job queue and transactional state machine, the ingestion API,
 cost ledger, end-to-end tracing, LLM signal extraction, a human review API,
 the n8n edge workflows — and the worker handler that composes them.
-`CalibratedBoundsPolicy` now runs in production (over the simulated provider
-registry — no real vendor adapter exists yet, so only identities from the
-frozen eval corpus can be enriched), buying evidence into the durable store,
-ledgering every call, and escalating low-confidence decisions through
-`request_review`. `arie.llm` alone remains uncalled by the worker — ingestion
-carries no free-text field for it to extract from yet. See
+`CalibratedBoundsPolicy` now runs in production over the simulated provider
+registry by default (`PROVIDER_MODE=simulated` — only identities from the
+frozen eval corpus can be enriched, no real spend possible), buying evidence
+into the durable store, ledgering every call, and escalating low-confidence
+decisions through `request_review`. A real vendor adapter exists too — see
+[Real provider](#real-provider) below — deployed but deliberately kept off by
+default. `arie.llm` alone remains uncalled by the worker — ingestion carries
+no free-text field for it to extract from yet. See
 [the handoff](docs/06-m1-handoff.md) for exactly what is and isn't wired.
 
 **Deliberately rejected**, with reasons in [`docs/adr/`](docs/adr/): LangGraph
@@ -198,6 +219,44 @@ want a clean-slate run (this deletes local ARIE demo data). See
 
 ---
 
+## Hosted deployment
+
+Post-M1 P6. The same two processes as local Docker Compose — the API and the
+worker, one Dockerfile, the run command is the only difference — deployed as
+two independent Railway services against the *existing* Supabase Pro project,
+no new database provisioned:
+
+```mermaid
+flowchart LR
+    U["Browser"] --> V["Vercel<br/>Next.js server-side proxy"]
+    N["n8n Cloud"] --> R
+    V --> R["Railway — arie-api<br/>public HTTPS"]
+    R <--> S[("Supabase Postgres<br/>Session Pooler")]
+    W["Railway — arie-worker<br/>no public domain"] <--> S
+```
+
+- **API** — `https://adaptive-revenue-intelligence-engine-production.up.railway.app`
+  — `GET /healthz` reports three states (`ok`/`degraded`/`down`); public,
+  healthchecked, `PROVIDER_MODE=simulated`.
+- **Worker** — same repo and image, `python -m arie.jobs.worker` as the only
+  override, no public domain, no HTTP surface — consumes the same
+  `SKIP LOCKED` queue as local Docker.
+- **Database** — the same Supabase Pro project used throughout M1, via its
+  Session Pooler connection (the plain direct host is IPv6-only and
+  unreachable from Railway); migrations run through a Railway Pre-Deploy
+  Command (`python scripts/migrate.py`) on the API service only, never
+  racing the worker to apply the same migration.
+- **Verified live**, not just deployed: an autonomous decision, a human-review
+  escalation with the machine recommendation kept separate from the human
+  action and the final outcome, a shadow evaluation, and state surviving a
+  full worker redeploy — all exercised through the public URL above, not a
+  local stack.
+
+Full topology, environment variable names, migration strategy, and rollback
+path: [`docs/07-deployment.md`](docs/07-deployment.md#hosted-on-railway-p6).
+
+---
+
 ## n8n edge workflows
 
 Two thin workflows, importable as-is, plus a local helper. No business logic
@@ -246,11 +305,10 @@ and go.
 **Local n8n vs. a hosted n8n account.** This Docker service is a
 reproducible dev/demo environment shipped *with the repo* — the same
 philosophy as everything else here (offline-first, zero required
-credentials, runs the same way on anyone's machine). A separately hosted
-n8n (cloud or otherwise) is a *later*, deliberately deferred step: it only
-becomes relevant once ARIE has a publicly reachable deployed API for it to
-call, which nothing in M1 sets up yet. Nothing in this repo connects to or
-deploys against any hosted n8n account, and this local service is not meant
+credentials, runs the same way on anyone's machine). A separately hosted n8n
+account pointed at the [hosted deployment](#hosted-deployment)'s public API
+is the real integration target — configured entirely in that account's own
+UI, nothing this repo deploys or contains. This local service is not meant
 to be removed once one exists — the two serve different purposes
 (reproducible local demo vs. a real integration target).
 
