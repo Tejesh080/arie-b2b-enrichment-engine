@@ -8,6 +8,10 @@ an LLM for a score. This system instead treats enrichment as a sequential
 decision problem: *given what I already know, is the next API call worth its
 price?*
 
+**[Live demo](https://arie-web.vercel.app/)** — submit a lead, watch it move
+through evidence and a decision, hosted end to end (Vercel + Railway +
+Supabase; see [Hosted deployment](#hosted-deployment)).
+
 ---
 
 ## The result, up front
@@ -246,11 +250,23 @@ flowchart LR
   unreachable from Railway); migrations run through a Railway Pre-Deploy
   Command (`python scripts/migrate.py`) on the API service only, never
   racing the worker to apply the same migration.
+- **Frontend** — [`arie-web`](https://github.com/Tejesh080/arie-web) on
+  Vercel (**[live demo](https://arie-web.vercel.app/)**), talking to the API
+  above through its own server-side proxy — the browser never calls Railway
+  directly.
+- **n8n Cloud** — the same two edge workflows described in
+  [n8n edge workflows](#n8n-edge-workflows) below, pointed at the public API
+  above instead of a local Docker network. Verified live end to end: a
+  webhook-triggered ingestion reached an autonomous decision, and a separate
+  Outcome Sync call retrieved that decision and relayed it to a mock CRM
+  sink, entirely through public URLs.
 - **Verified live**, not just deployed: an autonomous decision, a human-review
   escalation with the machine recommendation kept separate from the human
-  action and the final outcome, a shadow evaluation, and state surviving a
-  full worker redeploy — all exercised through the public URL above, not a
-  local stack.
+  action and the final outcome, a shadow evaluation, 5 concurrent submissions
+  settling correctly with no duplicate processing, and state surviving a full
+  worker redeploy — all exercised through the public URL above, not a local
+  stack. Re-verified through the Vercel frontend and the n8n Cloud workflows
+  once each was connected to the hosted API.
 
 Full topology, environment variable names, migration strategy, and rollback
 path: [`docs/07-deployment.md`](docs/07-deployment.md#hosted-on-railway-p6).
@@ -305,12 +321,14 @@ and go.
 **Local n8n vs. a hosted n8n account.** This Docker service is a
 reproducible dev/demo environment shipped *with the repo* — the same
 philosophy as everything else here (offline-first, zero required
-credentials, runs the same way on anyone's machine). A separately hosted n8n
-account pointed at the [hosted deployment](#hosted-deployment)'s public API
-is the real integration target — configured entirely in that account's own
-UI, nothing this repo deploys or contains. This local service is not meant
-to be removed once one exists — the two serve different purposes
-(reproducible local demo vs. a real integration target).
+credentials, runs the same way on anyone's machine). The real integration
+target is a separately hosted n8n account pointed at the
+[hosted deployment](#hosted-deployment)'s public API — configured entirely
+in that account's own UI, nothing this repo deploys or contains, and now
+verified live: the same two workflows, same node graph, running against the
+public Railway URL instead of the Docker network names. This local service
+is not meant to be removed now that one exists — the two serve different
+purposes (reproducible local demo vs. the real integration target).
 
 ### Import and try it
 
