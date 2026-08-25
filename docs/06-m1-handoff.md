@@ -445,6 +445,14 @@ interface.
     the local Docker service once a hosted one exists — they serve different
     purposes (reproducible local demo vs. a real integration target) and both
     are wanted.
+
+    **Post-M1 update (P6):** that hosted account now exists and is verified
+    end to end against the public Railway API — see README.md's
+    [Hosted deployment](../README.md#hosted-deployment). The paragraph above
+    still describes the repo correctly (no hosted n8n config lives here; it
+    is configured in that account's own UI) and the local Docker service was
+    kept, as instructed. Only the "deliberately deferred" framing is
+    historical.
 12. ✅ **Production-readiness hardening (Step 13).** `/healthz` now reports
     three states, not one — `database` (a real round trip) and `schema_ready`
     (every file in `migrations/` has a `schema_migrations` row, checked by

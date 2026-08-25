@@ -10,7 +10,9 @@ price?*
 
 **[Live demo](https://arie-web.vercel.app/)** — submit a lead, watch it move
 through evidence and a decision, hosted end to end (Vercel + Railway +
-Supabase; see [Hosted deployment](#hosted-deployment)).
+Supabase + n8n Cloud; see [Hosted deployment](#hosted-deployment)).
+
+![The ARIE Decision Console overview: the decision schematic, and recently submitted leads with their live status and modeled cost](docs/assets/console-overview.png)
 
 ---
 
@@ -220,6 +222,33 @@ same request doesn't create duplicate work. The run is non-destructive by
 default; `.\scripts\demo.ps1 -Fresh` wipes local Docker volumes first if you
 want a clean-slate run (this deletes local ARIE demo data). See
 [`scripts/demo/`](scripts/demo/) for the Python runner the script wraps.
+
+---
+
+## Decision Console
+
+The frontend ([`arie-web`](https://github.com/Tejesh080/arie-web), Next.js on
+Vercel) exists to make one thing legible: **what ARIE decided, and every reason
+it stopped where it did.** Its hardest requirement is that a machine
+recommendation and a human's decision never collapse into a single "outcome"
+field — they are drawn as an ordered sequence, and both survive on the record
+permanently.
+
+| Autonomous decision | Human override |
+|---|---|
+| ![Receipt for an autonomously routed lead: confidence 83.2% against an 80.4% autonomy threshold, the stopping reason, and the full provider ledger](docs/assets/receipt-autonomous.png) | ![Receipt for a lead ARIE recommended rejecting that a reviewer approved: the machine recommendation, the human action, and the final outcome shown as three separate stages](docs/assets/receipt-human-override.png) |
+| Confidence cleared the autonomy threshold, so ARIE acted alone. The ledger separates evidence acquired fresh from evidence reused, and names any provider that cost something and returned nothing. | ARIE recommended `reject`; a reviewer approved. **Machine → human → final stays visible as three stages** — the recommendation is never overwritten by what happened next. |
+
+| Shadow evaluation | Mobile |
+|---|---|
+| ![Receipt for a shadow-mode lead, in violet, stating that no routing action was executed](docs/assets/receipt-shadow.png) | ![The console on a 390px viewport, with the lead cards and metrics stacked](docs/assets/mobile-overview.png) |
+| Shadow mode computes the full recommendation and takes **no authoritative action** — nothing routed, nothing rejected, no review opened. Given its own colour so it can never be misread as a real routing decision. | Dedicated mobile layout, not a squeezed desktop one: the receipt's tables become stacked cards rather than a horizontal scroll. |
+
+Every figure in these screenshots came from the live hosted backend. The
+processing, queue, persistence, receipts and human-review workflow are all
+real; provider acquisition is simulated (`PROVIDER_MODE=simulated`), so cost
+figures are **modeled cost at configured provider rates**, not billed vendor
+spend — see [Provider safety](docs/07-deployment.md).
 
 ---
 
@@ -437,7 +466,9 @@ transaction, that freezes exactly those facts at decision time. Full reasoning
 in [`docs/06-m1-handoff.md`](docs/06-m1-handoff.md#post-m1-p1--decision-receipt).
 
 **Deliberately deferred:** `estimated_cost_avoided_usd` (no defensible
-per-lead counterfactual baseline yet — actual spend is reported instead), a
+per-lead counterfactual baseline yet — the cost actually recorded for the run
+is reported instead, which under `PROVIDER_MODE=simulated` is modeled cost at
+configured provider rates, not billed spend), a
 per-provider "why was this one skipped" verdict (the production policy
 doesn't evaluate skipped providers individually; `providers.not_called` is an
 honest set difference against the catalogue, not a claim about reasoning that

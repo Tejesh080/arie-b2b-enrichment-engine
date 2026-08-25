@@ -277,9 +277,17 @@ testing — see [`08-portfolio.md`](08-portfolio.md) for what that limitation
 does and doesn't mean): 5 leads at the same identity, submitted
 simultaneously against the public API. All 5 reached `AUTO_ROUTED`, each
 with a consistent version history (no lost or duplicated transitions) and
-identical evidence — 2 fresh provider calls plus 5 cache hits each — proving
-`SKIP LOCKED` correctly serialized the concurrent claims and the evidence
-cache stayed consistent under concurrent access, not just sequential.
+identical evidence — 2 fresh provider calls plus 5 cache hits each.
+
+Stated precisely: five concurrent hosted submissions completed successfully
+without duplicate terminal processing, and the evidence cache stayed
+consistent across them. That is the observation. It is *consistent with*
+`SKIP LOCKED` serializing the claims correctly, but this run captured no
+direct contention evidence — no measured lock waits, no trace of two workers
+racing the same row — so it is not on its own proof that `SKIP LOCKED` is
+what produced the outcome. The mechanism is covered by the queue's own unit
+and integration tests; this check confirms the deployed system behaves
+correctly under a small amount of real concurrency.
 
 ---
 
@@ -290,12 +298,17 @@ cache stayed consistent under concurrent access, not just sequential.
   [ADR 0002](adr/0002-postgres-queue-not-temporal-or-redis.md) — and adding
   one wouldn't be a deployment decision, it would be an architecture change
   this project has already deliberately declined.
-- **A hosted n8n account.** The Docker `n8n` service is a reproducible local
-  dev/demo environment shipped with the repo; connecting `workflows/n8n/`'s
-  workflows to a hosted n8n instance is a deliberately deferred later step
-  that only makes sense once the API above has a public URL for it to call —
-  see README.md's own "Local n8n vs. a hosted n8n account" section. Nothing
-  here stands that up, and nothing here should.
+- **Standing up an n8n account from this repo.** n8n Cloud *is* connected and
+  verified against the public API above — the same two edge workflows, pointed
+  at the Railway URL instead of Docker network names, driven end to end:
+  webhook ingestion → `POST /leads` → Supabase queue → worker → terminal
+  decision → Decision Receipt → Outcome Sync → mock CRM sink, with the final
+  Outcome Sync returning `synced: true` and the sink echoing the payload back.
+  What this document does not cover is *provisioning* it: that lives entirely
+  in that account's own UI, is not deployed or contained by this repo, and has
+  no environment variables or rollback path here. The local Docker `n8n`
+  service remains, deliberately — a reproducible zero-credential demo is a
+  different thing from the real integration target, and both are wanted.
 - **`PROVIDER_MODE=live` by default.** A real adapter has existed since P5
   (`arie.providers.live_abstract`, Abstract API's Company Enrichment) and is
   production-capable — the "no real adapter exists yet (ADR 0003)" framing

@@ -267,12 +267,18 @@ actually win — none tested here.
 - One real third-party provider integration, live-verified (not simulated)
   against Abstract API, with a documented real bug found and fixed during
   that verification.
-- A hosted deployment (Railway + Supabase + Vercel) with a genuinely
-  exercised end-to-end proof — autonomous decision, human-review escalation
-  with the three-way distinction preserved, shadow evaluation, state
-  surviving a production redeploy, and 5 concurrent submissions against the
-  same identity all settling correctly (no duplicate processing, correct
-  cache reuse under concurrency) — not just "it deploys."
+- A hosted deployment (Railway + Supabase + Vercel + n8n Cloud) with a
+  genuinely exercised end-to-end proof — autonomous decision, human-review
+  escalation with the three-way distinction preserved, shadow evaluation,
+  state surviving a production redeploy, and five concurrent submissions
+  against the same identity all completing successfully without duplicate
+  terminal processing — not just "it deploys."
+- A full orchestration chain proven across four hosted services: n8n Cloud
+  ingestion → Railway `POST /leads` → Supabase queue → Railway worker →
+  terminal decision → Decision Receipt → n8n Outcome Sync → mock CRM sink,
+  with Outcome Sync returning `synced: true`. The processing, queue,
+  persistence, receipts, human-review workflow and orchestration are all
+  real; only provider acquisition is simulated (see "Claims to avoid").
 
 **Claims to avoid**
 
