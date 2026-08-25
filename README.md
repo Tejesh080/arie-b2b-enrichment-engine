@@ -6,7 +6,7 @@ Most enrichment pipelines call every data provider for every lead, then ask a
 model to score the result. ARIE asks a different question first: *given what I
 already know, is the next API call worth paying for?*
 
-**[Live demo](https://arie-web.vercel.app/)** · [Frontend repo](https://github.com/Tejesh080/arie-web) · [Docs](#documentation)
+**[Live demo](https://arie-web.vercel.app/)** · [Frontend repo](https://github.com/Tejesh080/arie-decision-console) · [Docs](#documentation)
 
 ![The ARIE Decision Console overview: the decision schematic, and recently submitted leads with their live status and modeled cost](docs/assets/console-overview.png)
 
