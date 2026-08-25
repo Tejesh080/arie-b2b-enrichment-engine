@@ -30,7 +30,7 @@ jobs:
 
   integration:
     # A disposable Postgres service container, born and destroyed with this
-    # job — never the shared Supabase database `docs/06-m1-handoff.md`'s
+    # job — never the shared Supabase database `docs/architecture.md`'s
     # integration tests describe running against for local dev. That
     # database holds real rows and is opt-in for a reason; nothing here
     # touches it. This is what actually exercises arie.evidence, arie.identity,

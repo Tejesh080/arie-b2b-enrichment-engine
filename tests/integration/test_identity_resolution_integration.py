@@ -11,7 +11,7 @@ conftest.py). Four concerns, each load-bearing for a different reason:
   already-known company reads the first contact's evidence for free, via
   arie.evidence.store.PostgresEvidenceStore keyed on the resolved company_id.
 - **Ambiguous-identity measurement** — not a target to hit, a number to
-  report. Per docs/06-m1-handoff.md, this is what would turn "add Splink"
+  report. Per docs/architecture.md, this is what would turn "add Splink"
   from taste into a data-driven decision; it is deliberately not gated on a
   threshold here.
 """

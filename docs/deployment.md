@@ -89,7 +89,7 @@ The two settings both processes actually require:
 
 - `DATABASE_URL` — the **pooled** connection string (Supabase's Transaction
   Pooler, port 6543 once anything needs concurrent-connection headroom beyond
-  the Session Pooler; see `docs/06-m1-handoff.md`'s Environment section for
+  the Session Pooler; see `docs/architecture.md`'s Environment section for
   the IPv6-only direct-host caveat that makes the Session Pooler double as
   both today).
 - `PROVIDER_MODE` — `simulated` is the only value with an implemented backend
@@ -198,7 +198,7 @@ command differs, exactly as `docker-compose.yml` already models locally.
   `DATABASE_DIRECT_URL`; nothing else does. On this project, that variable's
   value is the **same Session Pooler string** as `DATABASE_URL` below, not
   Supabase's plain `db.<ref>.supabase.co` host — that host is IPv6-only and
-  unreachable from Railway, the exact caveat `docs/06-m1-handoff.md` already
+  unreachable from Railway, the exact caveat `docs/architecture.md` already
   documents. This is safe, not a workaround: `scripts/migrate.py` opens one
   plain `psycopg.connect()` and runs each migration in its own transaction on
   that single session, which is exactly what the Session Pooler's session-mode
@@ -220,7 +220,7 @@ command differs, exactly as `docker-compose.yml` already models locally.
 **Database.** Both services use the existing Supabase Pro project's
 **Session Pooler** connection string for `DATABASE_URL` — the same one local
 dev already uses, per the IPv6-only-direct-host caveat in
-`docs/06-m1-handoff.md`. Set once as a Railway **Shared Variable** and
+`docs/architecture.md`. Set once as a Railway **Shared Variable** and
 referenced by both services rather than pasted twice. The pooler choice
 didn't change for Railway: nothing surfaced a reason the Transaction Pooler
 is needed instead, and switching would first need `prepare_threshold=None`
@@ -239,7 +239,7 @@ never in this repo.**
 | `LEAD_BUDGET_USD_CAP`, `TARGET_AUTONOMOUS_ERROR_RATE`, `LATENCY_PENALTY_USD_PER_SEC`, `WORKER_POLL_INTERVAL_SEC`, `WORKER_MAX_ATTEMPTS`, `WORKER_LEASE_SECONDS` | `arie-worker`, optional | policy/runtime defaults apply if unset |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME` | shared, optional | tracing stays off if unset |
 
-`DEEPSEEK_API_KEY` and the Firecrawl/Apollo/Hunter/Langfuse/Anthropic/OpenAI/
+`DEEPSEEK_API_KEY` and the Firecrawl/Apollo/Hunter/Langfuse/OpenAI/
 Supabase-client placeholders in `.env.example` are not read by any path the
 API or worker actually run — do not configure them on Railway.
 
@@ -273,7 +273,7 @@ afterward, were unchanged — proof the state lives in Supabase, not the
 worker container.
 
 **One small concurrency check**, deliberately bounded (this is not load
-testing — see [`08-portfolio.md`](08-portfolio.md) for what that limitation
+testing — see [`portfolio.md`](portfolio.md) for what that limitation
 does and doesn't mean): 5 leads at the same identity, submitted
 simultaneously against the public API. All 5 reached `AUTO_ROUTED`, each
 with a consistent version history (no lost or duplicated transitions) and

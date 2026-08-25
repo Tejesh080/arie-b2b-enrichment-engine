@@ -146,12 +146,12 @@ def test_spread_of_one_value_has_no_deviation() -> None:
 
 
 def test_default_seeds_matches_the_documented_reproduction_command() -> None:
-    """Pins the gap found reconciling docs/05-results.md against a fresh run.
+    """Pins the gap found reconciling docs/benchmark.md against a fresh run.
 
     `DEFAULT_SEEDS` was seven seeds `(42, ..., 48)` while every "mean across 10
-    seeds" claim in README/05-results.md was actually produced by
+    seeds" claim in README/benchmark.md was actually produced by
     `--seeds 42 43 44 45 46 47 48 49 50 51` — the reproduction command
-    documented at the top of 05-results.md, which this test also pins so the
+    documented at the top of benchmark.md, which this test also pins so the
     two cannot drift apart silently again. Running `python -m bench.multi_seed`
     with no arguments (as README's Quick Start tells a reader to) must measure
     the same seeds the published numbers claim.

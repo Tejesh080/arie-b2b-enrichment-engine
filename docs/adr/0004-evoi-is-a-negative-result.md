@@ -40,7 +40,7 @@ agreement, on 9 of 10 seeds. It is also more expensive at every human-review
 price tested. That 16.1% and "9 of 10 seeds" are measured against
 `best_adaptive` — the best-of-seven `value_scale` variants per seed, the more
 generous comparison — not against the single un-scaled row above; see
-[`05-results.md`](../05-results.md#reconciling-this-page-against-a-fresh-run)
+[`benchmark.md`](../benchmark.md#reconciling-this-page-against-a-fresh-run)
 for why the two are not the same cost figure.
 
 ## Why it failed

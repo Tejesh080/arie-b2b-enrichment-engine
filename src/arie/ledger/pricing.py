@@ -17,7 +17,7 @@ applies, every cost view is wrong by exactly that factor and nothing in the
 system will notice. Step 10, which wires the first real model call, is where
 these stop being assumptions — reconcile the computed cost against whatever the
 API's own usage reporting returns and correct the table (see
-``docs/ASSUMPTIONS.md``).
+``docs/benchmark.md``).
 
 Decimal throughout, not float. This is money that gets summed across thousands
 of rows into ``v_lead_cost``; binary floating point accumulates error in exactly

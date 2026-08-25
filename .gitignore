@@ -60,5 +60,8 @@ Thumbs.db
 supabase/.branches/
 supabase/.temp/
 
-# Claude Code local settings (keep .mcp.json — it's shared project config)
-.claude/settings.local.json
+# AI coding-assistant local config. .mcp.json used to be tracked as "shared
+# project config"; it is tooling, not project setup, and it carried a Supabase
+# project ref in its URL, so it is ignored now.
+.claude/
+.mcp.json

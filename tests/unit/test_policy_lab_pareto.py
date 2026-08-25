@@ -58,7 +58,7 @@ def test_frontier_keeps_increasing_cost_increasing_agreement_points() -> None:
 
 
 def test_frontier_reproduces_the_production_vs_evoi_finding() -> None:
-    """The exact shape docs/05-results.md reports: calibrated_bounds is
+    """The exact shape docs/benchmark.md reports: calibrated_bounds is
     cheaper AND better-agreement than adaptive_voi_x1, so it dominates
     outright; full_enrichment and waterfall_expensive are each other's
     cheaper-but-worse / pricier-but-better trade-off and stay on the frontier."""

@@ -5,7 +5,7 @@ Entry point for ``make db-migrate``. Uses the *direct* connection
 pooler in transaction mode (pgbouncer, which is what Supabase's pooled
 connection is) does not guarantee the session-level semantics DDL wants, and
 migrations are exactly the place that distinction matters — see
-``docs/06-m1-handoff.md``.
+``docs/architecture.md``.
 
 Every migration in this repo is already written to be idempotent
 (``CREATE TABLE IF NOT EXISTS``, ``CREATE OR REPLACE VIEW``) — a deliberate

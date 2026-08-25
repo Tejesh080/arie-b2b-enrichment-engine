@@ -2,7 +2,7 @@
 waterfall baseline comparison. Fixture numbers are chosen so
 mean-of-per-seed-ratios and ratio-of-means genuinely differ, pinning that
 these are computed as two distinct statistics rather than accidentally the
-same expression twice (see docs/05-results.md's own 41.6% vs. 41.4% note)."""
+same expression twice (see docs/benchmark.md's own 41.6% vs. 41.4% note)."""
 
 from __future__ import annotations
 
@@ -122,7 +122,7 @@ def test_baseline_comparison_calls_and_autonomy_diffs() -> None:
 
 def test_baseline_comparison_reproduces_the_published_headline_figures() -> None:
     """The real 10-seed per-seed values behind bench/out/multi_seed.json's
-    headline row (seeds 42-51; see docs/05-results.md: "41.6% cheaper... sd
+    headline row (seeds 42-51; see docs/benchmark.md: "41.6% cheaper... sd
     11.0pp", "2.33pp lower... sd 2.07pp"). Uses the actual per-seed cost and
     agreement values, not just their means, since the headline "41.6%" is
     itself a mean of ten per-seed ratios -- an aggregate-only fixture cannot

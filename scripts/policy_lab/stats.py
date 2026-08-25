@@ -4,7 +4,7 @@ raw `per_seed[].policies[]` rows.
 Deliberately does not read the artifact's precomputed `stability` array for
 `adaptive_voi_x1`: those rows summarize `best_adaptive` (the best-of-seven
 `value_scale` variant per seed), not the single un-scaled `adaptive_voi_x1`
-policy this report is about (see docs/05-results.md's own note on the
+policy this report is about (see docs/benchmark.md's own note on the
 distinction). Recomputing from the raw per-seed rows, with the same method
 (`statistics.fmean`/`stdev`) `bench/multi_seed.py` uses, keeps this module
 self-contained and independently verifiable against the artifact.

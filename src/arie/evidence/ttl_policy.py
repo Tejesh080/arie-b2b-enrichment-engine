@@ -8,7 +8,7 @@ which vendor happened to answer. So TTL is keyed by ``field_name``, matching
 ``arie.scoring.rules.SCORED_FIELDS``.
 
 Values are assumptions, not measurements — following the project's rule
-(docs/ASSUMPTIONS.md) that no parameter enters production without a stated
+(docs/benchmark.md) that no parameter enters production without a stated
 justification. Nothing here has been fitted to real provider drift; revisit once
 a real adapter's staleness is observable.
 """

@@ -34,7 +34,7 @@ def test_unknown_stop_reason_falls_back_instead_of_raising() -> None:
 
 
 def test_settled_explanation_does_not_overclaim_certainty() -> None:
-    """`docs/06-m1-handoff.md`'s "five things most likely to be got wrong" #1:
+    """`docs/architecture.md`'s "five things most likely to be got wrong" #1:
     is_settled means "nothing left worth buying", not "certainly correct" — the
     explanation must say so rather than implying the decision is proven right."""
     settled = _STOP_REASON_EXPLANATIONS["decision_settled"].lower()

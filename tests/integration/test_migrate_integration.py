@@ -1,7 +1,7 @@
 """Migrations applied against a real Postgres database.
 
 The schema has "never been run against a live database" per
-docs/06-m1-handoff.md — this is what closes that gap. Requires
+docs/architecture.md — this is what closes that gap. Requires
 DATABASE_URL / DATABASE_DIRECT_URL; skipped otherwise (see conftest.py).
 """
 

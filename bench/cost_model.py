@@ -22,7 +22,7 @@ from typing import Any
 from arie.policy.runner import PolicySummary
 
 # Indicative review prices, in dollars per escalated lead. Assumptions, not
-# measurements — recorded in docs/ASSUMPTIONS.md.
+# measurements — recorded in docs/benchmark.md.
 #
 #   $0.00  the implicit assumption of an API-only accounting
 #   $0.25  ~20 seconds of a $45/hr analyst

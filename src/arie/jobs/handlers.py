@@ -3,7 +3,7 @@
 This module composes pieces that all already existed — ``CalibratedBoundsPolicy``,
 the simulated provider registry, ``PostgresEvidenceStore``, ``PostgresCostLedger``,
 the state graph, and ``arie.approval.workflow.request_review`` — into the one
-handler shape ``docs/06-m1-handoff.md`` describes: *"a compute_score handler
+handler shape ``docs/architecture.md`` describes: *"a compute_score handler
 receives a JobContext, reads the lead's known facts from PostgresEvidenceStore,
 runs the policy, records what it bought in PostgresCostLedger, and returns the
 lead's new status."* Nothing here is a new architecture; it is the composition
@@ -725,7 +725,7 @@ def _build_live_handlers(
     `ScoringResult.signals` (completeness, conflict, boundary distance, ...),
     which are well-defined for any evidence bundle — but applying a model
     fitted on synthetic corpus signals to real evidence is an unvalidated
-    assumption, stated here and in `docs/06-m1-handoff.md`'s P5 section, not
+    assumption, stated here and in `docs/architecture.md`'s P5 section, not
     quietly treated as equivalent to the simulated path's own guarantee.
     """
     provider = (

@@ -31,7 +31,7 @@ def _regenerate_hint() -> str:
     return (
         "Run:\n  python -m bench.multi_seed\n"
         "(~15 minutes, offline, no API keys — reproduces the numbers in "
-        "docs/05-results.md) or pass -Regenerate to scripts\\policy-lab.ps1 "
+        "docs/benchmark.md) or pass -Regenerate to scripts\\policy-lab.ps1 "
         "to do this automatically."
     )
 

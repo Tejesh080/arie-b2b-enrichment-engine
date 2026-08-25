@@ -4,7 +4,7 @@ Mirrors `test_api_ingestion_integration.py`'s posture: exercise the actual HTTP
 surface against the actual database, and treat the rollback / conflict tests
 as the ones that matter most. `arie.approval.workflow.request_review` is not
 called by anything in production yet (no `finalize_decision` handler exists —
-see docs/06-m1-handoff.md), so every test here opens its own pending review
+see docs/architecture.md), so every test here opens its own pending review
 directly, the same way `arie.statemachine`'s own integration tests build a
 bare lead row rather than going through the (not yet wired) worker.
 

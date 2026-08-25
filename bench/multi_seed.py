@@ -25,12 +25,12 @@ from arie.policy.runner import PolicySummary
 from bench.cost_model import HUMAN_REVIEW_PRICES, break_even_human_cost, total_cost
 from bench.harness import BenchmarkRun, run_once
 
-# Ten seeds, matching every "mean across 10 seeds" claim in README/05-results.md.
+# Ten seeds, matching every "mean across 10 seeds" claim in README/benchmark.md.
 #
 # This was `(42, ..., 48)` — seven seeds — from the day the sweep was first
 # built until this comment was added. Every published number was actually
 # produced by `--seeds 42 43 44 45 46 47 48 49 50 51`, an explicit CLI override
-# recorded as the "Reproduce with" command at the top of docs/05-results.md —
+# recorded as the "Reproduce with" command at the top of docs/benchmark.md —
 # but the tracked default never matched it, so running this module with no
 # arguments (as README's own Quick Start told a reader to) silently measured a
 # different, smaller sweep than the one the docs describe. Extended to those

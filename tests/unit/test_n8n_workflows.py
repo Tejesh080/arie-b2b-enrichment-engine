@@ -2,7 +2,7 @@
 
 Before this file, nothing read these JSON files at all: "hand-authored
 against n8n's current node schemas... verified for real" (see
-`docs/06-m1-handoff.md`'s Step 12 section) meant a one-time manual import,
+`docs/architecture.md`'s Step 12 section) meant a one-time manual import,
 not anything CI would notice regress. Two things worth catching automatically
 from here on:
 

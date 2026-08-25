@@ -2,16 +2,16 @@
 
 **Why this is not `arie.evalgen`.** M0's dataset is deliberately structured-only
 — `recent_trigger_event` is a five-value closed enum, `buying_intent` a plain
-float; there is no free text anywhere in it, on purpose (`docs/03-mvp.md`: "No
+float; there is no free text anywhere in it, on purpose (`docs/benchmark.md`: "No
 LLM in M0... introducing nondeterminism into the experiment that establishes
 the baseline result is a methodological error"). This module is *M1's own*
 small evaluation for *this one narrow task*, and it stays structurally
 separate from `arie.evalgen`, `bench/multi_seed.py`, and `data/eval/` — it
 imports nothing from them and nothing here can perturb the M0 benchmark's
-provenance. See `docs/06-m1-handoff.md`'s Step 10 section.
+provenance. See `docs/architecture.md`'s Step 10 section.
 
 **Twenty-six samples is a smoke-test-scale corpus, not a statistically powered
-one** — stated plainly, the same way `05-results.md` states "ten seeds is a
+one** — stated plainly, the same way `benchmark.md` states "ten seeds is a
 small sample" for the M0 benchmark. A delta this small a sample produces is a
 directional signal, not a precise estimate; treat a report of ±1 sample's
 worth of accuracy as noise.
@@ -33,7 +33,7 @@ from arie.llm.schema import ExpectedLabel, ExtractedSignal, LabeledSample
 
 # Fully synthetic: fictional companies, fictional people, no sanitised real
 # leads — the same reason `arie.evalgen.generator` uses invented identities
-# (docs/04-eval-dataset.md: "so an LLM cannot recognise a real company from
+# (docs/benchmark.md: "so an LLM cannot recognise a real company from
 # pretraining"). Phrasing is deliberately mixed: some samples use exactly the
 # phrases `arie.llm.baseline` matches on (realistic — those phrases are common
 # precisely because they're common), and roughly half deliberately do not, so

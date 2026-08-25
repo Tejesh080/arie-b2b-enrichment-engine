@@ -52,5 +52,6 @@ Thumbs.db
 .vscode/
 *.swp
 
-# Claude Code local settings
+# Assistant/editor local settings
 .claude/
+.mcp.json

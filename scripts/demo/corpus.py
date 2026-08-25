@@ -21,7 +21,7 @@ CANONICAL_SEED = 42
 `tests/conftest.py`'s `CANONICAL_SEED` use — the frozen corpus everything else
 in this repo demonstrates against."""
 
-# Known-good identities from prior manual verification (docs/06-m1-handoff.md,
+# Known-good identities from prior manual verification (docs/architecture.md,
 # README's n8n walkthrough). Tried first because they're the identities this
 # repo's own docs already name; if the corpus or policy ever changes under
 # them, `select_demo_corpus` falls back to scanning rather than asserting a

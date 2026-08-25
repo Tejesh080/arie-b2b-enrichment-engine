@@ -20,7 +20,7 @@ from arie.providers.catalog import ALL_PROVIDERS, CHEAP_TIER
 from arie.scoring.merge import merge_observations, merged_cost
 from arie.scoring.rules import decide, score_facts
 
-# Pre-registered in docs/04-eval-dataset.md before any result was produced.
+# Pre-registered in docs/benchmark.md before any result was produced.
 MIN_F1_GAP = 0.15
 MIN_FULL_INFO_F1 = 0.70
 MAX_FULL_INFO_F1 = 0.99

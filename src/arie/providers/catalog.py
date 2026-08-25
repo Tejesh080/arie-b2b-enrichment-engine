@@ -13,7 +13,7 @@ every strategy sees *identical* provider behaviour. Sampling at call time would
 mean the adaptive policy and the waterfall baseline faced different luck, and
 any measured difference between them would be partly noise.
 
-Every parameter here is an assumption. See ``docs/ASSUMPTIONS.md``.
+Every parameter here is an assumption. See ``docs/benchmark.md``.
 """
 
 from __future__ import annotations

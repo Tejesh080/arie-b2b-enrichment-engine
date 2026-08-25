@@ -8,7 +8,7 @@ company/domain firmographic lookup — and normalizes at most two fields,
 simulated ``firmographics_basic``/``firmographics_premium`` already model. It
 never registers a second provider, never scrapes, never automates a browser, and
 never retries beyond the one bounded HTTP attempt below — see
-``docs/06-m1-handoff.md``'s P5 section for the full "will not do" list.
+``docs/architecture.md``'s P5 section for the full "will not do" list.
 
 **Why this provider.** Simple API-key-in-query-string auth, a free tier (100
 requests/month, no card) for failure-path testing, a deterministic JSON
@@ -64,7 +64,7 @@ without a new column."""
 # Declared source-reliability confidence for a SUCCESS result. An assumption,
 # exactly in the spirit of arie.providers.catalog's ProviderSpec fields
 # (categorical_error, numeric_noise) — Abstract does not publish an accuracy
-# figure, and this project's own rule (docs/ASSUMPTIONS.md) is that no
+# figure, and this project's own rule (docs/benchmark.md) is that no
 # parameter enters production unstated. Revisit once real-world agreement is
 # measurable — the same "turn an assumption into a measurement" step ADR 0003's
 # "When to revisit" section already names for the first real adapter wired.

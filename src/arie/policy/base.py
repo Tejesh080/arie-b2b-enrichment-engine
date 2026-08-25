@@ -27,7 +27,7 @@ from arie.scoring.engine import ScoringResult
 # Value of getting one decision right, by deal tier. Only the *ratios* matter:
 # these scale the benefit side of the EVoI comparison against provider prices.
 #
-# The absolute levels are assumptions (see docs/ASSUMPTIONS.md). Note they sit
+# The absolute levels are assumptions (see docs/benchmark.md). Note they sit
 # far above provider costs, which is realistic and is precisely why teams
 # over-enrich by default — almost any call looks justified if you assume it
 # might change the answer. The policy's job is to identify when it cannot.

@@ -319,7 +319,7 @@ def render_html(run: DemoRun) -> str:
     <code>POST /leads</code>, <code>GET /leads/{{id}}/receipt</code>,
     <code>GET /reviews/{{id}}</code>, <code>POST /reviews/{{id}}/decision</code>.
     No Postgres queries, no internal state. Cost-quality benchmark results are
-    reported separately in <code>docs/05-results.md</code>.
+    reported separately in <code>docs/benchmark.md</code>.
   </footer>
 </div>
 </body>

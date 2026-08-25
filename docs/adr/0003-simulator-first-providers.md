@@ -44,7 +44,7 @@ per-lead obscurity draw.
 **Negative — stated plainly**
 
 - **Simulator parameters are assumptions, not measurements.** Every one is
-  documented with its justification in [`../ASSUMPTIONS.md`](../ASSUMPTIONS.md).
+  documented with its justification in [`../benchmark.md`](../benchmark.md#assumptions).
   Results are conditional on those assumptions being roughly right, and the
   README says so.
 - A live demo needs at least one real adapter wired (planned, deferred).

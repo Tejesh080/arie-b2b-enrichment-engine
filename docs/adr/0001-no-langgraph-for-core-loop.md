@@ -5,7 +5,7 @@
 ## Context
 
 Nearly every comparable open-source project in this space (see
-[`../01-research.md`](../01-research.md)) builds its lead pipeline on LangGraph.
+the research notes) builds its lead pipeline on LangGraph.
 Using it would be the path of least resistance and the most familiar-looking
 choice to a casual reader.
 

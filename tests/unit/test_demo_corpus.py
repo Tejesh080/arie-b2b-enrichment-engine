@@ -38,7 +38,7 @@ def test_the_two_demo_leads_are_different_people(leads: list[EvalLead]) -> None:
 
 
 def test_documented_demo_identities_are_still_current(leads: list[EvalLead]) -> None:
-    """Pins the exact identities docs/06-m1-handoff.md and README.md name --
+    """Pins the exact identities docs/architecture.md and README.md name --
     if this ever fails, the corpus or the policy changed and the docs (and
     this test) need updating, not silently falling back."""
     corpus = select_demo_corpus(leads=leads)

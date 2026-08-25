@@ -81,7 +81,7 @@ def counterfactual_regret(reference: PolicySummary, policy: PolicySummary) -> Co
 
 # --- pre-registered M0 criteria ---------------------------------------------
 #
-# Fixed in docs/03-mvp.md before any result existed. Evaluated mechanically so
+# Fixed in docs/benchmark.md before any result existed. Evaluated mechanically so
 # the verdict cannot drift toward whatever the numbers happened to show.
 
 AGREEMENT_TOLERANCE_PP = 1.0

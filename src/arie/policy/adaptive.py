@@ -35,7 +35,7 @@ into a uniform interval would make the single provider that reveals it look
 enormously valuable for every lead.
 
 The uniform prior over reachable scores is the weakest assumption here and is
-recorded in docs/ASSUMPTIONS.md. It is deliberately not fitted: a learned flip
+recorded in docs/benchmark.md. It is deliberately not fitted: a learned flip
 model would be one more thing to calibrate, and the point of this layer is that
 the acquisition decision stays inspectable.
 """

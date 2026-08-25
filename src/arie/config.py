@@ -124,7 +124,7 @@ class ObservabilityConfig:
 class LLMConfig:
     """DeepSeek client configuration for ``arie.llm`` signal extraction.
 
-    See ``docs/06-m1-handoff.md``'s Step 10 section for why this exists at all:
+    See ``docs/architecture.md``'s Step 10 section for why this exists at all:
     one narrow task (buying-signal extraction from free text), never a general
     "call an LLM" facility.
     """
@@ -186,7 +186,7 @@ class LiveProviderConfig:
     """An ESTIMATED unit cost, not a per-call price Abstract's response reports.
 
     Derived from the Standard plan's list price at time of writing ($99/month
-    for 60,000 requests/month => ~$0.00165/request) — see ``docs/06-m1-handoff.md``'s
+    for 60,000 requests/month => ~$0.00165/request) — see ``docs/architecture.md``'s
     P5 section. Configurable because a list price changes; never presented as
     an exact, provider-reported cost the way ``arie.ledger.store`` treats a
     vendor's own billed figure."""

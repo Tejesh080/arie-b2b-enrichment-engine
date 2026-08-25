@@ -8,7 +8,7 @@ module docstring exists to avoid.
 
 `nadia.delacroix@lumen500.com` (autonomous, AUTO_ROUTED) and
 `nadia.haddad@cobalt500.com` (escalates to AWAITING_HUMAN) are the same
-seed-42 corpus identities documented in docs/06-m1-handoff.md and README.md's
+seed-42 corpus identities documented in docs/architecture.md and README.md's
 own n8n walkthrough -- real, stable people in the frozen dataset, not
 fixtures invented for this suite.
 """

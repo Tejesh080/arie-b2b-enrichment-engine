@@ -2,7 +2,7 @@
 
 Every scored field must have a deliberate TTL — an unlisted field silently
 falling back to "cache forever" would be the kind of bug this project's
-culture explicitly guards against (see docs/ASSUMPTIONS.md).
+culture explicitly guards against (see docs/benchmark.md).
 """
 
 from __future__ import annotations

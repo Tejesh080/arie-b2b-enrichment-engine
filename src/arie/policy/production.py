@@ -10,7 +10,7 @@ on nine of ten, at equal or better decision agreement, and cheapest on total
 cost at every human-review price tested. So the ablation is the product and the
 sophisticated version is the documented negative result.
 
-Full numbers and methodology: docs/05-results.md.
+Full numbers and methodology: docs/benchmark.md.
 Why EVoI did not pay off: docs/adr/0004-evoi-is-a-negative-result.md.
 
 The policy itself is deliberately simple:

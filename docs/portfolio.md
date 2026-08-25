@@ -2,8 +2,8 @@
 
 Interview-ready framing for this project — what to say, in how much time,
 and what not to claim. Every number here is pulled from
-[`README.md`](../README.md), [`05-results.md`](05-results.md), and
-[`07-deployment.md`](07-deployment.md), not restated from memory; if any of
+[`README.md`](../README.md), [`benchmark.md`](benchmark.md#results), and
+[`deployment.md`](deployment.md), not restated from memory; if any of
 those change, this page is stale until it's updated to match.
 
 ---

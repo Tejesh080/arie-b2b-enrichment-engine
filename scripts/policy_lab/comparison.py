@@ -1,7 +1,7 @@
 """Calibrated Bounds vs. the tuned waterfall — the one comparison the report
 treats as a focused, named claim rather than a table cell.
 
-Reports both the mean-of-per-seed-ratios cost saving (what `docs/05-results.md`
+Reports both the mean-of-per-seed-ratios cost saving (what `docs/benchmark.md`
 calls "41.6% cheaper... sd 11.0pp") and the ratio-of-means reading (what that
 same doc calls "41.4%... in aggregate dollar terms"), because they are
 genuinely different statistics computed from the same data — this repo's own

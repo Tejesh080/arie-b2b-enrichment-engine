@@ -6,7 +6,7 @@ that lives for one benchmark pass. This is the persistent equivalent, writing to
 deliberately — most visibly that **a cache hit is recorded as a zero-cost call
 rather than not recorded at all**. Dropping cache hits would make cache hit rate
 unmeasurable, and that metric is the entire justification for the company-level
-evidence store (see ``docs/06-m1-handoff.md``, "the five things most likely to be
+evidence store (see ``docs/architecture.md``, "the five things most likely to be
 got wrong").
 
 **Ledger writes commit in their own transaction, on purpose.**
