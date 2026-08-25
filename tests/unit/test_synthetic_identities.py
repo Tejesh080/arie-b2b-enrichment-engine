@@ -15,6 +15,7 @@ import collections
 
 import pytest
 
+from arie.core.types import ProviderResult
 from arie.evalgen.schema import EvalLead
 from arie.jobs.handlers import SimulatedEnrichmentRuntime, build_runtime
 from arie.policy.base import EvidenceCache, RunContext
@@ -30,16 +31,16 @@ def runtime(leads: list[EvalLead]) -> SimulatedEnrichmentRuntime:
 
 class _MemoryCache(EvidenceCache):
     def __init__(self) -> None:
-        self._items: dict[tuple[str, str], object] = {}
+        self._items: dict[tuple[str, str], ProviderResult] = {}
 
-    def get(self, provider: str, key: str):  # type: ignore[override]
+    def get(self, provider: str, key: str) -> ProviderResult | None:
         return self._items.get((provider, key))
 
-    def put(self, provider: str, key: str, result) -> None:  # type: ignore[override]
+    def put(self, provider: str, key: str, result: ProviderResult) -> None:
         self._items[(provider, key)] = result
 
 
-def _synth(email: str, domain: str, **kw) -> EvalLead:
+def _synth(email: str, domain: str, **kw: str) -> EvalLead:
     return synthesize_corpus_lead(canonical_email=email, canonical_domain=domain, **kw)
 
 
@@ -113,8 +114,8 @@ def test_the_policy_reaches_every_outcome_over_a_sample_of_identities(
     """The demo must be able to show an autonomous route, a reject, and a
     human escalation from leads a visitor typed in — otherwise arbitrary
     submissions are a single-outcome dead end and the demo teaches nothing."""
-    decisions = collections.Counter()
-    autonomy = collections.Counter()
+    decisions: collections.Counter[str] = collections.Counter()
+    autonomy: collections.Counter[bool] = collections.Counter()
 
     words = [
         "alder",

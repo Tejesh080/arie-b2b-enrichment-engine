@@ -626,10 +626,18 @@ def _build_simulated_handlers(
                 # reach this branch, so the frozen replay is untouched; see
                 # arie.providers.synthetic for the determinism contract that
                 # keeps the durable evidence cache coherent across contacts.
+                domain = identity.canonical_domain or domain_from_email(identity.canonical_email)
+                if domain is None:
+                    # Unreachable for ingested leads (a canonical email always
+                    # carries a domain), but if it ever happens, fail into the
+                    # ordinary dead-letter path — which now marks the lead —
+                    # rather than synthesizing from nothing.
+                    raise UnknownCorpusIdentityError(
+                        f"lead {job.lead_id} has no company domain to synthesize from"
+                    ) from None
                 corpus_lead = synthesize_corpus_lead(
                     canonical_email=identity.canonical_email,
-                    canonical_domain=identity.canonical_domain
-                    or domain_from_email(identity.canonical_email),
+                    canonical_domain=domain,
                     full_name=identity.full_name,
                     company_name=identity.company_name,
                 )
