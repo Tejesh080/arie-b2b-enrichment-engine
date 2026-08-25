@@ -69,8 +69,9 @@ resolve one of three ways:
 | **Human review** | Confidence falls short. ARIE stops, explains why, and waits for a person to approve, reject, or override. |
 | **Shadow evaluation** | ARIE computes the full recommendation and takes no action at all — useful for running it alongside an existing workflow to see what it *would* have done. |
 
-The form offers two prepared identities that reliably produce the first two
-outcomes, plus a shadow-mode toggle.
+The form offers one-click examples that reliably produce each outcome, plus a
+shadow-mode toggle — and accepts any identity you type, which gets its own
+deterministic simulated evidence.
 
 ---
 
@@ -154,9 +155,14 @@ Method, dataset design and every parameter assumption: [benchmark.md](docs/bench
 
 Worth being precise about, because they're easy to conflate.
 
-**The hosted demo runs in simulated mode.** It replays a frozen evaluation
-corpus. No vendor is called and no money is spent, so the cost figures you see
-are modelled cost at configured provider rates — not billed spend. Everything
+**The hosted demo runs in simulated mode.** Known example identities replay a
+frozen evaluation corpus; any other identity gets deterministic synthetic
+evidence generated from the same provider catalogue and noise model, seeded by
+the lead's own email and domain — so the same lead always resolves the same
+way, and a second contact at the same company reuses its cached company
+evidence. No vendor is called and no money is spent either way, so the cost
+figures you see are modelled cost at configured provider rates — not billed
+spend. Everything
 around it is real: real Postgres queue, real worker, real persistence, real
 receipts, real human-review workflow, real n8n orchestration.
 

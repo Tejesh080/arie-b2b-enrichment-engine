@@ -22,6 +22,8 @@ error anywhere inside ingestion leaves no partial row behind.
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -59,6 +61,8 @@ from arie.ledger.store import PostgresCostLedger
 from arie.migrations import MigrationsDirectoryError, pending_migrations
 from arie.observability.tracing import configure_tracing, shutdown_tracing
 from arie.statemachine.apply import OptimisticConcurrencyError
+
+_LOGGER = logging.getLogger("arie.api")
 
 
 @dataclass(frozen=True)
@@ -134,8 +138,50 @@ def create_app(*, state: AppState | None = None) -> FastAPI:
         app.state.arie = state
 
     register_routes(app)
+    register_error_shaping(app)
     instrument(app)
     return app
+
+
+def register_error_shaping(app: FastAPI) -> None:
+    """Every 5xx this API emits carries a JSON ``detail``, like its 4xxs do.
+
+    Without these, an unhandled exception falls through to Starlette's
+    ServerErrorMiddleware, which answers with *plain-text* "Internal Server
+    Error" — the one response shape the frontend's message extraction can't
+    read, so users saw the raw fallback string "ARIE request failed (500)".
+    Shaping is all this does: the error is still logged with its traceback,
+    and nothing is retried or swallowed.
+
+    ``psycopg.OperationalError`` gets its own handler because it is the one
+    *expected* transient (a dropped pooler connection, a database restart):
+    503 says "try again shortly" where a bare 500 says "something broke".
+    """
+
+    @app.exception_handler(psycopg.OperationalError)
+    async def _database_unreachable(request: Request, exc: psycopg.OperationalError) -> Response:
+        _LOGGER.exception("database unreachable during %s %s", request.method, request.url.path)
+        return _json_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "ARIE's database was briefly unreachable. Nothing was lost — retry in a moment.",
+        )
+
+    @app.exception_handler(Exception)
+    async def _unhandled(request: Request, exc: Exception) -> Response:
+        _LOGGER.exception("unhandled error during %s %s", request.method, request.url.path)
+        return _json_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "ARIE hit an unexpected internal error handling this request. "
+            "It has been logged; retrying is safe.",
+        )
+
+
+def _json_error(code: int, detail: str) -> Response:
+    return Response(
+        content=json.dumps({"detail": detail}),
+        media_type="application/json",
+        status_code=code,
+    )
 
 
 def instrument(app: FastAPI) -> None:

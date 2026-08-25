@@ -175,7 +175,7 @@ src/arie/
   scoring/      deterministic scorer and score bounds (no I/O, no model)
   confidence/   calibrated confidence model, feature extraction, tau selection
   policy/       the stopping controller that composes scoring + confidence
-  providers/    EnrichmentProvider Protocol; simulated registry and live adapter
+  providers/    EnrichmentProvider Protocol; simulated registry, synthetic-identity fallback, live adapter
   jobs/         Postgres job queue (SKIP LOCKED), worker loop, handlers
   statemachine/ transitions, status groups, optimistic concurrency
   approval/     human review workflow

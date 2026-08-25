@@ -5,7 +5,8 @@ simulated registry and a real vendor adapter both implement it, and the policy
 cannot tell them apart.
 
 > **Which mode runs where.** The public hosted demo runs
-> `PROVIDER_MODE=simulated`: it replays a frozen corpus, so no vendor is called
+> `PROVIDER_MODE=simulated`: it replays a frozen corpus for known identities and
+synthesizes deterministic evidence for the rest, so no vendor is called
 > and no money is spent. Cost figures there are modelled cost at configured
 > rates. The real adapter below is separate, and was verified with real billed
 > calls. Do not conflate the two.

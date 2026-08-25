@@ -27,14 +27,19 @@ ever exist, ``fetch_evidence`` becomes a genuinely separate long-running phase
 and this collapses back into per-stage handlers — that split is the adapters'
 step to make, not this one's.
 
-**Simulated mode replays a frozen corpus, so only corpus identities process.**
-``SimulatedProvider`` raises for entities outside the generated dataset — a
-deliberate guard ("a wiring error must not masquerade as poor provider
-coverage"). This module honours that instead of working around it: the handler
-looks the ingested lead's person up in the corpus by normalized email, and a
-lead that isn't there fails with a clear error into the normal
-retry/dead-letter path. That is the honest shape of "production" while
-``PROVIDER_MODE=simulated`` is in effect.
+**Simulated mode replays the frozen corpus for corpus identities, and
+synthesizes deterministic simulated evidence for everything else.**
+``SimulatedProvider`` still raises for entities outside its observation store —
+the guard that keeps a wiring error from masquerading as poor provider
+coverage. The handler looks the ingested lead's person up in the corpus by
+normalized email; a hit replays its frozen observations byte-for-byte
+(unchanged from before), and a miss falls back to
+``arie.providers.synthetic.synthesize_corpus_lead`` — the same catalogue,
+rates, and noise model, seeded from the lead's own canonical keys so the
+result is deterministic and cache-coherent. Out-of-corpus leads used to fail
+into the dead-letter path by design; now that the public demo accepts
+arbitrary identities, a data source for them exists and the honest outcome is
+a receipt, not a dead letter.
 
 **Post-M1 P5 — ``PROVIDER_MODE=live`` has a real backend now, built and
 registered by a separate function, ``_build_live_handlers``.** It has no
@@ -93,7 +98,7 @@ from arie.core.types import (
 )
 from arie.evidence.store import PostgresEvidenceStore
 from arie.evidence.ttl_policy import ttl_for_field
-from arie.identity.normalize import normalize_domain, normalize_email
+from arie.identity.normalize import domain_from_email, normalize_domain, normalize_email
 from arie.ledger.store import PostgresCostLedger
 from arie.observability.tracing import get_tracer, set_attributes, traced
 from arie.policy.base import EvidenceCache, PolicyOutcome, RunContext
@@ -104,6 +109,7 @@ from arie.providers.live_abstract import (
     AbstractCompanyEnrichmentProvider,
 )
 from arie.providers.simulated import CallLedger, build_from_leads
+from arie.providers.synthetic import synthesize_corpus_lead
 from arie.scoring.engine import ScoringResult, score_evidence
 from arie.statemachine.apply import apply_transition
 from arie.statemachine.transitions import next_status
@@ -237,10 +243,16 @@ class _LeadIdentity:
     """Post-M1 P5. Fixed at ingestion — see ``arie.api.ingest``'s idempotency
     semantics. Read here so a single ``compute_score`` variant (simulated or
     live) can branch its own DECISION-node outcome without a second query."""
+    full_name: str | None = None
+    company_name: str | None = None
+    """Display names as submitted, used only when synthesizing an
+    out-of-corpus identity so its receipt shows what the submitter typed
+    rather than generator-invented names."""
 
 
 _SELECT_LEAD_IDENTITY = """
-    SELECT l.company_id, l.person_id, l.is_shadow, c.canonical_domain, p.canonical_email
+    SELECT l.company_id, l.person_id, l.is_shadow, c.canonical_domain, p.canonical_email,
+           p.full_name, c.name AS company_name
     FROM leads l
     LEFT JOIN companies c ON c.company_id = l.company_id
     LEFT JOIN persons  p ON p.person_id  = l.person_id
@@ -310,6 +322,8 @@ def _load_identity(conn: psycopg.Connection, lead_id: UUID) -> _LeadIdentity:
         canonical_email=row["canonical_email"],
         canonical_domain=row["canonical_domain"],
         is_shadow=row["is_shadow"],
+        full_name=row["full_name"],
+        company_name=row["company_name"],
     )
 
 
@@ -578,9 +592,10 @@ def build_handlers(
 def _build_simulated_handlers(
     pool: ConnectionPool, resolved_runtime: SimulatedEnrichmentRuntime
 ) -> dict[str, JobHandler]:
-    """``PROVIDER_MODE=simulated`` — replays the frozen corpus, unchanged from
-    before P5. Only identities in ``resolved_runtime.corpus_by_email`` can be
-    enriched; see ``UnknownCorpusIdentityError``."""
+    """``PROVIDER_MODE=simulated`` — replays the frozen corpus for identities
+    in ``resolved_runtime.corpus_by_email`` (unchanged from before P5), and
+    synthesizes deterministic simulated evidence for everything else (see
+    ``arie.providers.synthetic``)."""
     evidence_store = PostgresEvidenceStore(pool)
     cost_ledger = PostgresCostLedger(pool)
 
@@ -599,16 +614,34 @@ def _build_simulated_handlers(
             attributes={"arie.lead_id": job.lead_id, "arie.provider_mode": "simulated"},
         ) as span:
             identity = _load_identity(ctx.conn, job.lead_id)
-            corpus_lead = resolved_runtime.corpus_lead_for(
-                identity.canonical_email, identity.canonical_domain
-            )
+            try:
+                corpus_lead = resolved_runtime.corpus_lead_for(
+                    identity.canonical_email, identity.canonical_domain
+                )
+                registry = resolved_runtime.registry
+                synthetic = False
+            except UnknownCorpusIdentityError:
+                # Out-of-corpus identity — synthesize deterministic simulated
+                # evidence instead of dead-lettering. Corpus identities never
+                # reach this branch, so the frozen replay is untouched; see
+                # arie.providers.synthetic for the determinism contract that
+                # keeps the durable evidence cache coherent across contacts.
+                corpus_lead = synthesize_corpus_lead(
+                    canonical_email=identity.canonical_email,
+                    canonical_domain=identity.canonical_domain
+                    or domain_from_email(identity.canonical_email),
+                    full_name=identity.full_name,
+                    company_name=identity.company_name,
+                )
+                _, registry = build_from_leads([corpus_lead])
+                synthetic = True
             entities: dict[str, tuple[EntityType, UUID]] = {
                 corpus_lead.company.canonical_domain: ("company", identity.company_id),
                 corpus_lead.person.email: ("person", identity.person_id),
             }
 
             run_ctx = RunContext(
-                registry=resolved_runtime.registry,
+                registry=registry,
                 ledger=_DurableCallLedger(
                     cost_ledger, lead_id=job.lead_id, job_id=job.job_id, entities=entities
                 ),
@@ -684,6 +717,7 @@ def _build_simulated_handlers(
                     "arie.cost_usd": outcome.cost_usd,
                     "arie.stop_reason": outcome.stop_reason,
                     "arie.shadow": identity.is_shadow,
+                    "arie.synthetic_identity": synthetic,
                 },
             )
         # Transitions were applied here, hop by hop; None tells the worker

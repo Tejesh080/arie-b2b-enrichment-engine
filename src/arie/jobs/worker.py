@@ -20,6 +20,7 @@ row and nowhere else.
 
 from __future__ import annotations
 
+import contextlib
 import signal
 import socket
 import threading
@@ -43,7 +44,8 @@ from arie.observability.tracing import (
     shutdown_tracing,
     traced,
 )
-from arie.statemachine.apply import apply_transition
+from arie.statemachine.apply import OptimisticConcurrencyError, apply_transition
+from arie.statemachine.transitions import job_type_for
 
 _SELECT_LEAD_STATE = "SELECT status, version FROM leads WHERE lead_id = %(lead_id)s"
 
@@ -281,6 +283,14 @@ def _fail(
             outcome = queue.fail(
                 conn, job.job_id, worker_id=worker_id, error=error, max_attempts=max_attempts
             )
+            if outcome.status == "dead_letter" and job.lead_id is not None:
+                # The attempt budget is spent — nothing will ever advance this
+                # lead again, so tell its pollers that explicitly instead of
+                # leaving them in a "not finalized yet" loop forever (the exact
+                # contract FAILURE's docstring in arie.statemachine.transitions
+                # states). Same transaction as the dead-letter itself: the job
+                # and the lead can't disagree about whether processing is over.
+                _mark_lead_dead_lettered(conn, lead_id=job.lead_id, job=job, error=error)
             conn.commit()
     except JobOwnershipError as exc:
         return CycleResult(
@@ -288,6 +298,38 @@ def _fail(
         )
     result_kind = "dead_letter" if outcome.status == "dead_letter" else "retry"
     return CycleResult(job_id=job.job_id, job_type=job.job_type, outcome=result_kind, detail=error)
+
+
+def _mark_lead_dead_lettered(
+    conn: psycopg.Connection, *, lead_id: uuid.UUID, job: ClaimedJob, error: str
+) -> None:
+    """Transition a dead-lettered job's lead to DEAD_LETTER, if the queue
+    still owns its progress.
+
+    Guarded by ``job_type_for``: only statuses the queue auto-advances (the
+    NEW→DECISION scaffold) can be stranded by a dead letter. A lead already
+    terminal, awaiting a human, or otherwise outside the scaffold is not this
+    job's to move. Best-effort by design — an ``OptimisticConcurrencyError``
+    (someone else advanced the lead between the read and the write) means the
+    lead is demonstrably not stranded, so losing the race is success.
+    """
+    with conn.cursor() as cur:
+        cur.execute(_SELECT_LEAD_STATE, {"lead_id": lead_id})
+        row = cur.fetchone()
+    if row is None:
+        return
+    status, version = LeadStatus(row[0]), row[1]
+    if job_type_for(status) is None:
+        return
+    with contextlib.suppress(OptimisticConcurrencyError):
+        apply_transition(
+            conn,
+            lead_id=lead_id,
+            expected_version=version,
+            new_status=LeadStatus.DEAD_LETTER,
+            event_type="job:dead_letter",
+            payload={"job_id": str(job.job_id), "job_type": job.job_type, "error": error[:500]},
+        )
 
 
 def install_graceful_shutdown(stop: threading.Event) -> None:

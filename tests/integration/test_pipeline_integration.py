@@ -353,57 +353,121 @@ def test_the_m1_smoke_path_ingestion_through_human_review_decision(
     assert events[-1] == "human_review:decided"
 
 
-def test_an_off_corpus_lead_fails_into_the_ordinary_retry_path(
+def test_an_out_of_corpus_lead_is_synthesized_and_processed_to_a_terminal_status(
     api_client: TestClient,
     db_conn: psycopg.Connection,
     cleanup_ingest: IngestCleanup,
+    cleanup_evidence: list[uuid.UUID],
+    runtime: SimulatedEnrichmentRuntime,
     handlers: dict[str, JobHandler],
     job_queue: PostgresJobQueue,
     pipeline_pool: ConnectionPool,
 ) -> None:
-    """Simulated mode has no data source for identities outside the frozen
-    corpus. That is a job failure with a clear message routed through the
-    normal retry/backoff machinery — never a silent skip, and never fabricated
-    evidence."""
-    domain = f"not-in-corpus-{uuid.uuid4().hex[:10]}.test"
-    email = f"nobody@{domain}"
+    """An identity the frozen corpus has never heard of — the public demo's
+    'submit your own lead' path. Before arie.providers.synthetic these jobs
+    dead-lettered by design and the lead sat in NEW forever; now the same
+    pipeline synthesizes deterministic simulated evidence and lands a real
+    terminal status and receipt. The in-memory synthetic run is the ground
+    truth, exactly as the corpus tests above treat theirs."""
+    from arie.providers.simulated import build_from_leads
+    from arie.providers.synthetic import synthesize_corpus_lead
+
+    marker = uuid.uuid4().hex[:10]
+    domain = f"maple-harbor-{marker}.com"
+    email = f"rowan.ellis@{domain}"
+
+    synthetic = synthesize_corpus_lead(
+        canonical_email=email,
+        canonical_domain=domain,
+        full_name="Rowan Ellis",
+        company_name="Maple Harbor Group",
+    )
+    _, registry = build_from_leads([synthetic])
+    expected = runtime.policy.run(
+        synthetic, RunContext(registry=registry, ledger=CallLedger(), cache=EvidenceCache())
+    )
+    expected_status = {
+        "auto_route": LeadStatus.AUTO_ROUTED,
+        "reject": LeadStatus.SYNCED,
+        "escalate_human": LeadStatus.AWAITING_HUMAN,
+    }[decision_route(expected.decision, expected.autonomous)]
+
     cleanup_ingest.domains.append(domain)
     cleanup_ingest.emails.append(email)
-
     response = api_client.post(
         "/leads",
         json={
             "source": "pipeline-it",
             "email": email,
-            "external_ref": f"pipe-{uuid.uuid4().hex[:12]}",
+            "external_ref": f"synth-{marker}",
             "company_domain": domain,
+            "company_name": "Maple Harbor Group",
+            "full_name": "Rowan Ellis",
         },
     )
     assert response.status_code == 201
-    body = response.json()
+    body: dict[str, Any] = response.json()
     cleanup_ingest.lead_ids.append(uuid.UUID(body["lead_id"]))
+
+    job_status = _drive_job_to_completion(
+        job_queue, pipeline_pool, handlers, db_conn, body["job_id"]
+    )
+    assert job_status == "done", "out-of-corpus leads must process, not dead-letter"
+    _register_ledger_and_evidence_cleanup(db_conn, cleanup_ingest, cleanup_evidence, body)
+
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT status FROM leads WHERE lead_id = %s", (body["lead_id"],))
+        lead_row = cur.fetchone()
+        cur.execute(
+            "SELECT decision, confidence FROM decision_receipts WHERE lead_id = %s",
+            (body["lead_id"],),
+        )
+        receipt_row = cur.fetchone()
+
+    assert lead_row is not None and lead_row[0] == expected_status
+    assert receipt_row is not None, "a synthesized lead still gets a full decision receipt"
+    assert receipt_row[0] == str(expected.decision)
+    assert float(receipt_row[1]) == pytest.approx(expected.confidence, abs=1e-6)
+
+
+def test_a_dead_lettered_job_marks_its_lead_dead_letter(
+    db_conn: psycopg.Connection,
+    job_queue: PostgresJobQueue,
+    pipeline_pool: ConnectionPool,
+    make_lead: Any,
+    cleanup_jobs: list[uuid.UUID],
+) -> None:
+    """When the attempt budget is spent, the lead must be told — FAILURE's
+    contract in arie.statemachine.transitions — rather than sitting in NEW
+    while its pollers wait forever. Driven with an empty handler registry so
+    the job dead-letters deterministically on its first attempt."""
+    lead_id, _version = make_lead(source="deadletter-it")
+    enqueued = job_queue.enqueue(lead_id=lead_id, job_type="compute_score")
+    cleanup_jobs.append(enqueued.job_id)
 
     results = run_worker_cycle(
         job_queue,
         pipeline_pool,
-        handlers,
-        worker_id=f"pipeline-it-{uuid.uuid4().hex[:8]}",
-        batch_size=3,
+        handlers={},
+        worker_id=f"deadletter-it-{uuid.uuid4().hex[:8]}",
+        batch_size=1,
         job_types=["compute_score"],
+        max_attempts=1,
     )
-
-    ours = [r for r in results if str(r.job_id) == body["job_id"]]
-    assert len(ours) == 1
-    assert ours[0].outcome == "retry"
-    assert "frozen eval corpus" in (ours[0].detail or "")
+    assert [r.outcome for r in results if r.job_id == enqueued.job_id] == ["dead_letter"]
 
     with db_conn.cursor() as cur:
-        cur.execute("SELECT status, version FROM leads WHERE lead_id = %s", (body["lead_id"],))
-        lead_row = cur.fetchone()
-        cur.execute("SELECT status, attempt_count FROM jobs WHERE job_id = %s", (body["job_id"],))
+        cur.execute("SELECT status FROM jobs WHERE job_id = %s", (enqueued.job_id,))
         job_row = cur.fetchone()
+        cur.execute("SELECT status, version FROM leads WHERE lead_id = %s", (lead_id,))
+        lead_row = cur.fetchone()
+        cur.execute(
+            "SELECT event_type FROM lead_events WHERE lead_id = %s ORDER BY event_id",
+            (lead_id,),
+        )
+        events = [row[0] for row in cur.fetchall()]
 
-    assert lead_row is not None
-    assert lead_row == (LeadStatus.NEW, 1), "the failed attempt must leave the lead untouched"
-    assert job_row is not None
-    assert job_row[0] == "pending" and job_row[1] == 1, "rescheduled with backoff, not dead yet"
+    assert job_row is not None and job_row[0] == "dead_letter"
+    assert lead_row is not None and lead_row[0] == LeadStatus.DEAD_LETTER
+    assert lead_row[1] == 2, "exactly one audited transition, NEW -> DEAD_LETTER"
+    assert "job:dead_letter" in events
