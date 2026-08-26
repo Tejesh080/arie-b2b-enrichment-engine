@@ -100,6 +100,63 @@ class DatabaseConfig:
 
 
 @dataclass(frozen=True)
+class IntegrationDatabaseConfig:
+    """Where the integration suite is allowed to write. Never ``DATABASE_URL``.
+
+    Named for the *suite* rather than starting with ``Test``: pytest collects
+    any module-level ``Test*`` class as a test class, so the obvious name emits
+    a ``PytestCollectionWarning`` on every run of every file that imports it.
+
+    **This class exists because a fallback almost destroyed production data.**
+    The integration fixtures used to read ``DatabaseConfig``, which on any
+    developer machine with a populated ``.env`` is the *deployed* database. Two
+    consequences followed, and the second is worse than the first: the tests
+    wrote and deleted rows in a live database, and the deployed worker — polling
+    that same database — claimed the tests' jobs within about a second of
+    ingestion and processed them with its own handlers, so assertions failed for
+    reasons unrelated to the code under test.
+
+    Reading a *different* variable is what makes the first problem structural
+    rather than procedural. There is deliberately no fallback: if
+    ``TEST_DATABASE_URL`` is unset the integration suite skips with an
+    explanation, and no combination of environment can route it back to
+    ``DATABASE_URL``. "Remember to override the URL before running tests" is
+    not a safety mechanism; not having the URL is.
+
+    Two further guards live in ``tests/integration/conftest.py`` — see
+    ``ARIE_ALLOW_INTEGRATION_TEST_DB`` and the designation marker — because
+    they are checks on a *live connection*, which config cannot perform.
+    """
+
+    url: str = field(default_factory=lambda: os.getenv("TEST_DATABASE_URL", ""))
+    direct_url: str = field(
+        default_factory=lambda: (
+            os.getenv("TEST_DATABASE_DIRECT_URL", "") or os.getenv("TEST_DATABASE_URL", "")
+        )
+    )
+    """Falls back to ``url``, and only to ``url``. The pooled/direct split
+    matters solely against Supabase's transaction pooler (see
+    ``scripts/migrate.py``); for an ordinary Postgres — which every supported
+    test target is — they are the same server, and requiring both would be two
+    variables to get out of sync for no benefit."""
+
+    allow: bool = field(
+        default_factory=lambda: os.getenv("ARIE_ALLOW_INTEGRATION_TEST_DB", "") == "1"
+    )
+    """Explicit operator intent, separate from merely having a URL configured.
+
+    A URL can be inherited from a shell, a CI secret, or a stale export. This
+    cannot be inherited by accident in the same way: it is meaningless outside
+    the integration suite, so its only reason to be set is that someone meant
+    to run destructive tests against the database it accompanies.
+    """
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.url)
+
+
+@dataclass(frozen=True)
 class ObservabilityConfig:
     """Tracing configuration. Absent an endpoint, tracing is off — see
     ``arie.observability.tracing``.
@@ -197,6 +254,59 @@ class LiveProviderConfig:
 
 
 @dataclass(frozen=True)
+class LiveBudgetConfig:
+    """Hard spend ceilings for ``PROVIDER_MODE=live`` (Live V1 Foundation, Phase 6).
+
+    Enforced by ``arie.live.budget.LiveSpendGuard`` *before* any real provider
+    call, against the durable ``provider_calls`` ledger. Distinct from
+    ``PolicyConfig.lead_budget_usd_cap``, which bounds the *simulated*
+    catalogue's fictional prices inside the EVoI loop and is sized to sit above
+    the cost of calling all eight simulated providers. Conflating the two would
+    force one number to be both "generous enough that the benchmark can reach
+    full information" and "tight enough that a live retry storm cannot empty a
+    real account".
+
+    **Server-side only.** Nothing here is prefixed ``NEXT_PUBLIC_``/``VITE_``,
+    nothing is echoed by an API response, and the frontend lives in a separate
+    repository with no access to this process's environment. A spend cap the
+    browser can read is a spend cap an attacker knows the exact shape of.
+    """
+
+    daily_usd: float = field(
+        default_factory=lambda: _env_float("LIVE_PROVIDER_DAILY_BUDGET_USD", 2.00)
+    )
+    """Account-wide ceiling per UTC day, across every live provider.
+
+    $2.00 at Abstract's estimated $0.00165/call is roughly 1,200 enrichments a
+    day — far above any plausible demo or pilot volume, and far below an amount
+    worth losing to a stuck queue overnight. Deliberately a *small* number: the
+    default should be safe for someone who deploys without reading this
+    docstring, and raising it is a one-line env change for someone who has."""
+
+    per_lead_usd: float = field(
+        default_factory=lambda: _env_float("LIVE_PROVIDER_PER_LEAD_BUDGET_USD", 0.05)
+    )
+    """Ceiling for one lead's total live enrichment.
+
+    $0.05 is ~30 Abstract calls, or comfortable headroom for one Abstract call
+    plus one person-enrichment call once a second provider exists (Apollo's
+    published per-credit pricing sits well under a cent at plan volumes). A
+    single lead needing more than this is a bug — a retry loop, a cache that is
+    not being read — and the honest response is to stop and ask a human, which
+    is exactly what exhausting it does."""
+
+    def __post_init__(self) -> None:
+        if self.per_lead_usd > self.daily_usd:
+            raise ValueError(
+                f"LIVE_PROVIDER_PER_LEAD_BUDGET_USD={self.per_lead_usd} exceeds "
+                f"LIVE_PROVIDER_DAILY_BUDGET_USD={self.daily_usd} — one lead could "
+                "consume the entire daily budget, which makes the daily cap meaningless"
+            )
+        if self.daily_usd < 0 or self.per_lead_usd < 0:
+            raise ValueError("live budget caps must not be negative")
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     provider_mode: ProviderMode = field(
         default_factory=lambda: cast(ProviderMode, os.getenv("PROVIDER_MODE", "simulated"))
@@ -226,3 +336,4 @@ RUNTIME = RuntimeConfig()
 OBSERVABILITY = ObservabilityConfig()
 LLM = LLMConfig()
 LIVE_PROVIDER = LiveProviderConfig()
+LIVE_BUDGET = LiveBudgetConfig()

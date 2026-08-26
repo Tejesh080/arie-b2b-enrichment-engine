@@ -27,7 +27,7 @@ from typing import Any
 from arie.core.types import Evidence, ProviderStatus
 from arie.evalgen.schema import ProviderObservation
 from arie.providers.catalog import BY_NAME
-from arie.scoring.rules import SCORED_FIELDS, field_points
+from arie.scoring.rules import SCORED_FIELDS, field_points, is_unknown
 
 # Disagreements smaller than this many points are treated as agreement. Guards
 # against float noise in continuous fields (e.g. two intent readings of 0.7001
@@ -79,9 +79,16 @@ def resolve_candidates(candidates: Iterable[Candidate]) -> dict[str, FieldResolu
     """
     grouped: dict[str, list[Candidate]] = {}
     for candidate in candidates:
-        if candidate.field_name not in SCORED_FIELDS or candidate.value is None:
+        if candidate.field_name not in SCORED_FIELDS or is_unknown(candidate.value):
             # A null from a source is not evidence of absence, just an
-            # unresolved attribute.
+            # unresolved attribute. The UNKNOWN sentinel is dropped for the
+            # same reason and one more: a resolution is what the Decision
+            # Receipt renders as "this field is known, and this source won
+            # it". A value ARIE could not map is not a won field, and listing
+            # it as one would make the receipt claim knowledge it does not
+            # have. It leaves no fact behind — `facts_from` therefore omits
+            # the field, and `arie.scoring.engine` reads it as unknown, which
+            # is exactly right.
             continue
         grouped.setdefault(candidate.field_name, []).append(candidate)
 

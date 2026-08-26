@@ -20,7 +20,7 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from psycopg_pool import ConnectionPool
-from tests.integration.conftest import IngestCleanup
+from tests.integration.conftest import IngestCleanup, source_for
 
 from arie.config import LiveProviderConfig
 from arie.evalgen.schema import EvalLead
@@ -85,7 +85,7 @@ def _ingest(
     response = api_client.post(
         "/leads",
         json={
-            "source": "live-it",
+            "source": source_for("live"),
             "email": email,
             "external_ref": f"live-{uuid.uuid4().hex[:12]}",
             "company_domain": domain,
@@ -277,7 +277,7 @@ def test_a_lead_with_no_domain_never_calls_the_provider(
     response = api_client.post(
         "/leads",
         json={
-            "source": "live-it",
+            "source": source_for("live"),
             "email": email,
             "external_ref": f"live-{uuid.uuid4().hex[:12]}",
             "company_name": company_name,

@@ -175,7 +175,10 @@ src/arie/
   scoring/      deterministic scorer and score bounds (no I/O, no model)
   confidence/   calibrated confidence model, feature extraction, tau selection
   policy/       the stopping controller that composes scoring + confidence
-  providers/    EnrichmentProvider Protocol; simulated registry, synthetic-identity fallback, live adapter
+  providers/    EnrichmentProvider Protocol; simulated registry, synthetic-identity fallback, live adapter, Apollo contract (fixtures only)
+  normalization/ canonical taxonomy + the provider->scorer adapter boundary
+  icp.py        the named reference ICP for Live V1 (descriptive, not a scorer)
+  live/         live-mode autonomy guard and spend caps
   jobs/         Postgres job queue (SKIP LOCKED), worker loop, handlers
   statemachine/ transitions, status groups, optimistic concurrency
   approval/     human review workflow
@@ -186,5 +189,6 @@ bench/          benchmark harness, cost model, multi-seed runner
 migrations/     canonical SQL migrations (source of truth)
 supabase/       generated mirror of migrations/ for Supabase Branching
 workflows/n8n/  the two edge workflows plus a mock sink
-scripts/        demo CLI, policy lab, migration runner, live provider smoke test
+scripts/        demo CLI, policy lab, migration runner, live provider smoke test,
+                integration-test database designation (test_db.py)
 ```

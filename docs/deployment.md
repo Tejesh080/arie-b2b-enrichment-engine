@@ -236,6 +236,7 @@ never in this repo.**
 | `DATABASE_DIRECT_URL` | `arie-api` only | consumed only by the Pre-Deploy Command |
 | `PROVIDER_MODE` | `arie-worker` | start at `simulated` — see "Provider safety" below |
 | `ABSTRACT_COMPANY_API_KEY`, `ABSTRACT_COMPANY_BASE_URL`, `ABSTRACT_COMPANY_TIMEOUT_SECONDS`, `ABSTRACT_COMPANY_COST_USD_PER_CALL` | `arie-worker`, optional | read only when `PROVIDER_MODE=live` |
+| `LIVE_PROVIDER_DAILY_BUDGET_USD`, `LIVE_PROVIDER_PER_LEAD_BUDGET_USD` | `arie-worker`, optional | live spend ceilings; safe defaults apply if unset. Server-side only — never expose to a browser |
 | `LEAD_BUDGET_USD_CAP`, `TARGET_AUTONOMOUS_ERROR_RATE`, `LATENCY_PENALTY_USD_PER_SEC`, `WORKER_POLL_INTERVAL_SEC`, `WORKER_MAX_ATTEMPTS`, `WORKER_LEASE_SECONDS` | `arie-worker`, optional | policy/runtime defaults apply if unset |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME` | shared, optional | tracing stays off if unset |
 
@@ -250,6 +251,45 @@ the worker call the real Abstract API for *any* ingested lead, not only
 corpus identities. To return to zero real-provider spend, set
 `PROVIDER_MODE=simulated` on `arie-worker` and redeploy it; nothing else
 needs to change.
+
+Three things bound the blast radius of `PROVIDER_MODE=live`, all enforced in
+code rather than by configuration discipline (see
+[`provider-integration.md`](provider-integration.md)'s "Live V1 Foundation"):
+
+- **No autonomous business action.** A lead enriched by a real provider always
+  terminates at `AWAITING_HUMAN` (or `SHADOW_EVALUATED` for a shadow lead) —
+  never `AUTO_ROUTED`, never the reject terminal — because the confidence
+  threshold gating autonomy is calibrated on synthetic data. Not a flag.
+- **Spend ceilings**, checked against the durable ledger before each call:
+  `LIVE_PROVIDER_DAILY_BUDGET_USD` (default `$2.00`) and
+  `LIVE_PROVIDER_PER_LEAD_BUDGET_USD` (default `$0.05`).
+- **Failures degrade rather than propagate.** A provider timeout, error, or
+  exhausted budget stops acquisition with its own stop reason and sends the
+  lead to a human; the job is not failed and the lead is not lost.
+
+**A deployed worker polls this database, and the integration suite can no
+longer reach it.** `arie-worker` claims `compute_score` jobs within about a
+second of ingestion. While the integration fixtures read `DATABASE_URL`, that
+meant two things at once: the suite wrote and deleted rows in the deployed
+database, and the deployed worker processed the tests' leads with its own
+handlers, so assertions failed for reasons unrelated to the code under test.
+
+The fix is structural rather than procedural — "scale the worker to zero before
+running tests" is a step someone forgets. The integration fixtures now read
+**`TEST_DATABASE_URL`, with no fallback to `DATABASE_URL`**, plus two further
+guards (`ARIE_ALLOW_INTEGRATION_TEST_DB=1`, and a designation marker only
+`make test-db` creates — a command that refuses to stamp anything matching
+`DATABASE_URL` or already holding data). An unset `TEST_DATABASE_URL` skips the
+suite; it never silently falls through to a deployment.
+
+Locally that means a *different database on the same Postgres* than the Compose
+stack uses — `arie_test` versus `arie`. The Compose workers poll `arie`, whose
+`jobs` table is a different table, so the whole stack can stay running during a
+test run. See [`.env.example`](../.env.example) and `scripts/test_db.py`.
+
+`arie-worker` therefore needs no special handling around test runs, and
+`DATABASE_URL` should never be set on a developer machine for testing purposes
+— it is a deployment variable.
 
 **Rollback.** Railway keeps prior deploys; redeploying an older one is the
 rollback path, per service, independently. Every migration through `0009`
@@ -315,3 +355,7 @@ correctly under a small amount of real concurrency.
   this bullet used to carry no longer describes the code. What's still true:
   the *hosted* deployment starts in `simulated` mode deliberately, not
   because `live` doesn't work — see "Provider safety" above.
+- **Autonomous decisions on real-provider evidence.** Deliberately blocked in
+  code until the confidence model is validated and recalibrated against real
+  evidence. Live mode enriches, scores, and recommends; a human decides. The
+  work that would lift this is a measurement, not a configuration change.

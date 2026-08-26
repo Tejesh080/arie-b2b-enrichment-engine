@@ -30,10 +30,9 @@ jobs:
 
   integration:
     # A disposable Postgres service container, born and destroyed with this
-    # job — never the shared Supabase database `docs/architecture.md`'s
-    # integration tests describe running against for local dev. That
-    # database holds real rows and is opt-in for a reason; nothing here
-    # touches it. This is what actually exercises arie.evidence, arie.identity,
+    # job. It is wired to TEST_DATABASE_URL, which is the only variable the
+    # integration fixtures read — they never fall back to DATABASE_URL, so no
+    # deployment is reachable from this job even if one were configured. This is what actually exercises arie.evidence, arie.identity,
     # arie.jobs/arie.statemachine, arie.api, and arie.ledger against a real
     # database on every push — `make test` alone (the "quality" job above)
     # does not, per the handoff's own warning not to infer otherwise.
@@ -53,11 +52,15 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      DATABASE_URL: postgresql://arie:arie_ci@localhost:5432/arie
-      # Locally distinct from DATABASE_URL only against Supabase's pooler
+      # TEST_DATABASE_URL, not DATABASE_URL: the integration fixtures read only
+      # the former and never fall back, so nothing here can be pointed at a
+      # deployment by an inherited variable or a mistyped secret.
+      # Locally distinct from the pooled URL only against Supabase's pooler
       # (see scripts/migrate.py's docstring) — this service container is the
       # same Postgres either way.
-      DATABASE_DIRECT_URL: postgresql://arie:arie_ci@localhost:5432/arie
+      TEST_DATABASE_URL: postgresql://arie:arie_ci@localhost:5432/arie
+      TEST_DATABASE_DIRECT_URL: postgresql://arie:arie_ci@localhost:5432/arie
+      ARIE_ALLOW_INTEGRATION_TEST_DB: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -65,8 +68,16 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -e ".[dev,service]"
+      - name: Designate the service container as a test database
+        # The suite refuses to write to a database that has not been marked.
+        # Here that is a formality — the container is born and destroyed with
+        # this job — but it is the same command a developer runs, so CI proves
+        # the path works rather than bypassing it.
+        run: python scripts/test_db.py designate
       - name: Apply migrations (the canonical runner — ADR 0005)
         run: python scripts/migrate.py
+        env:
+          DATABASE_DIRECT_URL: postgresql://arie:arie_ci@localhost:5432/arie
       - name: Integration tests
         run: pytest -m integration --cov=src/arie --cov-report=term-missing
 

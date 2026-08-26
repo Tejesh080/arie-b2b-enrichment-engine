@@ -219,6 +219,10 @@ class ReceiptDecisionResponse(BaseModel):
     autonomous: bool
     final_status: LeadStatus
     human_override: bool
+    autonomy_guard: str | None = None
+    """Live V1 Foundation. Additive and nullable: `None` for every simulated
+    receipt, which is every receipt an existing consumer has ever seen, so no
+    client breaks on it."""
 
 
 class ReceiptScoreBoundsResponse(BaseModel):

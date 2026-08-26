@@ -1,6 +1,6 @@
 """Identity resolution against a real Postgres database.
 
-Requires DATABASE_URL / DATABASE_DIRECT_URL; skipped otherwise (see
+Requires TEST_DATABASE_URL; skipped otherwise (see
 conftest.py). Four concerns, each load-bearing for a different reason:
 
 - **Deduplication** — the same real company/person, spelled differently on

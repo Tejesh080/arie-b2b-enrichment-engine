@@ -1,6 +1,6 @@
 """arie.statemachine.apply and the full worker cycle, against a real database.
 
-Requires DATABASE_URL / DATABASE_DIRECT_URL; skipped otherwise (see
+Requires TEST_DATABASE_URL; skipped otherwise (see
 conftest.py). Covers: atomic commit of job completion + lead transition
 together, optimistic-concurrency conflicts, the lead_events audit trail, and
 the worker loop's exception handling (rollback + retry, and the case where no

@@ -39,13 +39,18 @@ from psycopg.rows import dict_row
 from arie.api.reads import fetch_lead
 from arie.core.types import LeadStatus
 from arie.ledger.store import LeadCost, PostgresCostLedger
+from arie.live.budget import DAILY_BUDGET_EXHAUSTED, PER_LEAD_BUDGET_EXHAUSTED
+from arie.live.providers import REGISTERED_LIVE_PROVIDER_NAMES
+from arie.live.safety import LIVE_GUARD_REASON
 from arie.providers.catalog import ALL_PROVIDERS
 from arie.providers.live_abstract import LIVE_POLICY_NAME
-from arie.providers.live_abstract import PROVIDER_NAME as LIVE_PROVIDER_NAME
 from arie.scoring.rules import QUALIFY_THRESHOLD, REJECT_THRESHOLD
 from arie.statemachine.transitions import FAILURE
 
-LIVE_PROVIDER_NAMES: tuple[str, ...] = (LIVE_PROVIDER_NAME,)
+LIVE_PROVIDER_NAMES: tuple[str, ...] = REGISTERED_LIVE_PROVIDER_NAMES
+"""Kept as a module-level name for existing callers/tests; the definition now
+lives in ``arie.live.providers`` so the spend caps and this receipt cannot
+disagree about which providers are real."""
 
 RECEIPT_VERSION = "1"
 
@@ -67,6 +72,22 @@ _STOP_REASON_EXPLANATIONS: dict[str, str] = {
         "one real provider (which requires a domain) could never be called. The decision "
         "reflects whatever evidence was already known, not certainty that none exists."
     ),
+    "provider_failed": (
+        "The live data provider failed to respond usably (a timeout, or a transport or API "
+        "error). No evidence was purchased from it. The decision reflects only what was "
+        "already known — this lead was not assessed on complete information, and the "
+        "failure is recorded against the provider rather than against the lead."
+    ),
+    PER_LEAD_BUDGET_EXHAUSTED: (
+        "Enriching this lead any further would exceed its per-lead live spend cap, so no "
+        "provider was called. The decision reflects only the evidence already held. A lead "
+        "reaching this limit is unusual and worth investigating."
+    ),
+    DAILY_BUDGET_EXHAUSTED: (
+        "The account-wide daily live spend cap is exhausted, so no provider was called for "
+        "this lead. The decision reflects only the evidence already held. Acquisition "
+        "resumes on the next UTC day, or when the cap is raised."
+    ),
 }
 
 
@@ -79,11 +100,24 @@ class ReceiptDecision:
     recommended_action: str
     """What the policy concluded — ``Decision`` enum value, frozen at decision time."""
     autonomous: bool
+    """Whether ARIE *acted* without a human. Not "whether the model was confident
+    enough to" — under the Live V1 autonomy guard those two come apart, and
+    `autonomy_guard` below says when."""
     final_status: LeadStatus
     """The lead's live status — may reflect a human's override of `recommended_action`."""
     human_override: bool
     """True only once a human has responded with a `final_decision` that differs from
     `original_decision` — the same comparison `v_escalation_rate.human_overrode` makes."""
+    autonomy_guard: str | None = None
+    """Why autonomous action was withheld regardless of the recommendation, or
+    `None` when no guard applied.
+
+    Live V1 Foundation. Derived from `policy_name` rather than stored: every
+    live-mode receipt was produced under the guard, so a column would record
+    the same constant on every such row. A reviewer seeing an escalated lead
+    with `recommended_action="auto_route"` needs this to distinguish "ARIE was
+    unsure" from "ARIE was sure, and is not yet permitted to act on real-provider
+    evidence" — see `arie.live.safety`."""
 
 
 @dataclass(frozen=True)
@@ -386,6 +420,9 @@ def build_receipt(
             autonomous=receipt_row["autonomous"],
             final_status=lead.status,
             human_override=human_override,
+            autonomy_guard=(
+                LIVE_GUARD_REASON if receipt_row["policy_name"] == LIVE_POLICY_NAME else None
+            ),
         ),
         score=ReceiptScore(
             value=float(receipt_row["score_value"]),

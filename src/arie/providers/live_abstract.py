@@ -12,9 +12,20 @@ never retries beyond the one bounded HTTP attempt below — see
 
 **Why this provider.** Simple API-key-in-query-string auth, a free tier (100
 requests/month, no card) for failure-path testing, a deterministic JSON
-response, and — the deciding factor — its response field names are *exactly*
+response, and — the deciding factor — its response *field names* are exactly
 ARIE's own ``arie.scoring.rules.SCORED_FIELDS`` names for the two fields it
-returns. No mapping table, no unit conversion, no new normalization layer.
+returns.
+
+**Matching field names are not matching vocabularies, and P5 conflated the
+two.** ``industry`` arrives as Abstract's own category string — ``"Computer
+Software"``, ``"Financial Services"``, ``"Hospital & Health Care"``. Until the
+Live V1 Foundation this adapter lower-cased it and handed it straight to the
+scorer, where ``_INDUSTRY_POINTS.get("computer software", 0.0)`` returned 0.0:
+a prime-ICP software company scored as though it had been assessed and found
+worthless, indistinguishable from a genuine poor fit. Every value this adapter
+emits now goes through ``arie.normalization.contract``, which maps it onto the
+closed canonical vocabulary or reports it as unmapped — never both, and never
+silently neither.
 
 **Never raises for an ordinary operational outcome.** Mirrors
 ``arie.providers.simulated.SimulatedProvider`` exactly: a data miss, a timeout,
@@ -37,7 +48,6 @@ message.
 
 from __future__ import annotations
 
-import contextlib
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -46,6 +56,7 @@ import httpx
 
 from arie.config import LIVE_PROVIDER, LiveProviderConfig
 from arie.core.types import Entity, EntityType, ProviderResult, ProviderStatus
+from arie.normalization.contract import NormalizationReport, normalize_provider_fields
 
 PROVIDER_NAME = "abstract_company_enrichment"
 """The one live provider's catalogue-independent name. Deliberately not added to
@@ -261,10 +272,16 @@ class AbstractCompanyEnrichmentProvider:
                 error_kind="malformed_response",
             )
 
-        fields = _normalize_fields(body)
+        report = _normalize_fields(body)
 
-        if not fields:
-            # A 200 with no usable field is a genuine miss, not a failure.
+        if not report.has_usable_fields:
+            # A 200 with no usable field is a genuine miss, not a failure —
+            # and, post-Live-V1, "the provider answered in vocabulary we could
+            # not map" lands here too rather than being scored as zero. The
+            # `unmapped` detail rides along on `raw` so an operator can see the
+            # difference between "Abstract knows nothing about this domain" and
+            # "Abstract said something ARIE needs a taxonomy entry for".
+            #
             # Abstract's own pricing page states a submitted domain consumes a
             # credit "regardless of response success" — billed the same as a
             # SUCCESS call, matching arie.providers.catalog's `bill_on_miss`
@@ -276,15 +293,17 @@ class AbstractCompanyEnrichmentProvider:
                 latency_ms=latency_ms,
                 entity=entity,
                 error_kind=None,
+                normalization=report,
             )
 
         return self._result(
             status=ProviderStatus.SUCCESS,
-            fields=fields,
+            fields=report.fields,
             cost_usd=self.config.cost_usd_per_call,
             latency_ms=latency_ms,
             entity=entity,
             error_kind=None,
+            normalization=report,
         )
 
     def _result(
@@ -296,10 +315,19 @@ class AbstractCompanyEnrichmentProvider:
         latency_ms: float,
         entity: Entity,
         error_kind: str | None,
+        normalization: NormalizationReport | None = None,
     ) -> ProviderResult:
         raw: dict[str, Any] = {"provider": self.name, "entity": entity.canonical_key}
         if error_kind is not None:
             raw["error_kind"] = error_kind
+        if normalization is not None:
+            # Always, not only on failure. The raw->canonical pair is the whole
+            # audit trail for a mapping decision: "Abstract said 'Computer
+            # Software', ARIE scored it as 'software'" is checkable, while
+            # "industry: software" alone is not. `audit()` is field names,
+            # truncated raw values, and canonical values — never the whole
+            # vendor payload, and never anything derived from the API key.
+            raw["normalization"] = normalization.audit()
         return ProviderResult(
             fields=fields,
             confidence=_DECLARED_CONFIDENCE if status is ProviderStatus.SUCCESS else 0.0,
@@ -310,24 +338,25 @@ class AbstractCompanyEnrichmentProvider:
         )
 
 
-def _normalize_fields(body: dict[str, Any]) -> dict[str, Any]:
+def _normalize_fields(body: dict[str, Any]) -> NormalizationReport:
     """Only ever surface the two fields this adapter declares, deterministically.
 
-    A malformed or missing individual field is dropped rather than failing the
-    whole response — ``arie.scoring.rules.field_points`` already tolerates a
-    missing field as "unknown" (0 points, not an error), so the honest response
-    to "the provider sent something we can't use for this one field" is "treat
-    it as absent", not "fail the entire call".
+    Two steps, and the split is the point (see
+    ``arie.normalization.contract``): *this* function knows which Abstract
+    response keys correspond to which ARIE field names — the only
+    Abstract-specific knowledge in the pipeline — and the canonical layer knows
+    what the values mean. A new provider re-implements the first step and
+    reuses the second, which is what stops two adapters disagreeing about
+    whether "SaaS" is software.
+
+    A malformed or unmappable individual field is dropped from ``fields`` and
+    recorded in ``unmapped`` rather than failing the whole response: the honest
+    response to "the provider sent something we can't use for this one field"
+    is "treat that field as unknown", not "fail the entire call" and not
+    "score it as zero".
     """
-    fields: dict[str, Any] = {}
-
-    employee_count = body.get("employee_count")
-    if employee_count is not None:
-        with contextlib.suppress(TypeError, ValueError):
-            fields["employee_count"] = int(float(employee_count))
-
-    industry = body.get("industry")
-    if isinstance(industry, str) and industry.strip():
-        fields["industry"] = industry.strip().lower()
-
-    return fields
+    return normalize_provider_fields(
+        provider=PROVIDER_NAME,
+        entity_type="company",
+        raw_fields={key: body.get(key) for key in PROVIDES_FIELDS},
+    )

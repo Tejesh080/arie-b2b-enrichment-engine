@@ -17,7 +17,7 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from psycopg_pool import ConnectionPool
-from tests.integration.conftest import IngestCleanup
+from tests.integration.conftest import IngestCleanup, source_for
 
 from arie.core.types import LeadStatus
 from arie.evalgen.schema import EvalLead
@@ -88,7 +88,7 @@ def _ingest(
     response = api_client.post(
         "/leads",
         json={
-            "source": "shadow-it",
+            "source": source_for("shadow"),
             "email": lead.person.email,
             "external_ref": f"shadow-{mode}-{uuid.uuid4().hex[:12]}",
             "company_domain": lead.company.canonical_domain,

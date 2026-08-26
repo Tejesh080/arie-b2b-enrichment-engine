@@ -21,9 +21,16 @@ ARIE's provider abstraction is wired to one real external service —
 vendor, without touching the frozen benchmark catalogue.
 
 - **Why this one.** A plain `GET` with `api_key`/`domain` query params, a free
-  tier (100 requests/month, no card), and a response whose field names —
+  tier (100 requests/month, no card), and a response whose *field names* —
   `employee_count`, `industry` — match ARIE's own `SCORED_FIELDS` exactly. No
-  scraping, no browser automation, no new normalization layer.
+  scraping, no browser automation.
+- **Matching field names are not matching vocabularies.** P5 shipped assuming
+  they were: `industry` arrived as Abstract's own category string, was
+  lower-cased, and was handed to the scorer, where `"computer software"` is not
+  a key and scored **0.0** — indistinguishable from "we assessed this industry
+  and found it worthless". The Live V1 Foundation's canonical taxonomy layer
+  (below) fixes that. The defect is recorded here rather than quietly deleted,
+  because it is the clearest possible statement of why that layer exists.
 - **Env:** `ABSTRACT_COMPANY_API_KEY` (see [`.env.example`](../.env.example)).
   `PROVIDER_MODE=live` refuses to build a worker without it — no silent
   fallback to the simulator.
@@ -54,13 +61,28 @@ vendor, without touching the frozen benchmark catalogue.
   Decision Receipt — a second real call, which the script says out loud
   before making it.
 
-  Run for real against `github.com`: `employee_count: 2579`,
-  `industry: "computer software"`, cost `$0.00165`, autonomously rejected
-  (score 8.0 — Abstract's free-text industry string doesn't match ARIE's
-  closed vocabulary, the exact caveat above, seen live). Also caught a real
-  bug worth knowing about: Abstract 301-redirects the documented `/v2` path
-  to `/v2/`; the adapter's `base_url` now carries the trailing slash and its
-  client sets `follow_redirects=True` as a backstop.
+  Run for real against `github.com` **after** the canonical taxonomy layer:
+  Abstract returns the literal string `"Computer Software"`, which now maps to
+  canonical `software` — 15.0 ICP points, up from 0.0 — alongside
+  `employee_count: 2579`, at `$0.00165`. The result carries the raw-to-canonical
+  pair the adapter used, so the mapping is checkable in production rather than
+  inferred:
+
+  ```json
+  "normalization": {
+    "mapped": [
+      {"field": "employee_count", "raw": "2579", "canonical": 2579},
+      {"field": "industry", "raw": "Computer Software", "canonical": "software"}
+    ],
+    "unmapped": []
+  }
+  ```
+
+  The same call before this change produced `industry: "computer software"` and
+  an autonomous rejection at score 8.0. Verification also caught a real vendor
+  quirk worth knowing about: Abstract 301-redirects the documented `/v2` path to
+  `/v2/`; the adapter's `base_url` carries the trailing slash and its client
+  sets `follow_redirects=True` as a backstop.
 
 **Deliberately not built:** a second provider, a provider registry/marketplace,
 retries beyond one bounded attempt, or any claim that this adapter's accuracy
@@ -71,7 +93,134 @@ for the full account, including live-verification status.
 
 ---
 
+## Live V1 Foundation
+
+Four things stand between a real provider call and a real business decision.
+None of them is optional, and none is a configuration flag.
+
+### 1. No autonomous action on real-provider evidence
+
+A lead enriched by a real provider **cannot** be auto-routed or rejected
+without a human. It terminates at `AWAITING_HUMAN` (with a real, actionable
+`human_reviews` row) or, if ingested as shadow, at `SHADOW_EVALUATED`.
+
+The reason is narrow and specific: `tau` is fitted on the *synthetic
+calibration split*, and its guarantee — at most `TARGET_AUTONOMOUS_ERROR_RATE`
+of autonomous decisions are wrong — holds over that distribution and no other.
+Real provider evidence has different coverage, different error modes, and
+different correlation between fields. Applying that threshold to it is an
+unmeasured claim wearing a calibrated number's clothes.
+
+This is not env-configurable (`arie.live.safety`). The gate that lifts it is a
+*measurement* — real-world validation and recalibration — not a deployment
+switch someone can flip under time pressure. **Simulated mode is untouched**:
+its autonomy is validated against an oracle on held-out data, and the demo and
+benchmark still exercise it.
+
+The Decision Receipt keeps recommendation, action, and outcome as three
+separate facts: `decision.recommended_action` is what ARIE concluded (never
+rewritten), `decision.autonomous` is `false`, and `decision.autonomy_guard`
+says *why* — so a reviewer seeing an escalated `auto_route` recommendation can
+tell "ARIE was unsure" from "ARIE was sure and is not yet permitted to act".
+
+### 2. A canonical taxonomy the scorer owns
+
+```
+RAW PROVIDER RESPONSE -> provider adapter -> normalized evidence
+                      -> canonical ARIE vocabulary -> evidence store -> scorer
+```
+
+`arie.normalization.taxonomy` maps real vendor strings onto the scorer's own
+closed vocabularies, explicitly (an alias table) and then heuristically
+(ordered, word-boundary phrase rules). `arie.normalization.contract` is the
+boundary every adapter passes through; nothing else may build evidence from a
+vendor payload. No raw provider vocabulary reaches the scorer.
+
+The canonical sets **are** the scorer's sets, widened only with
+recognised-but-unscored families (`construction`, `financial_services`,
+`healthcare`, ...) and an `unknown` sentinel. No scoring weight changed, and
+the frozen M0 benchmark output is byte-for-byte identical.
+
+### 3. Unknown is not zero
+
+This is the distinction the whole layer exists for:
+
+| | score | bounds | completeness |
+|---|---|---|---|
+| **known negative** — `"Construction"`, mapped deliberately, not the ICP | 0.0 | tightened | counts as known |
+| **unknown** — `"Pet Grooming Franchises"`, no mapping | 0.0 | stays open | counts as missing |
+
+Same number, opposite epistemics. Only the first is a reason to stop buying
+evidence. `arie.scoring.rules.is_unknown` is what separates them, and
+`arie.scoring.engine` reads it for both bounds and completeness. An unmappable
+value is reported in the adapter's `unmapped` audit rather than stored — the
+raw string is preserved so a missing alias-table row is actionable rather than
+a mystery.
+
+### 4. Spend caps, checked before the call
+
+Two ceilings, enforced against the durable `provider_calls` ledger (so they
+hold across workers and restarts, not per-process) *before* any request is
+made:
+
+| variable | default | approx. Abstract calls |
+|---|---|---|
+| `LIVE_PROVIDER_DAILY_BUDGET_USD` | `2.00` | ~1,200/day |
+| `LIVE_PROVIDER_PER_LEAD_BUDGET_USD` | `0.05` | ~30/lead |
+
+Server-side only; never exposed to a browser. A refusal is a first-class stop
+reason (`per_lead_budget_exhausted` / `daily_budget_exhausted`) that sends the
+lead to a human — never a silent skip, and never a decision made on partial
+evidence pretending to be complete. A provider timeout or error is likewise
+its own stop reason (`provider_failed`) rather than being folded into "every
+provider was called", which would claim the evidence does not exist rather than
+that ARIE failed to fetch it. Neither case fails the job: a vendor outage is
+not a reason to lose a real lead.
+
+Known limit, stated rather than papered over: the cap is *soft* under
+concurrency. Two workers can both read the same total and both proceed. The
+overshoot is bounded by (concurrent workers times per-call cost) — cents — and
+the exact alternative buys that precision with a new failure mode.
+
+### The reference ICP
+
+`arie.icp.REFERENCE_ICP_V1` is one named, versioned profile — B2B software/SaaS,
+50-1,000 employees, US/UK/AU/CA, sold to revenue-side leaders — in one place
+rather than as constants scattered through adapters. It is *a* reference
+profile chosen to make the live path concrete, not a claim about every
+business, and it is **descriptive, not a second scorer**: `arie.scoring.rules`
+remains the only thing that turns facts into a number.
+
+Two folds are recorded rather than hidden. `revenue_operations` and `growth`
+have no weight in the scorer, so they map to `operations`/`marketing` —
+introducing them as canonical values would make ARIE's own highest-intent
+functions score 0.0. `head` maps to `director` rather than `vp`, the
+conservative direction.
+
+Geography and the student/freelancer disqualifiers are **declared but
+unobservable**: no configured provider supplies them. They are reported as
+`UNOBSERVABLE` rather than dropped or, far worse, guessed. ARIE never invents a
+`disqualifying_flag`.
+
+### Next provider: Apollo (contract only, not integrated)
+
+Abstract supplies company firmographics only, leaving `title_seniority` (20
+points) and `title_function` (15) unknown for every live lead — 35 of the
+scorer's 90 reachable points. `arie.providers.apollo_contract` defines what an
+Apollo person-enrichment adapter must return and how it normalizes, tested
+against fixtures in `tests/fixtures/apollo/`.
+
+It makes **no network calls and reads no API key**. There is no HTTP client, no
+`fetch`, and it is not registered with any worker. It is already listed in
+`arie.live.providers.LIVE_PROVIDER_NAMES` so the spend caps cover it from the
+moment it is wired rather than from the moment someone remembers to add it.
+
+Apollo's intent and job-change data is deliberately unused: `buying_intent` is
+the largest field in the ruleset and the vendor's methodology is not
+inspectable.
+
 ---
+
 
 ## Shadow mode
 

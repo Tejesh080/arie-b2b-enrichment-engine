@@ -1,6 +1,6 @@
 """PostgresEvidenceStore against a real Postgres database.
 
-Requires DATABASE_URL / DATABASE_DIRECT_URL; skipped otherwise (see
+Requires TEST_DATABASE_URL; skipped otherwise (see
 conftest.py). Mirrors the semantics tests/unit/test_evidence_decay.py already
 pins for `Evidence.effective_confidence` — this file is about the *storage*
 layer keeping those semantics intact through a round trip, not re-testing decay

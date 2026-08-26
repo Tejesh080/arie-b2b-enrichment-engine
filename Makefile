@@ -1,4 +1,4 @@
-.PHONY: help install dev-install lint fmt type test test-all dataset validate-dataset bench clean db-migrate serve worker sync-supabase-migrations check-supabase-migrations
+.PHONY: help install dev-install lint fmt type test test-all test-db test-db-status dataset validate-dataset bench clean db-migrate serve worker sync-supabase-migrations check-supabase-migrations
 
 help:
 	@echo "Adaptive Revenue Intelligence Engine"
@@ -8,7 +8,9 @@ help:
 	@echo "  make fmt             Ruff format"
 	@echo "  make type            mypy strict"
 	@echo "  make test            Unit tests (no DB, no network)"
-	@echo "  make test-all        Include integration tests (needs DATABASE_URL)"
+	@echo "  make test-all        Include integration tests (needs TEST_DATABASE_URL)"
+	@echo "  make test-db         Designate a disposable integration-test database"
+	@echo "  make test-db-status  Show which database the integration suite would use"
 	@echo ""
 	@echo "  make dataset         Generate the seeded eval dataset"
 	@echo "  make validate-dataset  Assert the dataset is non-trivial (CI gate)"
@@ -41,6 +43,17 @@ test:
 
 test-all:
 	pytest
+
+# Integration tests read TEST_DATABASE_URL and never fall back to DATABASE_URL,
+# so a developer machine with a production .env cannot aim them at a deployment.
+# `test-db` creates the database if needed and stamps the designation marker the
+# suite requires; it refuses to stamp anything matching DATABASE_URL or holding
+# existing data. See scripts/test_db.py.
+test-db:
+	python scripts/test_db.py designate
+
+test-db-status:
+	python scripts/test_db.py status
 
 # --- M0: the proof -----------------------------------------------------------
 # Everything below runs offline, deterministically, with zero credentials.

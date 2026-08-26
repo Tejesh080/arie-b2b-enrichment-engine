@@ -1,0 +1,11 @@
+{
+  "person": {
+    "name": "Sam Reyes",
+    "email": "sam.reyes@harborline.test",
+    "title": "Head of Growth Marketing",
+    "organization": {
+      "name": "Harborline",
+      "primary_domain": "harborline.test"
+    }
+  }
+}

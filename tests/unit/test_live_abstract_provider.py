@@ -18,10 +18,12 @@ import pytest
 
 from arie.config import LiveProviderConfig
 from arie.core.types import Entity, ProviderStatus
+from arie.normalization.taxonomy import CANONICAL_INDUSTRIES
 from arie.providers.live_abstract import (
     AbstractCompanyConfigurationError,
     AbstractCompanyEnrichmentProvider,
 )
+from arie.scoring.rules import field_points
 
 _FAKE_KEY = "sk-live-test-secret-do-not-leak"
 
@@ -92,10 +94,74 @@ def test_success_maps_employee_count_and_industry() -> None:
     assert result.confidence > 0.0
 
 
-def test_industry_is_lowercased_and_stripped() -> None:
+def test_industry_is_mapped_onto_the_canonical_vocabulary_not_merely_lowercased() -> None:
+    """Live V1 Foundation. This test previously asserted the *bug*: that
+    ``"  Financial Technology  "`` reached the scorer as the literal string
+    ``"financial technology"``, which ``_INDUSTRY_POINTS`` has no key for and
+    therefore scored 0.0 — a fintech company assessed as worthless. The adapter
+    now maps it deliberately."""
     provider = _provider_with(_json_response(200, {"industry": "  Financial Technology  "}))
     result = provider.fetch(_entity())
-    assert result.fields["industry"] == "financial technology"
+    assert result.fields["industry"] == "fintech"
+    assert field_points("industry", result.fields["industry"]) > 0.0
+
+
+def test_an_unmappable_industry_is_reported_not_scored_as_zero() -> None:
+    """The other half of the same distinction: a category ARIE has no mapping
+    for must not arrive as a canonical value at all. With no other usable
+    field, that leaves nothing to score and the call is a MISS — never a
+    SUCCESS carrying a silently-worthless industry."""
+    provider = _provider_with(_json_response(200, {"industry": "Pet Grooming Franchises"}))
+    result = provider.fetch(_entity())
+
+    assert result.status is ProviderStatus.MISS
+    assert "industry" not in result.fields
+    assert result.raw["normalization"]["unmapped"] == [
+        {"field": "industry", "raw": "Pet Grooming Franchises"}
+    ]
+    assert result.raw["normalization"]["mapped"] == []
+
+
+def test_a_successful_call_carries_the_raw_to_canonical_mapping_it_made() -> None:
+    """Phase 7's auditability requirement, checked hermetically. A live call
+    must be able to say what the vendor sent *and* what ARIE decided it meant,
+    or the mapping is unverifiable in production."""
+    provider = _provider_with(
+        _json_response(200, {"employee_count": 2579, "industry": "computer software"})
+    )
+    result = provider.fetch(_entity())
+
+    assert result.status is ProviderStatus.SUCCESS
+    assert result.raw["normalization"]["mapped"] == [
+        {"field": "employee_count", "raw": "2579", "canonical": 2579},
+        {"field": "industry", "raw": "computer software", "canonical": "software"},
+    ]
+
+
+def test_the_provenance_never_carries_the_api_key() -> None:
+    """`raw` is printed by the smoke script and attached to spans. The one
+    thing it must never contain is the credential, which travels as a query
+    parameter because Abstract offers no header alternative."""
+    provider = _provider_with(_json_response(200, {"industry": "computer software"}))
+    result = provider.fetch(_entity())
+    assert _FAKE_KEY not in json.dumps(result.raw)
+
+
+def test_every_industry_the_adapter_emits_is_canonical() -> None:
+    """The boundary invariant, checked at the adapter rather than only at the
+    normalizer: no raw provider vocabulary can reach the evidence store."""
+    for raw in (
+        "Computer Software",
+        "computer software",
+        "SaaS",
+        "software development",
+        "Hospital & Health Care",
+        "Management Consulting",
+        "Non-profit Organization Management",
+    ):
+        provider = _provider_with(_json_response(200, {"industry": raw}))
+        fields = provider.fetch(_entity()).fields
+        assert fields["industry"] in CANONICAL_INDUSTRIES, raw
 
 
 def test_a_float_employee_count_is_coerced_to_int() -> None:

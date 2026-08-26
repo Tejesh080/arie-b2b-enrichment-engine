@@ -20,7 +20,7 @@ from typing import Any
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
-from tests.integration.conftest import IngestCleanup
+from tests.integration.conftest import IngestCleanup, source_for
 
 from arie.api.main import AppState, create_app
 from arie.config import POLICY
@@ -43,7 +43,7 @@ def _identity(cleanup: IngestCleanup) -> tuple[str, str]:
 
 def _payload(email: str, domain: str | None = None, **overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "source": "webhook",
+        "source": source_for("webhook"),
         "email": email,
         "external_ref": f"crm-{uuid.uuid4().hex[:10]}",
         "company_name": "Acme Incorporated",
@@ -89,7 +89,7 @@ def test_post_lead_creates_identity_lead_event_and_job(
     assert lead is not None
     assert str(lead[0]) == body["person_id"]
     assert str(lead[1]) == body["company_id"]
-    assert lead[2] == "webhook"
+    assert lead[2] == source_for("webhook")
     assert lead[3] == LeadStatus.NEW
 
     # Identity resolution actually ran in the request path — the whole point of
@@ -164,7 +164,7 @@ def test_redelivering_the_same_record_creates_no_second_lead_or_job(
         _count(
             db_conn,
             "SELECT count(*) FROM leads WHERE source = %s AND external_ref = %s",
-            ("webhook", payload["external_ref"]),
+            (source_for("webhook"), payload["external_ref"]),
         )
         == 1
     )
@@ -349,7 +349,11 @@ def test_invalid_email_is_rejected_before_anything_is_written(
 
     response = api_client.post(
         "/leads",
-        json={"source": "webhook", "email": "not-an-email", "external_ref": external_ref},
+        json={
+            "source": source_for("webhook"),
+            "email": "not-an-email",
+            "external_ref": external_ref,
+        },
     )
 
     assert response.status_code == 422
@@ -375,7 +379,7 @@ def test_get_lead_returns_status_and_a_zero_cost_rollup(
     assert body["lead_id"] == lead_id
     assert body["status"] == LeadStatus.NEW
     assert body["version"] == 1
-    assert body["source"] == "webhook"
+    assert body["source"] == source_for("webhook")
     assert Decimal(str(body["cost"]["total_cost_usd"])) == Decimal(0)
     assert body["cost"]["provider_calls"] == 0
     assert body["cost"]["cache_hits"] == 0

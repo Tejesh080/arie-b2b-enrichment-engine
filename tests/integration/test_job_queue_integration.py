@@ -1,6 +1,6 @@
 """PostgresJobQueue against a real Postgres database.
 
-Requires DATABASE_URL / DATABASE_DIRECT_URL; skipped otherwise (see
+Requires TEST_DATABASE_URL; skipped otherwise (see
 conftest.py). Covers: concurrent claiming (SELECT ... FOR UPDATE SKIP
 LOCKED), duplicate prevention (idempotency_key dedup), retry/backoff/DLQ
 progression (including lease-expiry reclaim), and rollback safety.

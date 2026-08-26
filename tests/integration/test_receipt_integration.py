@@ -24,7 +24,7 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from psycopg_pool import ConnectionPool
-from tests.integration.conftest import IngestCleanup
+from tests.integration.conftest import IngestCleanup, source_for
 
 from arie.core.types import LeadStatus
 from arie.evalgen.schema import EvalLead
@@ -79,7 +79,7 @@ def _ingest(
     response = api_client.post(
         "/leads",
         json={
-            "source": "receipt-it",
+            "source": source_for("receipt"),
             "email": email,
             "external_ref": f"receipt-{uuid.uuid4().hex[:12]}",
             "company_domain": domain,
@@ -157,7 +157,7 @@ def test_a_freshly_ingested_lead_has_a_pending_receipt(
     ingest = api_client.post(
         "/leads",
         json={
-            "source": "receipt-it",
+            "source": source_for("receipt"),
             "email": email,
             "external_ref": f"receipt-{uuid.uuid4().hex[:10]}",
             "company_domain": domain,
@@ -323,7 +323,7 @@ def test_a_second_lead_at_a_known_company_shows_cache_hits(
     second_response = api_client.post(
         "/leads",
         json={
-            "source": "receipt-it",
+            "source": source_for("receipt"),
             "email": AUTONOMOUS_EMAIL,
             "external_ref": f"receipt-{uuid.uuid4().hex[:12]}",
             "company_domain": AUTONOMOUS_DOMAIN,

@@ -100,6 +100,13 @@ from arie.evidence.store import PostgresEvidenceStore
 from arie.evidence.ttl_policy import ttl_for_field
 from arie.identity.normalize import domain_from_email, normalize_domain, normalize_email
 from arie.ledger.store import PostgresCostLedger
+from arie.live.budget import LiveSpendGuard
+from arie.live.safety import (
+    LIVE_GUARD_REASON,
+    autonomy_allowed_for,
+    guarded_route,
+    verify_live_status,
+)
 from arie.observability.tracing import get_tracer, set_attributes, traced
 from arie.policy.base import EvidenceCache, PolicyOutcome, RunContext
 from arie.providers.base import EnrichmentProvider, ProviderRegistry
@@ -165,10 +172,14 @@ def decision_route(decision: Decision, autonomous: bool) -> str:
     non-autonomous result escalates *whatever* the decision label says, and a
     policy that itself concluded ``escalate_human`` escalates even when
     confident about that conclusion.
+
+    The *unguarded* rule, which is what the simulated path (and the demo, and
+    the benchmark's own reporting) wants: simulated autonomy is validated
+    against an oracle on held-out data. Live mode goes through
+    ``arie.live.safety.guarded_route`` with ``autonomy_allowed=False``. Both
+    are the same function so the two paths cannot drift on the unguarded half.
     """
-    if not autonomous or decision is Decision.ESCALATE_HUMAN:
-        return "escalate_human"
-    return str(decision)
+    return guarded_route(decision, autonomous, autonomy_allowed=True)
 
 
 @dataclass(frozen=True)
@@ -477,6 +488,7 @@ def _finalize_decision(
     decision: Decision,
     autonomous: bool,
     is_shadow: bool,
+    autonomy_allowed: bool = True,
 ) -> LeadStatus:
     """The DECISION node's branch — shared by every ``compute_score`` variant
     (simulated/corpus and live/real) so shadow semantics can't drift between
@@ -495,6 +507,18 @@ def _finalize_decision(
     excludes. `decision`/`autonomous` are still frozen into `decision_receipts`
     by the caller before this runs, so the receipt reports "ARIE would have
     escalated this" rather than losing the recommendation.
+
+    **Live V1 Foundation — `autonomy_allowed`.** The live handler passes
+    ``arie.live.safety.autonomy_allowed_for(provider_mode)``, which is
+    currently ``False`` for live mode: a real-provider lead is escalated to a
+    human no matter what it scored or how confident the model was, because
+    that confidence is calibrated on synthetic data (see
+    ``arie.live.safety``'s module docstring for the full argument). The
+    simulated path keeps the default ``True`` and is byte-for-byte unchanged.
+
+    Note the ordering: the shadow branch is tested *first*, because a shadow
+    lead is already non-authoritative and opening a real ``human_reviews`` row
+    for it would manufacture the human action shadow mode exists to avoid.
     """
     if is_shadow:
         apply_transition(
@@ -503,14 +527,26 @@ def _finalize_decision(
             expected_version=version,
             new_status=LeadStatus.SHADOW_EVALUATED,
             event_type="policy:shadow_evaluated",
-            payload={"decision": str(decision), "autonomous": autonomous},
+            payload={
+                "decision": str(decision),
+                "autonomous": autonomous,
+                "autonomy_allowed": autonomy_allowed,
+            },
         )
         return LeadStatus.SHADOW_EVALUATED
 
-    route = decision_route(decision, autonomous)
+    route = guarded_route(decision, autonomous, autonomy_allowed=autonomy_allowed)
     if route == "escalate_human":
+        # `original_decision` carries the *recommendation*, unrewritten, so a
+        # reviewer of a guard-suppressed lead sees "ARIE would have auto-routed
+        # this" rather than an escalation with no explanation. The guard reason
+        # rides in the `lead:escalated` event payload.
         request_review(
-            conn, lead_id=lead_id, expected_version=version, original_decision=str(decision)
+            conn,
+            lead_id=lead_id,
+            expected_version=version,
+            original_decision=str(decision),
+            reason=None if autonomy_allowed else LIVE_GUARD_REASON,
         )
         return LeadStatus.AWAITING_HUMAN
 
@@ -769,13 +805,32 @@ def _build_live_handlers(
     fitted on synthetic corpus signals to real evidence is an unvalidated
     assumption, stated here and in `docs/architecture.md`'s P5 section, not
     quietly treated as equivalent to the simulated path's own guarantee.
+
+    **Live V1 Foundation — that unvalidated assumption is now enforced rather
+    than only documented.** `autonomy_allowed` is `False` for this mode
+    (`arie.live.safety`), so the confidence/tau comparison below still runs and
+    is still frozen into the receipt — it is the recommendation a reviewer
+    reads — but it can no longer *act*. Every non-shadow live lead lands on
+    AWAITING_HUMAN; every shadow one lands on SHADOW_EVALUATED;
+    `verify_live_status` asserts it.
+
+    **Live V1 Foundation — spend caps.** `LiveSpendGuard` is consulted before
+    the provider call, never after. A refusal is a first-class stop reason
+    (`per_lead_budget_exhausted` / `daily_budget_exhausted`), not an exception
+    and not a silent skip: the lead still gets a receipt describing exactly
+    what it decided on and why it stopped. A provider ERROR/TIMEOUT is
+    likewise its own stop reason (`provider_failed`) rather than being folded
+    into `all_providers_called`, which would have claimed the provider was
+    called and had nothing to add.
     """
     provider = (
         live_provider if live_provider is not None else AbstractCompanyEnrichmentProvider.build()
     )
     evidence_store = PostgresEvidenceStore(pool)
     cost_ledger = PostgresCostLedger(pool)
+    spend_guard = LiveSpendGuard(pool)
     model = resolved_runtime.policy.model
+    autonomy_allowed = autonomy_allowed_for("live")
 
     def compute_score(ctx: JobContext) -> None:
         job = ctx.job
@@ -806,46 +861,69 @@ def _build_live_handlers(
                 stop_reason = "confidence_reached"
             elif can_call_provider:
                 assert identity.canonical_domain is not None  # can_call_provider guarantees this
-                entity = Entity(
-                    entity_type="company",
-                    entity_id=identity.company_id,
-                    canonical_key=identity.canonical_domain,
+                # Asked BEFORE the call, never after: for a metered API, the
+                # moment you discover you exceeded a cap is the moment the
+                # check needed to have already happened.
+                allowance = spend_guard.allowance(
+                    lead_id=job.lead_id, estimated_cost_usd=provider.base_cost_usd
                 )
-                result = provider.fetch(entity)
-                cost_ledger.record_provider_call(
-                    idempotency_key=f"job:{job.job_id}:{provider.name}:{entity.canonical_key}",
-                    provider=provider.name,
-                    entity_type="company",
-                    entity_id=identity.company_id,
-                    status=result.status,
-                    cost_usd=result.cost_usd,
-                    latency_ms=result.latency_ms,
-                    lead_id=job.lead_id,
-                    cache_hit=False,
-                )
-                if result.status is ProviderStatus.SUCCESS and result.fields:
-                    evidence_store.put_many(
-                        Evidence(
-                            entity_type="company",
-                            entity_id=identity.company_id,
-                            field_name=field_name,
-                            value=value,
-                            source=provider.name,
-                            confidence=result.confidence,
-                            ttl_seconds=ttl_for_field(field_name),
-                            fetched_at=now,
-                        )
-                        for field_name, value in result.fields.items()
-                    )
-                    fresh = evidence_store.get_all_fresh("company", identity.company_id, now=now)
-                    scoring = score_evidence(fresh, now)
-
-                if scoring.bounds.is_settled:
-                    stop_reason = "decision_settled"
-                elif fresh and model.predict(scoring) >= model.tau:
-                    stop_reason = "confidence_reached"
+                set_attributes(span, {f"arie.budget.{k}": v for k, v in allowance.audit().items()})
+                if not allowance.permitted:
+                    assert allowance.reason is not None  # set whenever not permitted
+                    stop_reason = allowance.reason
                 else:
-                    stop_reason = "all_providers_called"
+                    entity = Entity(
+                        entity_type="company",
+                        entity_id=identity.company_id,
+                        canonical_key=identity.canonical_domain,
+                    )
+                    result = provider.fetch(entity)
+                    cost_ledger.record_provider_call(
+                        idempotency_key=f"job:{job.job_id}:{provider.name}:{entity.canonical_key}",
+                        provider=provider.name,
+                        entity_type="company",
+                        entity_id=identity.company_id,
+                        status=result.status,
+                        cost_usd=result.cost_usd,
+                        latency_ms=result.latency_ms,
+                        lead_id=job.lead_id,
+                        cache_hit=False,
+                    )
+                    if result.status is ProviderStatus.SUCCESS and result.fields:
+                        evidence_store.put_many(
+                            Evidence(
+                                entity_type="company",
+                                entity_id=identity.company_id,
+                                field_name=field_name,
+                                value=value,
+                                source=provider.name,
+                                confidence=result.confidence,
+                                ttl_seconds=ttl_for_field(field_name),
+                                fetched_at=now,
+                            )
+                            for field_name, value in result.fields.items()
+                        )
+                        fresh = evidence_store.get_all_fresh(
+                            "company", identity.company_id, now=now
+                        )
+                        scoring = score_evidence(fresh, now)
+
+                    if scoring.bounds.is_settled:
+                        stop_reason = "decision_settled"
+                    elif fresh and model.predict(scoring) >= model.tau:
+                        stop_reason = "confidence_reached"
+                    elif result.status in (ProviderStatus.ERROR, ProviderStatus.TIMEOUT):
+                        # The provider broke. Distinct from "called it and it
+                        # had nothing" (`all_providers_called`), which would
+                        # claim the evidence genuinely does not exist. The job
+                        # deliberately does NOT fail: a transport failure at one
+                        # vendor is not a reason to lose the lead, and the guard
+                        # sends it to a human anyway. The `error_kind` is on the
+                        # ledger row and the provider result's `raw`.
+                        stop_reason = "provider_failed"
+                    else:
+                        stop_reason = "all_providers_called"
+                    set_attributes(span, {"arie.provider_status": str(result.status)})
             elif identity.canonical_domain is None:
                 # Nothing to enrich by at all -- the one real provider
                 # requires a domain this lead never resolved one for.
@@ -873,7 +951,13 @@ def _build_live_handlers(
                 stop_reason = "all_providers_called"
 
             confidence = model.predict(scoring)
-            autonomous = confidence >= model.tau
+            model_autonomous = confidence >= model.tau
+            # `autonomous` on the receipt is what ARIE *did*, not what the
+            # model thought — writing True here while the guard escalated the
+            # lead anyway would make the receipt's own "autonomous action"
+            # column a lie, and that column is the one a reviewer trusts to
+            # tell recommendation from action apart.
+            autonomous = model_autonomous and autonomy_allowed
 
             with ctx.conn.cursor() as cur:
                 cur.execute(
@@ -905,13 +989,16 @@ def _build_live_handlers(
                     },
                 )
 
-            final = _finalize_decision(
-                ctx.conn,
-                lead_id=job.lead_id,
-                version=version,
-                decision=scoring.decision,
-                autonomous=autonomous,
-                is_shadow=identity.is_shadow,
+            final = verify_live_status(
+                _finalize_decision(
+                    ctx.conn,
+                    lead_id=job.lead_id,
+                    version=version,
+                    decision=scoring.decision,
+                    autonomous=model_autonomous,
+                    is_shadow=identity.is_shadow,
+                    autonomy_allowed=autonomy_allowed,
+                )
             )
 
             set_attributes(
@@ -920,6 +1007,9 @@ def _build_live_handlers(
                     "arie.decision": str(scoring.decision),
                     "arie.confidence": confidence,
                     "arie.autonomous": autonomous,
+                    "arie.model_autonomous": model_autonomous,
+                    "arie.autonomy_allowed": autonomy_allowed,
+                    "arie.autonomy_guard": None if autonomy_allowed else LIVE_GUARD_REASON,
                     "arie.lead.final_status": str(final),
                     "arie.stop_reason": stop_reason,
                     "arie.shadow": identity.is_shadow,

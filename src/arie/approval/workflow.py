@@ -175,6 +175,7 @@ def request_review(
     expected_version: int,
     original_decision: str | None,
     reviewer: str | None = None,
+    reason: str | None = None,
 ) -> PendingReview:
     """Escalate a lead to a human, atomically. Does not commit.
 
@@ -185,19 +186,37 @@ def request_review(
     lead in AWAITING_HUMAN with no review for a human to act on -- which looks
     exactly like a lead genuinely mid-review and is just as hard to notice as
     the lost-job window `arie.api.ingest`'s docstring describes for ingestion.
+
+    `reason` (Live V1 Foundation) records *why* the escalation happened when it
+    was not the ordinary "the policy was not confident enough" -- specifically
+    ``arie.live.safety.LIVE_GUARD_REASON``, where a confident recommendation
+    was overridden because live-mode autonomy is not yet validated. It goes
+    into the `lead:escalated` event payload rather than onto `human_reviews`:
+    the reason describes this one escalation event, the review row is about
+    the review's lifecycle, and a nullable column that is null for every
+    simulated lead ever escalated would be the wrong shape for both. `None`
+    keeps the payload byte-identical to before, so no existing consumer of
+    that event sees a new key.
     """
     with traced(
         _TRACER,
         "review.request",
-        attributes={"arie.lead_id": lead_id, "arie.original_decision": original_decision},
+        attributes={
+            "arie.lead_id": lead_id,
+            "arie.original_decision": original_decision,
+            "arie.escalation_reason": reason,
+        },
     ) as span:
+        payload: dict[str, str | None] = {"original_decision": original_decision}
+        if reason is not None:
+            payload["reason"] = reason
         apply_transition(
             conn,
             lead_id=lead_id,
             expected_version=expected_version,
             new_status=LeadStatus.AWAITING_HUMAN,
             event_type="lead:escalated",
-            payload={"original_decision": original_decision},
+            payload=payload,
         )
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(

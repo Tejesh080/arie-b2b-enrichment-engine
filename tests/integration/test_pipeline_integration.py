@@ -31,7 +31,7 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from psycopg_pool import ConnectionPool
-from tests.integration.conftest import IngestCleanup
+from tests.integration.conftest import IngestCleanup, source_for
 
 from arie.core.types import LeadStatus
 from arie.evalgen.schema import EvalLead
@@ -99,7 +99,7 @@ def _ingest_corpus_lead(
     response = api_client.post(
         "/leads",
         json={
-            "source": "pipeline-it",
+            "source": source_for("pipeline"),
             "email": lead.person.email,
             "external_ref": f"pipe-{uuid.uuid4().hex[:12]}",
             "company_domain": lead.company.canonical_domain,
@@ -397,7 +397,7 @@ def test_an_out_of_corpus_lead_is_synthesized_and_processed_to_a_terminal_status
     response = api_client.post(
         "/leads",
         json={
-            "source": "pipeline-it",
+            "source": source_for("pipeline"),
             "email": email,
             "external_ref": f"synth-{marker}",
             "company_domain": domain,
@@ -441,7 +441,7 @@ def test_a_dead_lettered_job_marks_its_lead_dead_letter(
     contract in arie.statemachine.transitions — rather than sitting in NEW
     while its pollers wait forever. Driven with an empty handler registry so
     the job dead-letters deterministically on its first attempt."""
-    lead_id, _version = make_lead(source="deadletter-it")
+    lead_id, _version = make_lead(source=source_for("deadletter"))
     enqueued = job_queue.enqueue(lead_id=lead_id, job_type="compute_score")
     cleanup_jobs.append(enqueued.job_id)
 

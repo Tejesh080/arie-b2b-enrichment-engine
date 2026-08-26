@@ -1,0 +1,18 @@
+{
+  "person": {
+    "name": "Robin Ashworth",
+    "email": "robin@meridian-labs.test",
+    "title": "Director of Sales Operations",
+    "seniority": "director",
+    "departments": ["operations"],
+    "intent_strength": "high",
+    "intent_topics": ["revenue intelligence", "lead scoring"],
+    "job_start_date": "2026-07-01",
+    "organization": {
+      "name": "Meridian Labs",
+      "primary_domain": "meridian-labs.test",
+      "latest_funding_round_date": "2026-05-14",
+      "latest_funding_stage": "Series B"
+    }
+  }
+}

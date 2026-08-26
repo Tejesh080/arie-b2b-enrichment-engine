@@ -297,3 +297,7 @@ actually win — none tested here.
   configured figures, not real vendor spend. Only the P5 Abstract API
   verification involved actual billed calls (and at $0.00165/call, real but
   small).
+- "ARIE autonomously qualifies real leads" — it does not, and is blocked in
+  code from doing so. Autonomy is validated only on the synthetic corpus; a
+  lead enriched by a real provider always ends at a human. Live mode
+  enriches, scores, and recommends. See docs/provider-integration.md.

@@ -1,0 +1,13 @@
+{
+  "person": {
+    "name": "Alex Vance",
+    "email": "alex@vibes.test",
+    "title": "Vibes Curator",
+    "seniority": "sparkle_tier_3",
+    "departments": ["chaos_engineering_of_feelings"],
+    "organization": {
+      "name": "Vibes Inc",
+      "primary_domain": "vibes.test"
+    }
+  }
+}

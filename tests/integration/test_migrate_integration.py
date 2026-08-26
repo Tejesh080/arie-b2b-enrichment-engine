@@ -14,16 +14,14 @@ import psycopg
 import pytest
 from scripts.migrate import checksum_of, migrate, migration_files
 
-from arie.config import DatabaseConfig
 from arie.migrations import MigrationsDirectoryError, pending_migrations
 
 pytestmark = pytest.mark.integration
 
 
-def test_migrating_twice_is_idempotent(migrated_database: str) -> None:
+def test_migrating_twice_is_idempotent(migrated_database_direct: str) -> None:
     # `migrated_database` (session-scoped) already applied everything once.
-    db = DatabaseConfig()
-    applied_again = migrate(db.direct_url)
+    applied_again = migrate(migrated_database_direct)
     assert applied_again == []
 
 
@@ -133,8 +131,16 @@ def test_pending_migrations_fails_closed_on_a_bad_migrations_dir(
 
 
 def test_reapplying_a_changed_migration_raises(
-    migrated_database: str, db_conn: psycopg.Connection
+    migrated_database_direct: str, db_conn: psycopg.Connection
 ) -> None:
+    """Corrupts a checksum row, then asserts the runner refuses to proceed.
+
+    The corruption and the ``migrate()`` call have to target the *same*
+    database, which is why this takes a fixture rather than reading config: it
+    previously corrupted the test database and then ran the migration runner
+    against production, where the checksum was of course still valid — so the
+    test asserted nothing and touched a deployment to do it.
+    """
     with db_conn.cursor() as cur:
         cur.execute(
             "UPDATE schema_migrations SET checksum = 'deliberately-wrong' WHERE filename = %s",
@@ -142,10 +148,9 @@ def test_reapplying_a_changed_migration_raises(
         )
     db_conn.commit()
 
-    db = DatabaseConfig()
     try:
         with pytest.raises(RuntimeError, match="checksum"):
-            migrate(db.direct_url)
+            migrate(migrated_database_direct)
     finally:
         # Restore the real checksum so later tests / re-runs aren't left broken.
         real = next(f for f in migration_files() if f.name == "0001_init.sql")

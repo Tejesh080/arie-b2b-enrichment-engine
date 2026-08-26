@@ -42,6 +42,7 @@ from arie.scoring.rules import (
     SCORED_FIELDS,
     decide,
     is_disqualified,
+    is_known,
     score_facts,
 )
 
@@ -142,7 +143,13 @@ def compute_bounds(facts: Mapping[str, Any]) -> ScoreBounds:
         # Nothing can rescue a confirmed blocker; the score is pinned at zero.
         return ScoreBounds(current=0.0, lower=0.0, upper=0.0)
 
-    unknown = [name for name in SCORED_FIELDS if facts.get(name) is None]
+    # `is_known`, not `is not None`: a field carrying the UNKNOWN sentinel was
+    # observed and could not be mapped, which is epistemically identical to
+    # never having been observed. Treating it as known would collapse the
+    # reachable upper bound onto a value nobody actually established — the
+    # exact "unrecognised vocabulary behaves like a bad fit" failure the
+    # canonical taxonomy layer exists to prevent.
+    unknown = [name for name in SCORED_FIELDS if not is_known(facts, name)]
 
     # Unknown additive fields contribute zero today and at most their ceiling
     # later, so they only raise the upper bound.
@@ -163,8 +170,11 @@ def compute_signals(
     resolutions: Mapping[str, FieldResolution],
     stale_fields: Iterable[str] = (),
 ) -> EvidenceSignals:
-    known = tuple(name for name in SCORED_FIELDS if facts.get(name) is not None)
-    unknown = tuple(name for name in SCORED_FIELDS if facts.get(name) is None)
+    # Same `is_known` reasoning as compute_bounds: an unmappable value must
+    # count against completeness, not toward it. A lead whose every field came
+    # back as vocabulary ARIE could not read must read as 0% complete, not 100%.
+    known = tuple(name for name in SCORED_FIELDS if is_known(facts, name))
+    unknown = tuple(name for name in SCORED_FIELDS if not is_known(facts, name))
 
     total_weight = sum(COMPLETENESS_WEIGHTS.values())
     known_weight = sum(COMPLETENESS_WEIGHTS.get(name, 0.0) for name in known)

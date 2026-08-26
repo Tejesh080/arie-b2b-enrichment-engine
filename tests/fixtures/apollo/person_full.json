@@ -1,0 +1,22 @@
+{
+  "person": {
+    "id": "5f1a2b3c4d5e6f7a8b9c0d1e",
+    "first_name": "Dana",
+    "last_name": "Okafor",
+    "name": "Dana Okafor",
+    "email": "dana.okafor@northwind-analytics.test",
+    "linkedin_url": "https://www.linkedin.com/in/dana-okafor-example",
+    "title": "VP of Revenue Operations",
+    "seniority": "vp",
+    "departments": ["operations"],
+    "subdepartments": ["revenue_operations"],
+    "organization": {
+      "id": "6a1b2c3d4e5f6a7b8c9d0e1f",
+      "name": "Northwind Analytics",
+      "website_url": "http://www.northwind-analytics.test",
+      "primary_domain": "northwind-analytics.test",
+      "industry": "computer software",
+      "estimated_num_employees": 240
+    }
+  }
+}

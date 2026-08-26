@@ -82,6 +82,49 @@ _TRIGGER_POINTS = 10.0
 # because it does not behave like the additive fields.
 DISQUALIFIER_FIELD = "disqualifying_flag"
 
+# --- unknown vs. known-negative ----------------------------------------------
+#
+# The sentinel a normalization layer emits when a real provider said something
+# this ruleset has no mapping for (``arie.normalization.taxonomy``). It exists
+# because "0 points" is ambiguous between two states that must never be
+# conflated:
+#
+#   * **known negative evidence** — the provider said "construction", we
+#     mapped it deliberately, and construction earns nothing under this ICP.
+#     The field is *known*; the score is settled to that extent.
+#   * **missing/unknown evidence** — the provider said "pet grooming
+#     franchises", or nothing at all. We have no idea what this lead is. The
+#     field is *unknown* and can still move the score in either direction.
+#
+# Both contribute 0.0 to the total, and that is correct. What must differ is
+# every *bounds* and *completeness* consequence: an unknown field still raises
+# the reachable upper bound and still counts against completeness, while a
+# known-negative one does neither. ``arie.scoring.engine`` reads
+# ``is_unknown`` rather than ``value is None`` for exactly this reason.
+#
+# The synthetic corpus never produces this sentinel — every generated value
+# comes from the closed vocabularies in ``arie.evalgen.generator`` — so nothing
+# below changes a single frozen benchmark number. It is the live path's
+# vocabulary, understood defensively by the scorer.
+UNKNOWN = "unknown"
+
+
+def is_unknown(value: Any) -> bool:
+    """True when ``value`` carries no usable evidence about its field.
+
+    ``None`` (never observed) and ``UNKNOWN`` (observed but unmappable) are the
+    same thing to every consumer of this module: absence of evidence. They are
+    kept as distinct *values* only so an audit trail can tell "we never asked"
+    apart from "we asked and could not use the answer".
+    """
+    return value is None or value == UNKNOWN
+
+
+def is_known(facts: Mapping[str, Any], field_name: str) -> bool:
+    """Whether ``facts`` holds usable evidence for ``field_name``."""
+    return not is_unknown(facts.get(field_name))
+
+
 # Fields the scorer knows how to consume. Anything else in a facts dict is
 # ignored rather than silently contributing.
 SCORED_FIELDS: tuple[str, ...] = (
@@ -141,11 +184,17 @@ def _size_points(employee_count: float) -> float:
 def field_points(field_name: str, value: Any) -> float:
     """Points a single field contributes at a given value.
 
-    Returns 0.0 for an unknown field or a ``None`` value. The disqualifier
-    always returns 0.0 — it is not additive, and folding it in as a large
-    negative weight would let a strong enough lead outscore a known blocker.
+    Returns 0.0 for an unknown field, a ``None`` value, or the ``UNKNOWN``
+    sentinel. The disqualifier always returns 0.0 — it is not additive, and
+    folding it in as a large negative weight would let a strong enough lead
+    outscore a known blocker.
+
+    Note that 0.0 here is *not* the caller's cue that a field is unknown: a
+    deliberately-mapped, genuinely-poor-fit value ("nonprofit" is 2.0, an
+    unlisted-but-recognised industry family is 0.0) scores low while remaining
+    known. Ask :func:`is_known` for that distinction, never the point value.
     """
-    if value is None:
+    if is_unknown(value):
         return 0.0
 
     if field_name == "employee_count":

@@ -2,17 +2,47 @@
 
 These are opt-in: every test in this package is marked ``integration`` and is
 excluded by ``make test`` (``pytest -m "not integration"``). They run under
-``make test-all``, which requires ``DATABASE_URL`` and ``DATABASE_DIRECT_URL``
-to be set — otherwise the session fixture below skips the whole package with a
-clear reason instead of failing on a missing connection.
+``make test-all``.
 
-These tests apply migrations and write and delete rows against whatever
-database the configured URLs point at. Point them at a disposable database or a
-Supabase branch, not a database you'd mind resetting.
+**They read ``TEST_DATABASE_URL``, never ``DATABASE_URL``, and there is no
+fallback between them.**
+
+That is not a stylistic preference. These fixtures used to read
+``DatabaseConfig`` — which on any developer machine with a populated ``.env``
+is the *deployed* database — and two things followed. The tests created and
+deleted rows in a live database; and the deployed worker, polling that same
+database, claimed the tests' freshly-ingested jobs within about a second and
+processed them with its own handlers, so assertions failed for reasons entirely
+unrelated to the code under test. Neither is fixable by remembering to override
+a variable, or by pausing the deployment before every run. The fix has to be
+that the production URL is not reachable from here at all.
+
+Three independent guards, in the order they fire:
+
+1. **A different variable.** No ``TEST_DATABASE_URL`` means the suite skips.
+   Nothing routes back to ``DATABASE_URL``.
+2. **Explicit intent.** ``ARIE_ALLOW_INTEGRATION_TEST_DB=1`` must also be set.
+   A URL can be inherited from a shell or a CI secret; this flag is meaningless
+   outside this suite, so setting it is a decision.
+3. **A property of the database itself.** The target must carry the marker
+   table that only ``scripts/test_db.py designate`` creates — and that command
+   refuses to stamp anything matching ``DATABASE_URL`` or holding existing
+   data. An environment variable cannot forge a table.
+
+Guards 1 and 2 *skip* (a missing opt-in is not a failure). A configuration that
+is present but dangerous or incomplete — the URL resolving to production, or an
+undesignated database — **fails loudly**: silently skipping a misconfiguration
+would let a run go green while testing nothing.
+
+Local setup is in ``scripts/test_db.py``'s docstring. The short version: point
+``TEST_DATABASE_URL`` at a *different database on the same local Postgres* than
+the Compose stack uses (``arie_test`` vs. ``arie``), so the Compose workers
+cannot see test jobs even while running.
 """
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from uuid import UUID
@@ -22,33 +52,122 @@ import pytest
 from fastapi.testclient import TestClient
 from psycopg_pool import ConnectionPool
 from scripts.migrate import migrate
+from scripts.test_db import IntegrationDatabaseGuardError, assert_not_production, marker_present
 
 from arie.api.main import AppState, build_state, create_app
-from arie.config import DatabaseConfig
+from arie.config import IntegrationDatabaseConfig
 from arie.evidence.store import PostgresEvidenceStore
 from arie.identity.resolver import IdentityResolver
 from arie.jobs.queue import PostgresJobQueue
 from arie.ledger.store import PostgresCostLedger
 
+_SETUP_HINT = (
+    "See scripts/test_db.py for setup. In short:\n"
+    "  docker compose up -d db\n"
+    "  export TEST_DATABASE_URL=postgresql://arie:arie_local_dev@localhost:5432/arie_test\n"
+    "  export ARIE_ALLOW_INTEGRATION_TEST_DB=1\n"
+    "  python scripts/test_db.py designate"
+)
 
-def _database_config() -> DatabaseConfig:
-    # Constructed fresh (not the module-level singleton) so a test run that
+
+def _test_database_config() -> IntegrationDatabaseConfig:
+    # Constructed fresh (not a module-level singleton) so a test run that
     # patches the environment before collection is still honoured.
-    return DatabaseConfig()
+    return IntegrationDatabaseConfig()
 
 
 @pytest.fixture(scope="session")
 def migrated_database() -> str:
     """Apply migrations once per session; return the pooled connection string.
 
-    Skips every test in this package if the database isn't configured, rather
-    than letting each test fail individually on a connection error.
+    Every guard is checked here, once, before any test runs — a per-test check
+    would report the same misconfiguration dozens of times, and a check after
+    the first write would be too late to matter.
     """
-    db = _database_config()
-    if not db.direct_url or not db.url:
-        pytest.skip("DATABASE_URL / DATABASE_DIRECT_URL not set — skipping DB integration tests")
+    db = _test_database_config()
+
+    if not db.configured:
+        pytest.skip(
+            "TEST_DATABASE_URL is not set, so there is no database these tests are "
+            "allowed to write to. They deliberately do not fall back to DATABASE_URL.\n"
+            + _SETUP_HINT
+        )
+    if not db.allow:
+        pytest.skip(
+            "ARIE_ALLOW_INTEGRATION_TEST_DB=1 is not set. These tests create and "
+            "delete rows; running them is an explicit choice, not a default.\n" + _SETUP_HINT
+        )
+
+    # Dangerous or incomplete from here down: fail, never skip.
+    try:
+        assert_not_production(db.url)
+    except IntegrationDatabaseGuardError as exc:
+        pytest.fail(str(exc), pytrace=False)
+
+    if not marker_present(db.direct_url):
+        pytest.fail(
+            "the configured TEST_DATABASE_URL points at a database that has not been "
+            "designated for integration testing, so this suite will not write to it.\n"
+            + _SETUP_HINT,
+            pytrace=False,
+        )
+
     migrate(db.direct_url)
     return db.url
+
+
+@pytest.fixture(scope="session")
+def migrated_database_direct(migrated_database: str) -> str:
+    """The *direct* (non-pooled) connection string for the same test database.
+
+    Exists so a test that needs to re-run the migration runner asks a fixture
+    instead of building its own config. Two tests in
+    ``test_migrate_integration.py`` used to call ``DatabaseConfig()`` directly,
+    which meant they ran migrations against **production** while every other
+    fixture in the session used the test database — invisible for as long as
+    both happened to be the same database, and a silent production write the
+    moment they stopped being.
+
+    Depends on ``migrated_database`` so every guard has already run.
+    """
+    return _test_database_config().direct_url
+
+
+RUN_ID = f"it-{uuid.uuid4().hex[:8]}"
+"""A short id unique to this pytest session, e.g. ``it-3f9a2c7e``.
+
+Every row a test creates is tagged with it, which buys two things. Rows are
+attributable — a stray row names the run that made it — and, more usefully,
+concurrent or interrupted runs cannot collide: two sessions against the same
+database generate different ids, so neither can be confused by the other's data.
+Cleanup still deletes by primary key, never by this prefix; the id is for
+attribution, not for a broad ``DELETE ... LIKE 'it-%'``.
+
+A module constant rather than only a fixture because the ``source`` values are
+built inside plain module-level helper functions, which a fixture cannot reach
+without threading a parameter through every helper and caller in seven files.
+conftest is imported once per session, so this is evaluated once per session —
+the same guarantee, spelled in a way the helpers can actually use. The
+:func:`integration_run_id` fixture returns this same value.
+"""
+
+
+def source_for(label: str) -> str:
+    """``leads.source`` for this run: ``it-3f9a2c7e:pipeline``.
+
+    Replaces the fixed literals (``pipeline-it``, ``shadow-it``, ``receipt-it``,
+    ``webhook``) the suite used to hard-code. Those were shared by every run
+    that ever executed, so a run that died before teardown left rows behind
+    that the next run's foreign-key teardown then tripped over — which is
+    exactly what happened, repeatedly.
+    """
+    return f"{RUN_ID}:{label}"
+
+
+@pytest.fixture(scope="session")
+def integration_run_id() -> str:
+    """:data:`RUN_ID`, for tests that would rather ask for it than import it."""
+    return RUN_ID
 
 
 @pytest.fixture
@@ -118,15 +237,32 @@ def cleanup_identity(db_conn: psycopg.Connection) -> Iterator[IdentityCleanup]:
         # Persons first: company_id references companies(company_id) with no
         # ON DELETE clause (default RESTRICT), so a company row with a
         # surviving person would fail to delete.
+        # `NOT EXISTS` rather than a plain delete: identity rows are shared by
+        # construction — `ON CONFLICT` returns an *existing* company/person
+        # when two leads resolve to the same identity — so a row this test
+        # touched may still be referenced by a lead another test (or another
+        # run) owns. Deleting it would raise a foreign-key violation and abort
+        # the whole teardown, stranding everything after it. Skipping it is
+        # correct: whoever still references it will clean it up.
         if tracker.emails:
-            cur.execute("DELETE FROM persons WHERE canonical_email = ANY(%s)", (tracker.emails,))
+            cur.execute(
+                "DELETE FROM persons p WHERE p.canonical_email = ANY(%s) "
+                "AND NOT EXISTS (SELECT 1 FROM leads l WHERE l.person_id = p.person_id)",
+                (tracker.emails,),
+            )
         if tracker.domains:
             cur.execute(
-                "DELETE FROM companies WHERE canonical_domain = ANY(%s)", (tracker.domains,)
+                "DELETE FROM companies c WHERE c.canonical_domain = ANY(%s) "
+                "AND NOT EXISTS (SELECT 1 FROM leads l WHERE l.company_id = c.company_id) "
+                "AND NOT EXISTS (SELECT 1 FROM persons p WHERE p.company_id = c.company_id)",
+                (tracker.domains,),
             )
         if tracker.company_names:
             cur.execute(
-                "DELETE FROM companies WHERE canonical_domain IS NULL AND normalized_name = ANY(%s)",
+                "DELETE FROM companies c WHERE c.canonical_domain IS NULL "
+                "AND c.normalized_name = ANY(%s) "
+                "AND NOT EXISTS (SELECT 1 FROM leads l WHERE l.company_id = c.company_id) "
+                "AND NOT EXISTS (SELECT 1 FROM persons p WHERE p.company_id = c.company_id)",
                 (tracker.company_names,),
             )
     db_conn.commit()

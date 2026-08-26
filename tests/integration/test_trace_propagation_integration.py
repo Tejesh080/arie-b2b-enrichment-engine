@@ -23,7 +23,7 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind, StatusCode
 from psycopg_pool import ConnectionPool
-from tests.integration.conftest import IngestCleanup
+from tests.integration.conftest import IngestCleanup, source_for
 
 from arie.api.main import AppState, create_app
 from arie.config import ObservabilityConfig
@@ -56,7 +56,7 @@ def _identity(cleanup: IngestCleanup) -> tuple[str, str]:
 
 def _payload(email: str, domain: str) -> dict[str, Any]:
     return {
-        "source": "webhook",
+        "source": source_for("trace"),
         "email": email,
         "company_domain": domain,
         "external_ref": f"crm-{uuid.uuid4().hex[:10]}",
