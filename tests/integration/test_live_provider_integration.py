@@ -7,6 +7,15 @@ HTTP layer is mocked with `httpx.MockTransport` throughout -- this suite never
 makes a real Abstract API call (see `scripts/live_provider_smoke.py` for the
 one deliberately-real path). Unlike the simulated suite, leads here have no
 corpus membership at all -- that is the entire point of live mode.
+
+**Scope, now that live mode runs two providers.** This suite injects Abstract
+*alone* (`live_provider=`, the deliberate single-adapter form) and keeps doing
+so on purpose: it exercises the company-enrichment path in isolation, where a
+failure can only be that path's. The multi-provider behaviour -- ordering, when
+Apollo is skipped, per-entity cache scoping, budget interaction across two
+providers -- lives in `test_live_multi_provider_integration.py`. Apollo
+therefore appears in these receipts under `providers.not_called`, which is the
+truthful report: it is registered, and it was not called.
 """
 
 from __future__ import annotations
@@ -28,6 +37,7 @@ from arie.identity.normalize import normalize_company_name
 from arie.jobs.handlers import SimulatedEnrichmentRuntime, build_handlers, build_runtime
 from arie.jobs.queue import PostgresJobQueue
 from arie.jobs.worker import JobHandler, run_worker_cycle
+from arie.providers.apollo_contract import APOLLO_PROVIDER_NAME
 from arie.providers.live_abstract import PROVIDER_NAME, AbstractCompanyEnrichmentProvider
 
 pytestmark = pytest.mark.integration
@@ -191,7 +201,12 @@ def test_a_lead_with_no_corpus_membership_is_enriched_by_the_live_provider(
 
     receipt = api_client.get(f"/leads/{body['lead_id']}/receipt").json()
     assert receipt["providers"]["called"][0]["provider"] == PROVIDER_NAME
-    assert receipt["providers"]["not_called"] == []
+    # This suite injects Abstract alone, so Apollo is a registered live
+    # provider that genuinely was not called -- and the receipt says so. This
+    # asserted `[]` while Abstract was the only registered provider; the honest
+    # value changed when a second one was wired, and a receipt that still
+    # claimed "nothing else was available" would be the bug.
+    assert receipt["providers"]["not_called"] == [APOLLO_PROVIDER_NAME]
     assert receipt["shadow"] is False
 
 

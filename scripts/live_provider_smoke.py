@@ -6,6 +6,11 @@ invocation never makes more than one real call:
 1. Call ``AbstractCompanyEnrichmentProvider`` directly for one domain and print
    the normalized result (status, fields, cost, latency) — proves the adapter
    works against the real API. This is the default behaviour.
+1b. With ``--person-email``: also call ``ApolloPersonEnrichmentProvider`` once
+   for that email. A separate flag, a separate vendor, a separate credit — an
+   operator smoke-testing the company adapter must not silently spend an Apollo
+   credit too. Refuses up front if ``APOLLO_API_KEY`` is unset, before the
+   Abstract call has been made.
 2. If ``--api-base-url`` is also given: POST a lead to a *running* ARIE API
    (assumed already started with ``PROVIDER_MODE=live`` and the same
    ``ABSTRACT_COMPANY_API_KEY``), wait for its Decision Receipt, and print it —
@@ -18,6 +23,8 @@ requests/month, and this script's whole point is to spend one (or two) of
 them deliberately, not by accident.
 
     python scripts/live_provider_smoke.py --domain github.com --confirm-live-spend
+    python scripts/live_provider_smoke.py --domain github.com --confirm-live-spend \\
+        --person-email someone@github.com
     python scripts/live_provider_smoke.py --domain github.com --confirm-live-spend \\
         --api-base-url http://localhost:8000 --shadow
 """
@@ -33,9 +40,10 @@ from typing import Any
 
 import httpx
 
-from arie.config import LIVE_PROVIDER
+from arie.config import APOLLO_PERSON, LIVE_PROVIDER
 from arie.core.types import Entity
 from arie.providers.live_abstract import AbstractCompanyEnrichmentProvider
+from arie.providers.live_apollo import ApolloPersonEnrichmentProvider
 
 
 def _print_json(label: str, payload: dict[str, Any]) -> None:
@@ -62,6 +70,43 @@ def _call_adapter_once(domain: str) -> dict[str, Any]:
         "fields": result.fields,
         "confidence": result.confidence,
         "cost_usd": result.cost_usd,
+        "latency_ms": round(result.latency_ms, 1),
+        "raw": result.raw,
+    }
+
+
+def _call_person_adapter_once(email: str) -> dict[str, Any]:
+    """One real Apollo People Enrichment call, for one email.
+
+    Consumes at most one Apollo credit (a demographics match); a no-match
+    response consumes none. ``reveal_personal_emails``/``reveal_phone_number``
+    are hard-coded off in the adapter, so this can never trip the eight-credit
+    phone-reveal charge.
+
+    Prints the normalized fields, the raw->canonical mapping audit, and who
+    Apollo matched — the last of those because the failure mode person
+    enrichment has and company enrichment does not is *matching the wrong
+    human*, and that is not visible from the canonical values alone.
+    """
+    provider = ApolloPersonEnrichmentProvider.build()
+    try:
+        entity = Entity(entity_type="person", entity_id=uuid.uuid4(), canonical_key=email)
+        result = provider.fetch(entity)
+    finally:
+        provider.close()
+
+    # `raw` never contains the api_key — it travels as a header, and no error
+    # path interpolates an httpx exception's str(). Still: never print
+    # `provider.config`, which holds the key itself.
+    return {
+        "provider": provider.name,
+        "email": email,
+        "status": str(result.status),
+        "fields": result.fields,
+        "confidence": result.confidence,
+        "cost_usd": result.cost_usd,
+        "cost_basis": result.raw.get("cost_basis"),
+        "credits_consumed": result.raw.get("credits_consumed", 0),
         "latency_ms": round(result.latency_ms, 1),
         "raw": result.raw,
     }
@@ -109,7 +154,14 @@ def main() -> int:
     parser.add_argument(
         "--confirm-live-spend",
         action="store_true",
-        help="Required. Acknowledges this call may spend real Abstract API quota/money.",
+        help="Required. Acknowledges this call may spend real provider quota/money.",
+    )
+    parser.add_argument(
+        "--person-email",
+        default=None,
+        help="If set, ALSO make one real Apollo People Enrichment call for this email "
+        "(consumes at most one Apollo credit; a no-match consumes none). Requires "
+        "APOLLO_API_KEY. Use a public business identity, not a private individual.",
     )
     parser.add_argument(
         "--api-base-url",
@@ -138,6 +190,18 @@ def main() -> int:
         )
         return 1
 
+    # Checked before anything is spent, not after the Abstract call has already
+    # gone out: the point of this gate is that an operator who asked for a
+    # person smoke and cannot get one finds out for free.
+    if args.person_email and not APOLLO_PERSON.configured:
+        print(
+            "APOLLO_API_KEY is not set — see .env.example. The Apollo adapter and its whole "
+            "fixture suite are complete and green; only this one real call is blocked. "
+            "Set APOLLO_API_KEY in .env and re-run to make it.",
+            file=sys.stderr,
+        )
+        return 1
+
     if not args.confirm_live_spend:
         print(
             "Refusing to run without --confirm-live-spend: this makes a real call against "
@@ -150,6 +214,11 @@ def main() -> int:
     print(f"Calling the real adapter once for domain={args.domain!r}...")
     adapter_result = _call_adapter_once(args.domain)
     _print_json("Direct adapter call", adapter_result)
+
+    if args.person_email:
+        print()
+        print(f"Calling the real Apollo adapter once for email={args.person_email!r}...")
+        _print_json("Direct person adapter call", _call_person_adapter_once(args.person_email))
 
     if args.api_base_url:
         print(

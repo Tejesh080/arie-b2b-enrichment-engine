@@ -68,15 +68,17 @@ _STOP_REASON_EXPLANATIONS: dict[str, str] = {
         "Every available data provider was called; there was no further evidence left to purchase."
     ),
     "no_domain_available": (
-        "Post-M1 P5, live provider mode. This lead had no company domain to enrich by, so the "
-        "one real provider (which requires a domain) could never be called. The decision "
-        "reflects whatever evidence was already known, not certainty that none exists."
+        "Live provider mode. No data provider could be called for this lead at all — none "
+        "of them had an identifier of the kind it needs (typically a company domain this "
+        "lead never resolved one for). The decision reflects whatever evidence was already "
+        "known, not certainty that none exists."
     ),
     "provider_failed": (
-        "The live data provider failed to respond usably (a timeout, or a transport or API "
+        "A live data provider failed to respond usably (a timeout, or a transport or API "
         "error). No evidence was purchased from it. The decision reflects only what was "
         "already known — this lead was not assessed on complete information, and the "
-        "failure is recorded against the provider rather than against the lead."
+        "failure is recorded against the provider rather than against the lead. Other "
+        "providers may still have answered; see the per-provider list above."
     ),
     PER_LEAD_BUDGET_EXHAUSTED: (
         "Enriching this lead any further would exceed its per-lead live spend cap, so no "

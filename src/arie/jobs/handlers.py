@@ -75,6 +75,7 @@ survived, the retry is served from cache and doesn't even re-fetch.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -101,6 +102,7 @@ from arie.evidence.ttl_policy import ttl_for_field
 from arie.identity.normalize import domain_from_email, normalize_domain, normalize_email
 from arie.ledger.store import PostgresCostLedger
 from arie.live.budget import LiveSpendGuard
+from arie.live.providers import acquisition_order
 from arie.live.safety import (
     LIVE_GUARD_REASON,
     autonomy_allowed_for,
@@ -115,6 +117,7 @@ from arie.providers.live_abstract import (
     LIVE_POLICY_NAME,
     AbstractCompanyEnrichmentProvider,
 )
+from arie.providers.live_apollo import ApolloPersonEnrichmentProvider
 from arie.providers.simulated import CallLedger, build_from_leads
 from arie.providers.synthetic import synthesize_corpus_lead
 from arie.scoring.engine import ScoringResult, score_evidence
@@ -122,6 +125,7 @@ from arie.statemachine.apply import apply_transition
 from arie.statemachine.transitions import next_status
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from arie.confidence.model import ConfidenceModel
     from arie.evalgen.schema import EvalLead
     from arie.jobs.worker import JobContext, JobHandler
     from arie.policy.production import CalibratedBoundsPolicy
@@ -595,6 +599,7 @@ def build_handlers(
     leads: list[EvalLead] | None = None,
     provider_mode: str | None = None,
     live_provider: EnrichmentProvider | None = None,
+    live_providers: Sequence[EnrichmentProvider] | None = None,
 ) -> dict[str, JobHandler]:
     """The worker's production handler registry.
 
@@ -605,11 +610,14 @@ def build_handlers(
     dataset do; both provider modes need the fitted confidence model, only
     `simulated` needs the corpus/registry.
 
-    `live_provider` lets a caller (tests, ``scripts/live_provider_smoke.py``)
-    inject an already-built adapter instead of paying
-    ``AbstractCompanyEnrichmentProvider.build()``'s API-key check — mirroring
-    ``arie.llm.deepseek.DeepSeekSignalExtractor``'s own injectable-client
-    pattern.
+    `live_providers` lets a caller (tests, ``scripts/live_provider_smoke.py``)
+    inject already-built adapters instead of paying each one's API-key check —
+    mirroring ``arie.llm.deepseek.DeepSeekSignalExtractor``'s own
+    injectable-client pattern. `live_provider` is the single-adapter form, kept
+    for callers that deliberately exercise one provider in isolation; it means
+    "run exactly this one", not "add this to the default set". Whichever is
+    used, the result is sorted into ``arie.live.providers.acquisition_order``
+    so an injected set cannot exercise a different ordering than production.
     """
     mode = provider_mode if provider_mode is not None else RUNTIME.provider_mode
     if mode not in ("simulated", "live"):
@@ -622,7 +630,9 @@ def build_handlers(
 
     if mode == "simulated":
         return _build_simulated_handlers(pool, resolved_runtime)
-    return _build_live_handlers(pool, resolved_runtime, live_provider=live_provider)
+    return _build_live_handlers(
+        pool, resolved_runtime, live_provider=live_provider, live_providers=live_providers
+    )
 
 
 def _build_simulated_handlers(
@@ -771,61 +781,497 @@ def _build_simulated_handlers(
     return {"compute_score": compute_score}
 
 
+@dataclass(frozen=True)
+class _LiveEntityRef:
+    """A resolved entity one live provider can be called for.
+
+    Exists so the acquisition loop below can be written once for both entity
+    types instead of once per provider. A provider declares which
+    ``entity_type`` it serves; this is how the lead answers "and do I have an
+    identifier of that kind?".
+    """
+
+    entity_type: EntityType
+    entity_id: UUID
+    canonical_key: str
+
+    def as_entity(self) -> Entity:
+        return Entity(
+            entity_type=self.entity_type,
+            entity_id=self.entity_id,
+            canonical_key=self.canonical_key,
+        )
+
+
+def _live_entity_refs(identity: _LeadIdentity) -> dict[EntityType, _LiveEntityRef]:
+    """Which identifiers this lead actually has, keyed by entity type.
+
+    A *missing* key is the point: ``company`` is absent for a free-mail lead
+    whose domain never resolved (``arie.identity.normalize.domain_from_email``
+    returns ``None`` for gmail.com and friends), and a domain-keyed provider
+    must then be skipped rather than called with a fabricated identifier.
+    ``person`` is always present — ``_load_identity`` refuses a lead without a
+    canonical email — but it is resolved through the same path so that the loop
+    has no special case, and so a future person provider cannot quietly assume
+    an invariant this function is the only place that states.
+    """
+    refs: dict[EntityType, _LiveEntityRef] = {
+        "person": _LiveEntityRef(
+            entity_type="person",
+            entity_id=identity.person_id,
+            canonical_key=identity.canonical_email,
+        )
+    }
+    if identity.canonical_domain is not None:
+        refs["company"] = _LiveEntityRef(
+            entity_type="company",
+            entity_id=identity.company_id,
+            canonical_key=identity.canonical_domain,
+        )
+    return refs
+
+
+# Why acquisition stopped, when it stopped before running out of providers.
+# Both are the *existing* live-safe rules, lifted out of the single-provider
+# loop unchanged — Live V1 deliberately introduces no new stopping model, and
+# in particular no new confidence model (the one in use is calibrated on
+# synthetic data, which is exactly why `arie.live.safety` forbids acting on it).
+_STOP_SETTLED = "decision_settled"
+_STOP_CONFIDENT = "confidence_reached"
+_STOP_PROVIDER_FAILED = "provider_failed"
+_STOP_ALL_CALLED = "all_providers_called"
+_STOP_NO_IDENTIFIER = "no_domain_available"
+"""Retained spelling. It reads company-specific and is now the general "no
+provider had an identifier it could use for this lead", but it is a stable
+``decision_receipts.stop_reason`` value with an explanation entry in
+``arie.api.receipt`` and a consumer in a separate frontend repository. Renaming
+it would be a breaking vocabulary change bought for cosmetics; the explanation
+text is what got corrected instead."""
+
+
+def _enough_evidence(
+    scoring: ScoringResult, *, has_evidence: bool, model: ConfidenceModel
+) -> str | None:
+    """Whether acquisition should stop here — the existing rule, nothing new.
+
+    Returns the stop reason, or ``None`` to mean "keep buying". Two ways to be
+    done, in the order the deterministic one has always come first:
+
+    * **Settled bounds.** No unbought evidence could move the reachable score
+      across a decision boundary, so buying more cannot change the outcome.
+      Worth knowing that in live mode this is currently unreachable in
+      practice, and honestly so: ``disqualifying_flag`` is supplied by no live
+      provider, and while it is unknown ``compute_bounds`` pins the score floor
+      at zero (``arie.scoring.engine``). It is checked first anyway because it
+      is the cheaper and stronger claim, and because the day a disqualifier
+      source exists this needs no edit.
+    * **Confidence.** The calibrated model judges the *current* recommendation
+      reliable at ``tau``. This is what actually fires in live mode, and it is
+      the whole reason Apollo is sometimes skipped: a five-person construction
+      firm is a confident reject on firmographics alone, and no job title would
+      change that.
+
+    ``has_evidence`` guards the confidence branch: with nothing observed at
+    all, ``predict`` is being asked about an empty bundle, and stopping there
+    would mean never calling a provider. Inherited unchanged from the
+    single-provider loop.
+
+    **Confidence here does not authorise action, and this is the distinction
+    the whole live path turns on.** It authorises *not spending more money* —
+    a recoverable, cheap decision whose worst case is a lead escalated on
+    thinner evidence than it could have had. Acting on that same number is
+    forbidden by ``arie.live.safety`` regardless of how high it is, because
+    the model behind it was calibrated on synthetic data. Stopping early and
+    routing early are different risks, and only the second is unbounded.
+    """
+    if scoring.bounds.is_settled:
+        return _STOP_SETTLED
+    if has_evidence and model.predict(scoring) >= model.tau:
+        return _STOP_CONFIDENT
+    return None
+
+
+@dataclass(frozen=True)
+class _LiveAcquisitionOutcome:
+    """What the live acquisition loop did, and what it decided on."""
+
+    scoring: ScoringResult
+    stop_reason: str
+    called: tuple[str, ...]
+    """Providers a real, billable request was actually sent to."""
+    cache_hits: tuple[str, ...]
+    """Providers skipped because every field they supply was already fresh in
+    the evidence store for *this lead's own* entity."""
+    unreachable: tuple[str, ...]
+    """Providers skipped because this lead has no identifier of the kind they
+    serve — never because they were thought unhelpful."""
+    not_needed: tuple[str, ...]
+    """Providers never reached because acquisition had already stopped. The
+    interesting set: this is where a skipped Apollo lands when company evidence
+    already settled the question."""
+    failed: tuple[str, ...]
+    cost_usd: float
+
+    def audit(self) -> dict[str, Any]:
+        """Span/event-safe summary — names and one number, no payloads."""
+        return {
+            "called": list(self.called),
+            "cache_hits": list(self.cache_hits),
+            "unreachable": list(self.unreachable),
+            "not_needed": list(self.not_needed),
+            "failed": list(self.failed),
+            "cost_usd": self.cost_usd,
+            "stop_reason": self.stop_reason,
+        }
+
+
+def _acquire_live_evidence(
+    *,
+    providers: tuple[EnrichmentProvider, ...],
+    identity: _LeadIdentity,
+    lead_id: UUID,
+    job_id: UUID,
+    evidence_store: PostgresEvidenceStore,
+    cost_ledger: PostgresCostLedger,
+    spend_guard: LiveSpendGuard,
+    model: ConfidenceModel,
+    now: datetime,
+) -> _LiveAcquisitionOutcome:
+    """Walk the live providers in order, stopping as soon as more evidence
+    stops being worth buying.
+
+    This is the generalisation of P5's single-provider loop, and it is
+    deliberately a generalisation rather than a rewrite: every step below
+    existed before, in the same order, for one hardcoded provider. What is new
+    is that the provider, the entity it needs, and the evidence it already has
+    are all looked up per iteration instead of being closed over.
+
+    One pass per provider:
+
+    1. **Is more evidence worth buying?** (:func:`_enough_evidence`) — asked
+       *before* each provider, not only after the last one. That is the whole
+       point of a second provider: the answer can become "no" partway through.
+    2. **Does this lead have an identifier this provider serves?** If not, skip
+       it and continue — a missing company domain must not stop a person
+       lookup that would have worked.
+    3. **Is it already answered?** Every field the provider supplies, fresh, in
+       the evidence store, *for this lead's own entity id*. Recorded as a
+       zero-cost cache-hit ledger row rather than silently skipped — handoff
+       item #5 — so a receipt can show ARIE declining to re-buy a fact.
+    4. **Does the budget allow it?** (``arie.live.budget``) — before the call,
+       never after.
+    5. **Call, ledger, normalize, persist, re-read, rescore.** The re-read is
+       from the store rather than from the in-memory result, so the next
+       iteration scores exactly what a later job would see.
+
+    **Budget refusal ends acquisition rather than skipping one provider.**
+    Providers run cheapest-first, so a cap that refuses provider *n* refuses
+    every provider after it too; continuing would produce a stream of identical
+    refusals and leave the lead's ``stop_reason`` naming whichever one happened
+    to be last. Stopping names the constraint once, truthfully.
+
+    **A provider failure never ends acquisition and never fails the job.** A
+    vendor being down is not a reason to lose the lead or to skip a different
+    vendor that is up. The failure is ledgered, remembered, and reported as the
+    stop reason if nothing better was reached — and the lead goes to a human,
+    which the live autonomy guard was going to do anyway.
+
+    Persists evidence and ledger rows through the same stores the simulated
+    path uses; both write in their own transactions, deliberately (see the
+    module docstring), so a later rollback cannot un-spend money.
+    """
+    refs = _live_entity_refs(identity)
+    evidence = _fresh_live_evidence(evidence_store, refs, now)
+    scoring = score_evidence(_all_evidence(evidence), now)
+
+    called: list[str] = []
+    cache_hits: list[str] = []
+    unreachable: list[str] = []
+    not_needed: list[str] = []
+    failed: list[str] = []
+    cost_usd = 0.0
+    stop_reason: str | None = None
+
+    for index, provider in enumerate(providers):
+        stop_reason = _enough_evidence(
+            scoring, has_evidence=bool(_all_evidence(evidence)), model=model
+        )
+        if stop_reason is not None:
+            not_needed = [candidate.name for candidate in providers[index:]]
+            break
+
+        ref = refs.get(provider.entity_type)
+        if ref is None:
+            unreachable.append(provider.name)
+            continue
+
+        held = {item.field_name for item in evidence.get(ref.entity_type, ())}
+        if set(provider.provides_fields) <= held:
+            cost_ledger.record_provider_call(
+                idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
+                provider=provider.name,
+                entity_type=ref.entity_type,
+                entity_id=ref.entity_id,
+                status=ProviderStatus.SUCCESS,
+                cost_usd=0.0,
+                latency_ms=0.0,
+                lead_id=lead_id,
+                cache_hit=True,
+            )
+            cache_hits.append(provider.name)
+            continue
+
+        allowance = spend_guard.allowance(
+            lead_id=lead_id, estimated_cost_usd=provider.base_cost_usd
+        )
+        if not allowance.permitted:
+            assert allowance.reason is not None  # set whenever not permitted
+            stop_reason = allowance.reason
+            not_needed = [candidate.name for candidate in providers[index + 1 :]]
+            break
+
+        result = provider.fetch(ref.as_entity())
+        called.append(provider.name)
+        cost_usd += result.cost_usd
+        cost_ledger.record_provider_call(
+            idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
+            provider=provider.name,
+            entity_type=ref.entity_type,
+            entity_id=ref.entity_id,
+            status=result.status,
+            cost_usd=result.cost_usd,
+            latency_ms=result.latency_ms,
+            lead_id=lead_id,
+            cache_hit=False,
+        )
+
+        if result.status in (ProviderStatus.ERROR, ProviderStatus.TIMEOUT):
+            failed.append(provider.name)
+
+        if result.status is ProviderStatus.SUCCESS and result.fields:
+            evidence_store.put_many(
+                Evidence(
+                    entity_type=ref.entity_type,
+                    entity_id=ref.entity_id,
+                    field_name=field_name,
+                    value=value,
+                    source=provider.name,
+                    confidence=result.confidence,
+                    ttl_seconds=ttl_for_field(field_name),
+                    fetched_at=now,
+                )
+                for field_name, value in result.fields.items()
+            )
+            evidence = _fresh_live_evidence(evidence_store, refs, now)
+            scoring = score_evidence(_all_evidence(evidence), now)
+
+    if stop_reason is None:
+        stop_reason = _resolve_terminal_stop_reason(
+            scoring=scoring,
+            evidence=evidence,
+            model=model,
+            called=called,
+            cache_hits=cache_hits,
+            unreachable=unreachable,
+            failed=failed,
+        )
+
+    return _LiveAcquisitionOutcome(
+        scoring=scoring,
+        stop_reason=stop_reason,
+        called=tuple(called),
+        cache_hits=tuple(cache_hits),
+        unreachable=tuple(unreachable),
+        not_needed=tuple(not_needed),
+        failed=tuple(failed),
+        cost_usd=cost_usd,
+    )
+
+
+def _resolve_terminal_stop_reason(
+    *,
+    scoring: ScoringResult,
+    evidence: dict[EntityType, tuple[Evidence, ...]],
+    model: ConfidenceModel,
+    called: list[str],
+    cache_hits: list[str],
+    unreachable: list[str],
+    failed: list[str],
+) -> str:
+    """Why acquisition stopped, when it stopped by running out of providers.
+
+    Order matters, and each step is a claim the receipt will make to a human:
+
+    1. The existing stopping rule, re-asked after the final call — a last
+       provider that supplied enough evidence should report
+       ``confidence_reached``, not ``all_providers_called``.
+    2. ``provider_failed`` if any provider broke. Sticky across the whole loop:
+       if Abstract timed out and Apollo succeeded but confidence was not
+       reached, this lead was still decided on incomplete information, and
+       ``all_providers_called`` would claim the missing evidence does not exist
+       rather than that ARIE failed to fetch it.
+    3. ``no_domain_available`` only when *nothing* was reachable — no call, no
+       cache hit, and at least one provider skipped for a missing identifier.
+       Requiring all three is what stops a lead that was enriched by a person
+       provider from reporting "no domain" merely because a company provider
+       was also skipped.
+    4. ``all_providers_called`` otherwise: everything available was consulted
+       and the question is still open.
+    """
+    settled = _enough_evidence(scoring, has_evidence=bool(_all_evidence(evidence)), model=model)
+    if settled is not None:
+        return settled
+    if failed:
+        return _STOP_PROVIDER_FAILED
+    if unreachable and not called and not cache_hits:
+        return _STOP_NO_IDENTIFIER
+    return _STOP_ALL_CALLED
+
+
+def _fresh_live_evidence(
+    evidence_store: PostgresEvidenceStore,
+    refs: dict[EntityType, _LiveEntityRef],
+    now: datetime,
+) -> dict[EntityType, tuple[Evidence, ...]]:
+    """Unexpired evidence for each entity this lead resolved, kept apart by type.
+
+    **Kept apart, not merged, and that is the cache-scoping guarantee.** Person
+    evidence is stored against ``persons.person_id`` and company evidence
+    against ``companies.company_id``, so two colleagues at one employer share
+    firmographics and share nothing else — a second contact at the same company
+    reuses ``industry``/``employee_count`` and must still be looked up
+    individually for their own title. Returning one flat list would make the
+    loop's "do I already have this provider's fields?" check answerable by the
+    *wrong* entity's rows, which for a person provider is precisely the
+    cross-contamination this shape prevents. The scorer is handed the union
+    (:func:`_all_evidence`) because field names are disjoint across the two
+    types and a lead's score is a fact about the pair.
+    """
+    return {
+        entity_type: tuple(evidence_store.get_all_fresh(entity_type, ref.entity_id, now=now))
+        for entity_type, ref in refs.items()
+    }
+
+
+def _all_evidence(evidence: dict[EntityType, tuple[Evidence, ...]]) -> list[Evidence]:
+    """The union, for scoring.
+
+    Sorted by entity type so the input to ``score_evidence`` is deterministic —
+    the merge layer breaks ties on confidence and recency, but a stable order
+    keeps a genuinely tied pair from resolving differently between two runs of
+    the same lead.
+    """
+    return [item for entity_type in sorted(evidence) for item in evidence[entity_type]]
+
+
+def _live_idempotency_key(job_id: UUID, provider_name: str, ref: _LiveEntityRef) -> str:
+    """Derived from the job id, so a crashed-and-retried job reproduces its own
+    keys and ``PostgresCostLedger``'s UNIQUE constraint refuses the duplicate
+    charge (ADR 0002). The entity's canonical key is part of it because one job
+    can now call two providers against two different entities."""
+    return f"job:{job_id}:{provider_name}:{ref.canonical_key}"
+
+
+def _default_live_providers() -> tuple[EnrichmentProvider, ...]:
+    """Build every registered live adapter, or fail loudly saying which key is missing.
+
+    Both are built, and a missing key for *either* raises at build time rather
+    than at call time — the same rule P5 established for Abstract, applied to
+    the second provider without exception. The alternative (build whichever
+    adapters are configured and quietly run with fewer) is the failure mode
+    that rule exists to prevent: a live deployment reporting coverage and cost
+    for a pipeline that silently lost half its evidence, with nothing in the
+    receipt to say so. A live worker either has both credentials or does not
+    start.
+    """
+    return (AbstractCompanyEnrichmentProvider.build(), ApolloPersonEnrichmentProvider.build())
+
+
+def _resolve_live_providers(
+    *,
+    live_provider: EnrichmentProvider | None,
+    live_providers: Sequence[EnrichmentProvider] | None,
+) -> tuple[EnrichmentProvider, ...]:
+    """Which adapters this handler runs, always in acquisition order.
+
+    ``live_providers`` is the general injection point. ``live_provider`` is its
+    single-adapter predecessor, kept because tests and
+    ``scripts/live_provider_smoke.py`` use it to exercise *one* provider in
+    isolation — a genuinely useful thing to be able to do, and the honest
+    meaning of injecting one adapter is "run exactly this one", not "run this
+    one plus whatever else the environment can build". Passing both is a caller
+    bug rather than a merge.
+
+    Whatever arrives is sorted by ``arie.live.providers.acquisition_order`` so
+    the order under test is the order in production.
+    """
+    if live_provider is not None and live_providers is not None:
+        raise ValueError(
+            "pass live_provider or live_providers, not both — they mean the same thing "
+            "and disagreeing about the set would silently change acquisition order"
+        )
+    if live_providers is not None:
+        resolved: Sequence[EnrichmentProvider] = live_providers
+    elif live_provider is not None:
+        resolved = (live_provider,)
+    else:
+        resolved = _default_live_providers()
+    return acquisition_order(resolved)
+
+
 def _build_live_handlers(
     pool: ConnectionPool,
     resolved_runtime: SimulatedEnrichmentRuntime,
     *,
     live_provider: EnrichmentProvider | None = None,
+    live_providers: Sequence[EnrichmentProvider] | None = None,
 ) -> dict[str, JobHandler]:
-    """``PROVIDER_MODE=live`` (post-M1 P5) — one real adapter, any ingested
-    lead (no corpus restriction).
+    """``PROVIDER_MODE=live`` — the real multi-provider acquisition path, any
+    ingested lead (no corpus restriction).
 
-    **Why this can't reuse `CalibratedBoundsPolicy.run`.** That method's
-    signature takes an `EvalLead` and walks `arie.providers.catalog.CATALOG`
-    (8 simulated providers) via `RunContext.fetch`, which resolves an entity
-    from `lead.company.canonical_domain`/`lead.person.email` and looks the
-    provider up in `arie.providers.catalog.BY_NAME` — a real lead has neither
-    an `EvalLead` nor a catalogue entry, and adding one would perturb frozen
-    dataset generation (`arie.evalgen.generator` iterates `CATALOG` to freeze
-    observations) and the M0 benchmark it feeds. So this handler is a second,
-    much smaller acquisition loop — trivial because there is exactly one
-    provider to decide about, not eight — built from the same *lead-
-    independent* primitives the simulated handler's policy sits on top of:
-    `arie.scoring.engine.score_evidence` (facts -> score/bounds/signals) and
-    `ConfidenceModel.predict` (both take a bare `ScoringResult`, never an
-    `EvalLead`). It reuses the exact same `PostgresEvidenceStore`/
+    **Why this still can't reuse `CalibratedBoundsPolicy.run`.** That method
+    takes an `EvalLead` and walks `arie.providers.catalog.CATALOG` (8 simulated
+    providers) via `RunContext.fetch`, which resolves an entity from
+    `lead.company.canonical_domain`/`lead.person.email` and looks the provider
+    up in `arie.providers.catalog.BY_NAME` — a real lead has neither an
+    `EvalLead` nor a catalogue entry, and adding one would perturb frozen
+    dataset generation (`arie.evalgen.generator` iterates `CATALOG`) and the M0
+    benchmark it feeds. So this handler runs its own, much smaller acquisition
+    loop (`_acquire_live_evidence`), built from the same *lead-independent*
+    primitives the simulated policy sits on: `arie.scoring.engine.score_evidence`
+    and `ConfidenceModel.predict`, both of which take a bare `ScoringResult` and
+    never an `EvalLead`. It reuses the same `PostgresEvidenceStore`/
     `PostgresCostLedger`, the same `_finalize_decision` shadow/normal branch,
     and the same `decision_receipts`/`scores` inserts as the simulated path —
     only the acquisition loop above them differs.
+
+    **Live V1 — two providers, and the second one is conditional.** Abstract
+    supplies company firmographics; Apollo supplies person seniority/function,
+    which is 35 of the scorer's 100 reachable points and was permanently
+    unknown for every live lead before it existed. Apollo is called *only* when
+    company evidence left the decision open — see
+    `arie.live.providers.REGISTERED_LIVE_PROVIDER_NAMES` for why that order,
+    and `_enough_evidence` for what "open" means. Both are gated by
+    `LiveSpendGuard` before the call, never after.
 
     **The confidence model is the corpus-calibrated one, reused as-is.** No
     other calibration data exists. `ConfidenceModel.predict` only reads
     `ScoringResult.signals` (completeness, conflict, boundary distance, ...),
     which are well-defined for any evidence bundle — but applying a model
     fitted on synthetic corpus signals to real evidence is an unvalidated
-    assumption, stated here and in `docs/architecture.md`'s P5 section, not
-    quietly treated as equivalent to the simulated path's own guarantee.
+    assumption, stated here and in `docs/architecture.md`, not quietly treated
+    as equivalent to the simulated path's own guarantee.
 
-    **Live V1 Foundation — that unvalidated assumption is now enforced rather
-    than only documented.** `autonomy_allowed` is `False` for this mode
-    (`arie.live.safety`), so the confidence/tau comparison below still runs and
-    is still frozen into the receipt — it is the recommendation a reviewer
-    reads — but it can no longer *act*. Every non-shadow live lead lands on
-    AWAITING_HUMAN; every shadow one lands on SHADOW_EVALUATED;
-    `verify_live_status` asserts it.
-
-    **Live V1 Foundation — spend caps.** `LiveSpendGuard` is consulted before
-    the provider call, never after. A refusal is a first-class stop reason
-    (`per_lead_budget_exhausted` / `daily_budget_exhausted`), not an exception
-    and not a silent skip: the lead still gets a receipt describing exactly
-    what it decided on and why it stopped. A provider ERROR/TIMEOUT is
-    likewise its own stop reason (`provider_failed`) rather than being folded
-    into `all_providers_called`, which would have claimed the provider was
-    called and had nothing to add.
+    That assumption is *enforced*, not merely documented: `autonomy_allowed` is
+    `False` for this mode (`arie.live.safety`), so the confidence/tau
+    comparison still runs and is still frozen into the receipt — it is the
+    recommendation a reviewer reads — but it can no longer act. Every non-shadow
+    live lead lands on AWAITING_HUMAN; every shadow one on SHADOW_EVALUATED;
+    `verify_live_status` asserts it. Adding a second provider does not soften
+    this, and widening the evidence is not evidence that the threshold
+    transfers.
     """
-    provider = (
-        live_provider if live_provider is not None else AbstractCompanyEnrichmentProvider.build()
-    )
+    providers = _resolve_live_providers(live_provider=live_provider, live_providers=live_providers)
     evidence_store = PostgresEvidenceStore(pool)
     cost_ledger = PostgresCostLedger(pool)
     spend_guard = LiveSpendGuard(pool)
@@ -849,106 +1295,18 @@ def _build_live_handlers(
             identity = _load_identity(ctx.conn, job.lead_id)
             version = _walk_to_decision(ctx.conn, lead_id=job.lead_id, version=ctx.lead_version)
 
-            now = datetime.now(UTC)
-            fresh = evidence_store.get_all_fresh("company", identity.company_id, now=now)
-            scoring = score_evidence(fresh, now)
-            already_has_fields = set(provider.provides_fields) <= {e.field_name for e in fresh}
-            can_call_provider = identity.canonical_domain is not None and not already_has_fields
-
-            if scoring.bounds.is_settled:
-                stop_reason = "decision_settled"
-            elif fresh and model.predict(scoring) >= model.tau:
-                stop_reason = "confidence_reached"
-            elif can_call_provider:
-                assert identity.canonical_domain is not None  # can_call_provider guarantees this
-                # Asked BEFORE the call, never after: for a metered API, the
-                # moment you discover you exceeded a cap is the moment the
-                # check needed to have already happened.
-                allowance = spend_guard.allowance(
-                    lead_id=job.lead_id, estimated_cost_usd=provider.base_cost_usd
-                )
-                set_attributes(span, {f"arie.budget.{k}": v for k, v in allowance.audit().items()})
-                if not allowance.permitted:
-                    assert allowance.reason is not None  # set whenever not permitted
-                    stop_reason = allowance.reason
-                else:
-                    entity = Entity(
-                        entity_type="company",
-                        entity_id=identity.company_id,
-                        canonical_key=identity.canonical_domain,
-                    )
-                    result = provider.fetch(entity)
-                    cost_ledger.record_provider_call(
-                        idempotency_key=f"job:{job.job_id}:{provider.name}:{entity.canonical_key}",
-                        provider=provider.name,
-                        entity_type="company",
-                        entity_id=identity.company_id,
-                        status=result.status,
-                        cost_usd=result.cost_usd,
-                        latency_ms=result.latency_ms,
-                        lead_id=job.lead_id,
-                        cache_hit=False,
-                    )
-                    if result.status is ProviderStatus.SUCCESS and result.fields:
-                        evidence_store.put_many(
-                            Evidence(
-                                entity_type="company",
-                                entity_id=identity.company_id,
-                                field_name=field_name,
-                                value=value,
-                                source=provider.name,
-                                confidence=result.confidence,
-                                ttl_seconds=ttl_for_field(field_name),
-                                fetched_at=now,
-                            )
-                            for field_name, value in result.fields.items()
-                        )
-                        fresh = evidence_store.get_all_fresh(
-                            "company", identity.company_id, now=now
-                        )
-                        scoring = score_evidence(fresh, now)
-
-                    if scoring.bounds.is_settled:
-                        stop_reason = "decision_settled"
-                    elif fresh and model.predict(scoring) >= model.tau:
-                        stop_reason = "confidence_reached"
-                    elif result.status in (ProviderStatus.ERROR, ProviderStatus.TIMEOUT):
-                        # The provider broke. Distinct from "called it and it
-                        # had nothing" (`all_providers_called`), which would
-                        # claim the evidence genuinely does not exist. The job
-                        # deliberately does NOT fail: a transport failure at one
-                        # vendor is not a reason to lose the lead, and the guard
-                        # sends it to a human anyway. The `error_kind` is on the
-                        # ledger row and the provider result's `raw`.
-                        stop_reason = "provider_failed"
-                    else:
-                        stop_reason = "all_providers_called"
-                    set_attributes(span, {"arie.provider_status": str(result.status)})
-            elif identity.canonical_domain is None:
-                # Nothing to enrich by at all -- the one real provider
-                # requires a domain this lead never resolved one for.
-                stop_reason = "no_domain_available"
-            else:
-                # already_has_fields: the one provider's fields are already
-                # fresh in the evidence store -- "ARIE decided it didn't need
-                # to call a real paid API because enough evidence already
-                # exists" (P5's own point), not a failure. Recorded as a
-                # zero-cost cache hit, not silently skipped -- handoff item
-                # #5: "cache hits must be recorded, not skipped", the same
-                # rule _DurableCallLedger.record already follows for the
-                # simulated path.
-                cost_ledger.record_provider_call(
-                    idempotency_key=f"job:{job.job_id}:{provider.name}:{identity.canonical_domain}",
-                    provider=provider.name,
-                    entity_type="company",
-                    entity_id=identity.company_id,
-                    status=ProviderStatus.SUCCESS,
-                    cost_usd=0.0,
-                    latency_ms=0.0,
-                    lead_id=job.lead_id,
-                    cache_hit=True,
-                )
-                stop_reason = "all_providers_called"
+            acquisition = _acquire_live_evidence(
+                providers=providers,
+                identity=identity,
+                lead_id=job.lead_id,
+                job_id=job.job_id,
+                evidence_store=evidence_store,
+                cost_ledger=cost_ledger,
+                spend_guard=spend_guard,
+                model=model,
+                now=datetime.now(UTC),
+            )
+            scoring = acquisition.scoring
 
             confidence = model.predict(scoring)
             model_autonomous = confidence >= model.tau
@@ -981,7 +1339,7 @@ def _build_live_handlers(
                         "score_value": scoring.bounds.current,
                         "score_lower": scoring.bounds.lower,
                         "score_upper": scoring.bounds.upper,
-                        "stop_reason": stop_reason,
+                        "stop_reason": acquisition.stop_reason,
                         "policy_name": LIVE_POLICY_NAME,
                         "scorer_version": scoring.breakdown.model_version,
                         "confidence_calibration": model.method,
@@ -1011,8 +1369,9 @@ def _build_live_handlers(
                     "arie.autonomy_allowed": autonomy_allowed,
                     "arie.autonomy_guard": None if autonomy_allowed else LIVE_GUARD_REASON,
                     "arie.lead.final_status": str(final),
-                    "arie.stop_reason": stop_reason,
+                    "arie.stop_reason": acquisition.stop_reason,
                     "arie.shadow": identity.is_shadow,
+                    **{f"arie.acquisition.{k}": v for k, v in acquisition.audit().items()},
                 },
             )
         return None

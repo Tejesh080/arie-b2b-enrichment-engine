@@ -175,7 +175,7 @@ src/arie/
   scoring/      deterministic scorer and score bounds (no I/O, no model)
   confidence/   calibrated confidence model, feature extraction, tau selection
   policy/       the stopping controller that composes scoring + confidence
-  providers/    EnrichmentProvider Protocol; simulated registry, synthetic-identity fallback, live adapter, Apollo contract (fixtures only)
+  providers/    EnrichmentProvider Protocol; simulated registry, synthetic-identity fallback, two live adapters (Abstract company, Apollo person) + Apollo's fixture-only normalization contract
   normalization/ canonical taxonomy + the provider->scorer adapter boundary
   icp.py        the named reference ICP for Live V1 (descriptive, not a scorer)
   live/         live-mode autonomy guard and spend caps

@@ -240,15 +240,20 @@ never in this repo.**
 | `LEAD_BUDGET_USD_CAP`, `TARGET_AUTONOMOUS_ERROR_RATE`, `LATENCY_PENALTY_USD_PER_SEC`, `WORKER_POLL_INTERVAL_SEC`, `WORKER_MAX_ATTEMPTS`, `WORKER_LEASE_SECONDS` | `arie-worker`, optional | policy/runtime defaults apply if unset |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME` | shared, optional | tracing stays off if unset |
 
-`DEEPSEEK_API_KEY` and the Firecrawl/Apollo/Hunter/Langfuse/OpenAI/
-Supabase-client placeholders in `.env.example` are not read by any path the
-API or worker actually run — do not configure them on Railway.
+`APOLLO_API_KEY` **is** read on any worker running `PROVIDER_MODE=live` —
+that mode builds both real adapters at startup and refuses to start with either
+key missing, rather than silently running a half-blind pipeline that still
+reports coverage and cost. `DEEPSEEK_API_KEY` and the
+Firecrawl/Hunter/Langfuse/OpenAI/Supabase-client placeholders in `.env.example`
+are not read by any path the API or worker actually run — do not configure them
+on Railway.
 
 **Provider safety.** Deploy with `PROVIDER_MODE=simulated` first and prove
 the hosted core — API, worker, Supabase, migrations, health, lead processing
 — end to end before ever touching `PROVIDER_MODE=live`: flipping it makes
-the worker call the real Abstract API for *any* ingested lead, not only
-corpus identities. To return to zero real-provider spend, set
+the worker call the real Abstract API — and, when company evidence leaves the
+decision open, the real Apollo API — for *any* ingested lead, not only corpus
+identities. To return to zero real-provider spend, set
 `PROVIDER_MODE=simulated` on `arie-worker` and redeploy it; nothing else
 needs to change.
 
@@ -349,8 +354,9 @@ correctly under a small amount of real concurrency.
   no environment variables or rollback path here. The local Docker `n8n`
   service remains, deliberately — a reproducible zero-credential demo is a
   different thing from the real integration target, and both are wanted.
-- **`PROVIDER_MODE=live` by default.** A real adapter has existed since P5
-  (`arie.providers.live_abstract`, Abstract API's Company Enrichment) and is
+- **`PROVIDER_MODE=live` by default.** Real adapters have existed since P5
+  (`arie.providers.live_abstract`, Abstract API's Company Enrichment; and now
+  `arie.providers.live_apollo`, Apollo People Enrichment) and are
   production-capable — the "no real adapter exists yet (ADR 0003)" framing
   this bullet used to carry no longer describes the code. What's still true:
   the *hosted* deployment starts in `simulated` mode deliberately, not

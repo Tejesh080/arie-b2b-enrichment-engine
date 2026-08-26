@@ -166,11 +166,16 @@ spend. Everything
 around it is real: real Postgres queue, real worker, real persistence, real
 receipts, real human-review workflow, real n8n orchestration.
 
-**One real provider integration exists and was verified with real billed calls.**
-ARIE's provider abstraction is wired to Abstract API's Company Enrichment
-endpoint through the same interface the simulator implements. Verifying it turned
-up a genuine bug on the first live call, which is documented rather than quietly
-fixed.
+**Two real provider integrations exist**, both behind the same interface the
+simulator implements: Abstract API's Company Enrichment (firmographics) and
+Apollo's People Enrichment (seniority and function). Abstract was verified with
+real billed calls, and verifying it turned up a genuine bug on the first one,
+documented rather than quietly fixed. Apollo is complete and green against
+fixtures and mocked transports; its one real smoke call is pending an API key.
+
+Live mode calls them in a fixed order and calls the second one *only if the
+first left the decision open* — so a lead that firmographics already answer
+confidently costs one cheap call, not two.
 
 Details of both: [provider-integration.md](docs/provider-integration.md).
 
@@ -224,7 +229,14 @@ frozen corpus, and prints their receipts.
 
 - The benchmark is synthetic. It proves the policy against a modelled provider
   distribution, not against real-world data drift or vendor-specific failures.
-- Only one real provider is wired, populating two fields.
+- Two real providers are wired, populating four of seven scored fields.
+  `buying_intent`, `recent_trigger_event`, and `disqualifying_flag` have no
+  trustworthy source and stay honestly unknown — which keeps the score floor at
+  zero for every live lead.
+- Apollo's adapter has not yet made a real API call. Its contract was verified
+  against Apollo's published documentation and every path is covered by fixture
+  and mock tests, but "verified against the docs" is not "verified against the
+  API".
 - No auth, no tenancy. This is a single-tenant proof, not a product.
 - The hosted concurrency check is small — five simultaneous submissions
   completed without duplicate processing. That is not load testing.

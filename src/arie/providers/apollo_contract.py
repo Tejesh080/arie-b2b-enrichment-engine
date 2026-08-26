@@ -3,17 +3,23 @@
 **This module makes zero network requests and requires zero credentials.** It
 is the normalization half of a provider adapter, written and tested against
 fixtures first, so that the shape of what Apollo must return — and what ARIE
-will do with it — is reviewable *before* a paid provider is wired in. The
-transport half (an ``httpx.Client``, a ``fetch``, a ledger entry, a registry
-registration) deliberately does not exist yet. ``arie.jobs.handlers`` does not
-import this, and ``arie.live.providers.REGISTERED_LIVE_PROVIDER_NAMES`` does
-not contain it.
+will do with it — was reviewable *before* a paid provider was wired in.
+
+The transport half now exists, in ``arie.providers.live_apollo``: an
+``httpx.Client``, a ``fetch``, a ledger entry, and a registration in
+``arie.live.providers.REGISTERED_LIVE_PROVIDER_NAMES``. **The split survives
+that, and is meant to.** Everything the transport emits still passes through
+:func:`normalize_apollo_person` here, so the part that decides what a job title
+is *worth* stays readable, reviewable, and exhaustively fixture-testable
+without a key, a client, or a mock — a property
+``tests/unit/test_apollo_contract.py`` asserts against this module's imports
+rather than its prose.
 
 **Why Apollo, and why person enrichment specifically.** The Live V1 audit found
 Abstract supplies only ``employee_count`` and ``industry`` — both company-level.
 That leaves ``title_seniority`` (up to 20.0 ICP points) and ``title_function``
 (up to 15.0) permanently unknown for every live lead, which is 35 of the
-scorer's 90 reachable points and, more importantly, keeps the score bounds so
+scorer's 100 reachable points and, more importantly, keeps the score bounds so
 wide that almost nothing can settle. Apollo's People Enrichment endpoint
 returns both, keyed by an email address ARIE already has at ingestion. No other
 candidate provider closes that gap with an identifier already in hand.
@@ -81,10 +87,13 @@ __all__ = [
 ]
 
 APOLLO_PROVIDER_NAME = "apollo_person_enrichment"
-"""Declared now so ``arie.live.providers.LIVE_PROVIDER_NAMES`` can include it,
-and therefore so the spend caps cover it from the moment it is wired rather
-than from the moment someone remembers to add it. No ``provider_calls`` row
-carries this name today, so the budget query sums zero for it."""
+"""Declared here, in the module with no credentials, rather than in the adapter.
+
+That ordering was the point: ``arie.live.providers.LIVE_PROVIDER_NAMES`` could
+include this name while no client existed, so the spend caps covered Apollo
+from its first real call rather than from the moment someone remembered to add
+it. ``provider_calls`` rows carry it now, and the budget query has been summing
+them since the first one."""
 
 APOLLO_PROVIDES_FIELDS: tuple[str, ...] = ("title_seniority", "title_function")
 """Exactly the two scored fields. Kept narrow on purpose: the EVoI controller
@@ -205,7 +214,7 @@ def _prefer_enum_then_title(
     2. The enum is absent or unmappable but the title parses. Use the parsed
        value. Apollo omits these enums for a meaningful share of records, and
        without this those leads would be permanently unknown on 35 of the
-       scorer's 90 points.
+       scorer's 100 points.
     3. Neither works. Return the **raw** vendor value rather than ``None``, so
        ``arie.normalization.contract`` reports it in ``unmapped`` with the
        string Apollo actually sent. Returning ``None`` here would silently

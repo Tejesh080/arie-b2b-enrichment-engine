@@ -202,22 +202,56 @@ unobservable**: no configured provider supplies them. They are reported as
 `UNOBSERVABLE` rather than dropped or, far worse, guessed. ARIE never invents a
 `disqualifying_flag`.
 
-### Next provider: Apollo (contract only, not integrated)
+### Second provider: Apollo person enrichment
 
-Abstract supplies company firmographics only, leaving `title_seniority` (20
+Abstract supplies company firmographics only, which left `title_seniority` (20
 points) and `title_function` (15) unknown for every live lead — 35 of the
-scorer's 90 reachable points. `arie.providers.apollo_contract` defines what an
-Apollo person-enrichment adapter must return and how it normalizes, tested
-against fixtures in `tests/fixtures/apollo/`.
+scorer's 100 reachable points. Apollo's People Enrichment endpoint
+(`POST /api/v1/people/match`, `x-api-key` header, matched on the work email
+ARIE already holds) closes that gap.
 
-It makes **no network calls and reads no API key**. There is no HTTP client, no
-`fetch`, and it is not registered with any worker. It is already listed in
-`arie.live.providers.LIVE_PROVIDER_NAMES` so the spend caps cover it from the
-moment it is wired rather than from the moment someone remembers to add it.
+The adapter arrived in two reviewable halves, and the split survives:
+`arie.providers.apollo_contract` is the raw→canonical mapping, with no HTTP
+client and no credential, tested entirely against fixtures in
+`tests/fixtures/apollo/`; `arie.providers.live_apollo` is the transport that
+sits behind it. Everything the second emits still goes through the first.
+
+**Cost is modelled from credits, not from dollars Apollo reports.** Apollo
+meters this endpoint in credits — one for a demographics match, zero when it
+finds nobody. `APOLLO_PERSON_COST_USD_PER_SUCCESS` converts that at a stated
+rate ($49/month ÷ 2,500 credits = $0.0196), and the ledger row carries
+`credits_consumed` alongside the dollars so the modelled figure is never
+mistaken for billed spend. This corrected an earlier estimate in the codebase
+that put Apollo credits "well under a cent" — verification against the
+published plans put them an order of magnitude higher.
+
+`reveal_personal_emails` and `reveal_phone_number` are sent as `false`
+explicitly. A returned mobile number costs eight extra credits, and ARIE scores
+neither — they would be PII fetched for no decision-relevant purpose.
 
 Apollo's intent and job-change data is deliberately unused: `buying_intent` is
 the largest field in the ruleset and the vendor's methodology is not
 inspectable.
+
+### Two providers, and the second one is conditional
+
+Ordering is fixed and deterministic — Abstract, then Apollo
+(`arie.live.providers.REGISTERED_LIVE_PROVIDER_NAMES`). Company evidence is an
+order of magnitude cheaper and is shared by every future lead at the same
+employer; person evidence is per-person and can never be amortised that way, so
+buying it before finding out whether it is needed is the expensive mistake.
+
+Between the two, the loop re-asks the existing stopping rule. A five-person
+construction firm is a confident reject on firmographics alone, so Apollo is
+never contacted and the receipt reports it under `providers.not_called` with a
+`confidence_reached` stop reason. A 240-person software company sits near the
+qualify boundary with seniority unknown, so Apollo is called. Both paths are
+asserted end-to-end in
+`tests/integration/test_live_multi_provider_integration.py`.
+
+This is **not** a marketplace or an EVoI optimiser over live providers. It is
+the smallest arrangement that makes "did ARIE decide it needed to spend?" a
+question the system can actually be asked.
 
 ---
 

@@ -238,16 +238,28 @@ def test_the_budget_stop_reasons_are_exactly_the_two_refusals() -> None:
 
 
 def test_the_daily_query_covers_every_provider_that_could_bill() -> None:
-    """Including Apollo, which is defined but not yet wired. A paid provider
-    added to the codebase and forgotten here would be invisible to the cap —
-    so it is added *before* it can spend, not after."""
+    """Apollo was in this tuple while it was still a fixture-only contract with
+    no client and no key — added *before* it could spend, not after. It now has
+    an adapter, and the cap covered it from the first call rather than from the
+    moment someone remembered."""
     assert ABSTRACT_PROVIDER_NAME in LIVE_PROVIDER_NAMES
     assert APOLLO_PROVIDER_NAME in LIVE_PROVIDER_NAMES
 
 
-def test_only_abstract_is_actually_registered_today() -> None:
-    assert REGISTERED_LIVE_PROVIDER_NAMES == (ABSTRACT_PROVIDER_NAME,)
+def test_every_registered_provider_is_covered_by_the_daily_cap() -> None:
+    """The invariant that actually matters, and it survives both tuples
+    changing: a provider the live handler builds and calls must be one the
+    daily spend query sums. The previous version of this test pinned the
+    literal one-element tuple, which asserted a phase rather than a property —
+    it had to be rewritten the moment a second provider was wired, which is
+    exactly when a spend-cap test should have held firm instead.
+
+    The subset direction is the load-bearing one. ``LIVE_PROVIDER_NAMES`` may
+    legitimately be *wider* (a contract defined ahead of its adapter, as Apollo
+    itself was); it must never be narrower, because that is a registered
+    provider spending money outside the cap."""
     assert set(REGISTERED_LIVE_PROVIDER_NAMES) <= set(LIVE_PROVIDER_NAMES)
+    assert REGISTERED_LIVE_PROVIDER_NAMES == (ABSTRACT_PROVIDER_NAME, APOLLO_PROVIDER_NAME)
 
 
 def test_no_simulated_catalogue_provider_counts_against_the_live_budget() -> None:

@@ -254,6 +254,90 @@ class LiveProviderConfig:
 
 
 @dataclass(frozen=True)
+class ApolloPersonConfig:
+    """Config for the second real enrichment adapter — ``arie.providers.live_apollo``.
+
+    Apollo's People Enrichment endpoint (``docs.apollo.io/reference/people-enrichment``):
+    ``POST https://api.apollo.io/api/v1/people/match`` with an ``x-api-key`` header
+    and the match identifiers as query parameters, returning one ``person`` object
+    whose ``seniority``/``departments``/``title`` fields become ARIE's
+    ``title_seniority`` and ``title_function`` — the 35 of the scorer's 100
+    reachable points ``LiveProviderConfig``'s company-only provider can never reach.
+
+    Separate from ``LiveProviderConfig`` rather than a second set of fields on it:
+    the two vendors share no setting (different auth mechanism, different cost
+    unit, different miss semantics), and one class holding both would need every
+    field prefixed by vendor anyway.
+    """
+
+    api_key: str = field(default_factory=lambda: os.getenv("APOLLO_API_KEY", ""))
+    """Sent as the ``x-api-key`` request header, never as a query parameter —
+    unlike Abstract, Apollo offers a header mechanism, so the credential never
+    reaches a URL that could be logged by a proxy or an exception's ``str()``."""
+
+    base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "APOLLO_BASE_URL", "https://api.apollo.io/api/v1/people/match"
+        )
+    )
+    """The exact endpoint, used verbatim. Apollo versions its API in the path
+    (``/api/v1/``), so an override is how you pin or move a version."""
+
+    timeout_seconds: float = field(
+        default_factory=lambda: _env_float("APOLLO_TIMEOUT_SECONDS", 10.0)
+    )
+
+    cost_usd_per_success: float = field(
+        default_factory=lambda: _env_float("APOLLO_PERSON_COST_USD_PER_SUCCESS", 0.0196)
+    )
+    """A MODELLED USD equivalent of the credit Apollo actually consumes — not a
+    dollar figure Apollo reports, and never to be read as billed spend.
+
+    Apollo meters this endpoint in **credits**, not dollars: one credit for a
+    demographics match, zero when no credit-consuming data is found, and an
+    additional eight if a mobile phone number is returned (which
+    ``arie.providers.live_apollo`` disables outright — see ``credits_per_match``).
+    ARIE's ledger stores USD, so the credit is converted here, once, at a rate
+    stated rather than assumed: Apollo's published Basic plan at time of writing
+    is $49/user/month for 30,000 credits/year — 2,500/month — giving
+    $49 / 2,500 = $0.0196/credit. The Professional and Organization plans work
+    out within a twentieth of a cent of the same figure, so the number is not
+    especially plan-sensitive.
+
+    **This corrects an assumption, and the correction is the reason to state the
+    derivation.** ``LiveBudgetConfig.per_lead_usd`` previously described Apollo's
+    per-credit price as "well under a cent"; verifying the published plans while
+    wiring this adapter put it at roughly two cents — an order of magnitude out.
+    The $0.05 per-lead cap still comfortably covers one Abstract call plus one
+    Apollo call ($0.02125 together), so nothing had to move; had the estimate
+    been trusted instead of checked, the first live person enrichment would have
+    silently sat much closer to the cap than anyone believed.
+
+    What this figure is **not**: the amount an Apollo invoice will show. Credits
+    are bought in monthly plan blocks and expire; a lead that consumes one credit
+    has consumed a unit of an already-paid allowance, not $0.0196 of new spend.
+    ARIE ledgers it as an acquisition cost because the acquisition policy needs a
+    comparable number to reason about, and ``arie.api.receipt`` presents it the
+    same way it presents Abstract's estimate. Reconciling either against a real
+    vendor invoice is a separate exercise neither number claims to have done."""
+
+    credits_per_match: int = 1
+    """Credits Apollo consumes for one successful match under the request
+    ``arie.providers.live_apollo`` actually sends.
+
+    Not env-configurable: it is a property of Apollo's documented metering and of
+    the request the adapter builds (``reveal_personal_emails=false``,
+    ``reveal_phone_number=false``), not a knob. Recorded so the adapter can put
+    the vendor's own unit on its result alongside the modelled dollars, and so
+    that anyone enabling phone reveal has to change this line and read this
+    docstring rather than discovering a 9x cost multiplier from an invoice."""
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key)
+
+
+@dataclass(frozen=True)
 class LiveBudgetConfig:
     """Hard spend ceilings for ``PROVIDER_MODE=live`` (Live V1 Foundation, Phase 6).
 
@@ -288,12 +372,16 @@ class LiveBudgetConfig:
     )
     """Ceiling for one lead's total live enrichment.
 
-    $0.05 is ~30 Abstract calls, or comfortable headroom for one Abstract call
-    plus one person-enrichment call once a second provider exists (Apollo's
-    published per-credit pricing sits well under a cent at plan volumes). A
-    single lead needing more than this is a bug — a retry loop, a cache that is
-    not being read — and the honest response is to stop and ask a human, which
-    is exactly what exhausting it does."""
+    $0.05 is ~30 Abstract calls, or comfortable headroom for the full live
+    acquisition path — one Abstract company call ($0.00165) plus one Apollo
+    person call ($0.0196) is $0.02125, well under half the cap. That Apollo
+    figure is a *verified* one and it replaces an earlier guess in this very
+    docstring that its credits cost "well under a cent"; see
+    ``ApolloPersonConfig.cost_usd_per_success`` for the derivation and why the
+    correction did not require moving this number. A single lead needing more
+    than this is a bug — a retry loop, a cache that is not being read — and the
+    honest response is to stop and ask a human, which is exactly what
+    exhausting it does."""
 
     def __post_init__(self) -> None:
         if self.per_lead_usd > self.daily_usd:
@@ -336,4 +424,5 @@ RUNTIME = RuntimeConfig()
 OBSERVABILITY = ObservabilityConfig()
 LLM = LLMConfig()
 LIVE_PROVIDER = LiveProviderConfig()
+APOLLO_PERSON = ApolloPersonConfig()
 LIVE_BUDGET = LiveBudgetConfig()

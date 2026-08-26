@@ -91,11 +91,13 @@ verify against current code/docs before using if this page is old.
   autonomous/human-review split, and a Decision Receipt endpoint that
   reconstructs *why* any past decision stopped where it did from persisted
   state alone.
-- Shipped a real third-party provider integration (Abstract API company
-  enrichment) behind the same `EnrichmentProvider` protocol the simulator
-  implements, plus a shadow-evaluation mode that runs the full pipeline
-  alongside an existing workflow with zero authoritative effect, gated so it
-  can never accidentally spend real money outside explicit opt-in.
+- Shipped real third-party provider integrations (Abstract API company
+  enrichment, Apollo person enrichment) behind the same `EnrichmentProvider`
+  protocol the simulator implements, with a deterministic acquisition order
+  that calls the more expensive person lookup *only* when company evidence
+  leaves the decision open — plus a shadow-evaluation mode that runs the full
+  pipeline alongside an existing workflow with zero authoritative effect, gated
+  so it can never accidentally spend real money outside explicit opt-in.
 - Deployed the backend to Railway (two services, one Docker image, sharing a
   Postgres queue and a hosted Supabase database) and the frontend to Vercel,
   then proved it live end-to-end through the public API: an autonomous
@@ -240,7 +242,11 @@ known, named gap, not an oversight discovered here.
 The synthetic benchmark's honesty is also its limit — it proves the policy
 beats alternatives against a *modeled* provider/noise distribution, not
 against real-world data drift, adversarial providers, or vendor-specific
-failure modes. Only one real provider is wired (Abstract API, two fields).
+failure modes. Two real providers are wired (Abstract API company
+enrichment and Apollo person enrichment, four of seven scored fields
+between them), and only the first has made real billed calls — Apollo's
+contract is verified against its published documentation and covered by
+fixture/mock tests, which is not the same as verified against the API.
 The only concurrency proof against the hosted deployment is small — 5
 leads submitted simultaneously against the same identity, all settled
 correctly with no duplicate processing (below) — not real load testing. No
@@ -296,7 +302,9 @@ actually win — none tested here.
   that proof ran with `PROVIDER_MODE=simulated`; its costs are modeled/
   configured figures, not real vendor spend. Only the P5 Abstract API
   verification involved actual billed calls (and at $0.00165/call, real but
-  small).
+  small). Apollo's per-call figure is a *modelled* credit-to-dollar conversion
+  at a stated rate, never a billed amount — the ledger records the credit count
+  next to it so the two cannot be confused.
 - "ARIE autonomously qualifies real leads" — it does not, and is blocked in
   code from doing so. Autonomy is validated only on the synthetic corpus; a
   lead enriched by a real provider always ends at a human. Live mode

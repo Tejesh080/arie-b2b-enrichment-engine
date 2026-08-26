@@ -41,7 +41,7 @@ def _fixture(name: str) -> dict[str, Any]:
 
 def test_the_provider_declares_exactly_the_two_fields_it_closes_the_gap_on() -> None:
     """Abstract supplies only company firmographics; seniority and function are
-    35 of the scorer's 90 reachable points and are unknown for every live lead
+    35 of the scorer's 100 reachable points and are unknown for every live lead
     without a person provider. Over-declaring would make the EVoI controller
     think a call is worth more than it is."""
     assert APOLLO_PROVIDES_FIELDS == ("title_seniority", "title_function")
@@ -49,17 +49,35 @@ def test_the_provider_declares_exactly_the_two_fields_it_closes_the_gap_on() -> 
         assert field_name in SCORED_FIELDS
 
 
-def test_apollo_is_not_wired_into_the_running_system() -> None:
-    """Phase 8's hard constraint: define the contract, do not integrate. If
-    this ever fails, a paid provider was registered without the review this
-    phase exists to enable."""
-    from arie.live.providers import REGISTERED_LIVE_PROVIDER_NAMES
+def test_apollo_is_wired_second_in_the_live_acquisition_order() -> None:
+    """This test used to assert the opposite — that Apollo was *not* registered
+    — because the phase before this one deliberately shipped the normalization
+    contract without a transport, so the mapping could be reviewed before a
+    paid provider was wired in. That review happened; the adapter now exists in
+    ``arie.providers.live_apollo``.
 
-    assert APOLLO_PROVIDER_NAME not in REGISTERED_LIVE_PROVIDER_NAMES
+    What is worth pinning now is the ordering, not the mere membership. Apollo
+    must come *after* the company provider: it costs an order of magnitude more
+    and its evidence is per-person, so it can never be amortised across a
+    company the way firmographics can. A refactor that reorders this tuple
+    would silently start paying for person enrichment on leads that were
+    already a confident reject on firmographics alone."""
+    from arie.live.providers import REGISTERED_LIVE_PROVIDER_NAMES
+    from arie.providers.live_abstract import PROVIDER_NAME as ABSTRACT_PROVIDER_NAME
+
+    assert REGISTERED_LIVE_PROVIDER_NAMES == (ABSTRACT_PROVIDER_NAME, APOLLO_PROVIDER_NAME)
 
 
 def test_the_contract_module_has_no_http_client_and_no_credentials() -> None:
-    """Checked against what the module *imports and defines*, not against its
+    """Still true, and still worth asserting now that a transport exists.
+
+    Wiring Apollo added ``arie.providers.live_apollo``; it did not move the
+    network into this module. The split is what lets the vocabulary mapping —
+    the part that decides what a job title is *worth* — be read, reviewed, and
+    exhaustively fixture-tested without a key, a client, or a mock. If a future
+    change puts an ``httpx`` import here, that property is gone.
+
+    Checked against what the module *imports and defines*, not against its
     prose — the docstring names `httpx.Client` and `APOLLO_API_KEY` precisely
     to say they are absent, and a naive text search would read that as their
     presence."""
