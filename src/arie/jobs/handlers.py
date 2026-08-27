@@ -118,6 +118,7 @@ from arie.providers.live_abstract import (
     AbstractCompanyEnrichmentProvider,
 )
 from arie.providers.live_apollo import ApolloPersonEnrichmentProvider
+from arie.providers.live_hunter import HunterEnrichmentProvider
 from arie.providers.simulated import CallLedger, build_from_leads
 from arie.providers.synthetic import synthesize_corpus_lead
 from arie.scoring.engine import ScoringResult, score_evidence
@@ -907,10 +908,15 @@ class _LiveAcquisitionOutcome:
     serve — never because they were thought unhelpful."""
     not_needed: tuple[str, ...]
     """Providers never reached because acquisition had already stopped. The
-    interesting set: this is where a skipped Apollo lands when company evidence
-    already settled the question."""
-    failed: tuple[str, ...]
-    cost_usd: float
+    interesting set: this is where a skipped person provider lands when company
+    evidence already settled the question."""
+    redundant: tuple[str, ...] = ()
+    """Providers skipped because every field they sell was already held from
+    *other* sources — e.g. Apollo when Hunter already supplied both person
+    fields. Not a cache hit (nothing of theirs was served) and not a ledger
+    row (no call was made); the audit trail is where the skip is visible."""
+    failed: tuple[str, ...] = ()
+    cost_usd: float = 0.0
 
     def audit(self) -> dict[str, Any]:
         """Span/event-safe summary — names and one number, no payloads."""
@@ -919,6 +925,7 @@ class _LiveAcquisitionOutcome:
             "cache_hits": list(self.cache_hits),
             "unreachable": list(self.unreachable),
             "not_needed": list(self.not_needed),
+            "redundant": list(self.redundant),
             "failed": list(self.failed),
             "cost_usd": self.cost_usd,
             "stop_reason": self.stop_reason,
@@ -988,6 +995,7 @@ def _acquire_live_evidence(
     cache_hits: list[str] = []
     unreachable: list[str] = []
     not_needed: list[str] = []
+    redundant: list[str] = []
     failed: list[str] = []
     cost_usd = 0.0
     stop_reason: str | None = None
@@ -1005,20 +1013,38 @@ def _acquire_live_evidence(
             unreachable.append(provider.name)
             continue
 
-        held = {item.field_name for item in evidence.get(ref.entity_type, ())}
+        held_rows = evidence.get(ref.entity_type, ())
+        held = {item.field_name for item in held_rows}
         if set(provider.provides_fields) <= held:
-            cost_ledger.record_provider_call(
-                idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
-                provider=provider.name,
-                entity_type=ref.entity_type,
-                entity_id=ref.entity_id,
-                status=ProviderStatus.SUCCESS,
-                cost_usd=0.0,
-                latency_ms=0.0,
-                lead_id=lead_id,
-                cache_hit=True,
-            )
-            cache_hits.append(provider.name)
+            # Everything this provider sells is already known. HOW it is
+            # already known decides what gets recorded, and the distinction
+            # only exists now that two person providers sell the same fields:
+            #
+            # * Some held row came from THIS provider — a true cache hit
+            #   (this lead, or an earlier one, already paid this vendor for
+            #   this fact). Recorded as the zero-cost cache-hit ledger row
+            #   the handoff requires: cache hits are recorded, never skipped.
+            # * Every held row came from OTHER sources — the provider is
+            #   simply redundant for coverage. No ledger row: no call was
+            #   made and nothing of this vendor cache was served, so a
+            #   "cache_hit" row here would attribute another vendor evidence
+            #   to this one. It lands in the audit trail instead.
+            own_sources = {item.source for item in held_rows}
+            if provider.name in own_sources:
+                cost_ledger.record_provider_call(
+                    idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
+                    provider=provider.name,
+                    entity_type=ref.entity_type,
+                    entity_id=ref.entity_id,
+                    status=ProviderStatus.SUCCESS,
+                    cost_usd=0.0,
+                    latency_ms=0.0,
+                    lead_id=lead_id,
+                    cache_hit=True,
+                )
+                cache_hits.append(provider.name)
+            else:
+                redundant.append(provider.name)
             continue
 
         allowance = spend_guard.allowance(
@@ -1033,16 +1059,13 @@ def _acquire_live_evidence(
         result = provider.fetch(ref.as_entity())
         called.append(provider.name)
         cost_usd += result.cost_usd
-        cost_ledger.record_provider_call(
-            idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
-            provider=provider.name,
-            entity_type=ref.entity_type,
-            entity_id=ref.entity_id,
-            status=result.status,
-            cost_usd=result.cost_usd,
-            latency_ms=result.latency_ms,
+        _ledger_live_call(
+            cost_ledger,
+            job_id=job_id,
             lead_id=lead_id,
-            cache_hit=False,
+            provider_name=provider.name,
+            ref=ref,
+            result=result,
         )
 
         if result.status in (ProviderStatus.ERROR, ProviderStatus.TIMEOUT):
@@ -1083,6 +1106,7 @@ def _acquire_live_evidence(
         cache_hits=tuple(cache_hits),
         unreachable=tuple(unreachable),
         not_needed=tuple(not_needed),
+        redundant=tuple(redundant),
         failed=tuple(failed),
         cost_usd=cost_usd,
     )
@@ -1168,23 +1192,66 @@ def _live_idempotency_key(job_id: UUID, provider_name: str, ref: _LiveEntityRef)
     """Derived from the job id, so a crashed-and-retried job reproduces its own
     keys and ``PostgresCostLedger``'s UNIQUE constraint refuses the duplicate
     charge (ADR 0002). The entity's canonical key is part of it because one job
-    can now call two providers against two different entities."""
+    can now call several providers against two different entities."""
     return f"job:{job_id}:{provider_name}:{ref.canonical_key}"
+
+
+def _ledger_live_call(
+    cost_ledger: PostgresCostLedger,
+    *,
+    job_id: UUID,
+    lead_id: UUID,
+    provider_name: str,
+    ref: _LiveEntityRef,
+    result: ProviderResult,
+) -> None:
+    """One real call's ledger row, provenance included.
+
+    The adapters put their cost provenance on ``ProviderResult.raw`` —
+    ``error_kind`` (the stable failure vocabulary), ``credits_consumed`` (the
+    vendor's own metering unit, where the vendor counts credits), and
+    ``cost_basis`` (what ``cost_usd`` *is*). This is the single place those
+    ride from the result onto the durable ``provider_calls`` columns (0010),
+    so the quota-cooldown guard can read failure kinds back out of the same
+    ledger the spend caps read, and so a ledger row's dollars can always be
+    audited back to what the vendor actually counted.
+    """
+    error_kind = result.raw.get("error_kind")
+    credits = result.raw.get("credits_consumed")
+    cost_basis = result.raw.get("cost_basis")
+    cost_ledger.record_provider_call(
+        idempotency_key=_live_idempotency_key(job_id, provider_name, ref),
+        provider=provider_name,
+        entity_type=ref.entity_type,
+        entity_id=ref.entity_id,
+        status=result.status,
+        cost_usd=result.cost_usd,
+        latency_ms=result.latency_ms,
+        lead_id=lead_id,
+        cache_hit=False,
+        error_kind=error_kind if isinstance(error_kind, str) else None,
+        credits_used=credits if isinstance(credits, int | float) else None,
+        cost_basis=cost_basis if isinstance(cost_basis, str) else None,
+    )
 
 
 def _default_live_providers() -> tuple[EnrichmentProvider, ...]:
     """Build every registered live adapter, or fail loudly saying which key is missing.
 
-    Both are built, and a missing key for *either* raises at build time rather
-    than at call time — the same rule P5 established for Abstract, applied to
-    the second provider without exception. The alternative (build whichever
-    adapters are configured and quietly run with fewer) is the failure mode
-    that rule exists to prevent: a live deployment reporting coverage and cost
-    for a pipeline that silently lost half its evidence, with nothing in the
-    receipt to say so. A live worker either has both credentials or does not
-    start.
+    All three are built, and a missing key for *any* raises at build time
+    rather than at call time — the same rule P5 established for Abstract,
+    applied to each provider since without exception. The alternative (build
+    whichever adapters are configured and quietly run with fewer) is the
+    failure mode that rule exists to prevent: a live deployment reporting
+    coverage and cost for a pipeline that silently lost part of its evidence,
+    with nothing in the receipt to say so. A live worker either has every
+    registered credential or does not start.
     """
-    return (AbstractCompanyEnrichmentProvider.build(), ApolloPersonEnrichmentProvider.build())
+    return (
+        AbstractCompanyEnrichmentProvider.build(),
+        HunterEnrichmentProvider.build(),
+        ApolloPersonEnrichmentProvider.build(),
+    )
 
 
 def _resolve_live_providers(

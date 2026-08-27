@@ -783,6 +783,16 @@ _FUNCTION_ALIASES: dict[str, str] = {
     "support": "other",
     "administrative": "other",
     "general management": "other",
+    # Hunter/Clearbit `employment.role` enum values observed nowhere else.
+    # (`canonical_key` folds the underscores: "customer_service" arrives here
+    # as "customer service".) All land in `other` on the stated conservative
+    # bias: each is a genuinely *known* function that is simply not an ICP
+    # target — known-and-worth-little, not unknown.
+    "customer service": "other",
+    "consulting": "other",
+    "education": "other",
+    "health professional": "other",
+    "real estate": "other",
 }
 
 # Ordered phrase rules over a free-text title. Order encodes precedence for

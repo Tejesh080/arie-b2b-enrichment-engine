@@ -1,0 +1,9 @@
+{
+  "errors": [
+    {
+      "id": "not_found",
+      "code": 404,
+      "details": "No data was found for this email address."
+    }
+  ]
+}

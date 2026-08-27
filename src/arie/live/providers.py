@@ -20,6 +20,7 @@ from collections.abc import Iterable
 
 from arie.providers.apollo_contract import APOLLO_PROVIDER_NAME
 from arie.providers.base import EnrichmentProvider
+from arie.providers.hunter_contract import HUNTER_PROVIDER_NAME
 from arie.providers.live_abstract import PROVIDER_NAME as ABSTRACT_PROVIDER_NAME
 
 __all__ = [
@@ -28,42 +29,52 @@ __all__ = [
     "acquisition_order",
 ]
 
-REGISTERED_LIVE_PROVIDER_NAMES: tuple[str, ...] = (ABSTRACT_PROVIDER_NAME, APOLLO_PROVIDER_NAME)
-"""Providers the live handler actually builds and calls, **in acquisition order**.
+REGISTERED_LIVE_PROVIDER_NAMES: tuple[str, ...] = (
+    ABSTRACT_PROVIDER_NAME,
+    HUNTER_PROVIDER_NAME,
+    APOLLO_PROVIDER_NAME,
+)
+"""Providers the live handler actually builds and calls, **in default
+acquisition order**.
 
 The order is the policy, not an accident of how the tuple was typed, and it is
-deliberately fixed rather than optimised:
+cheapest-first end to end — the same convention ``arie.providers.catalog``'s
+simulated ordering uses:
 
-1. **Abstract (company)** first. It is an order of magnitude cheaper
-   ($0.00165 vs $0.0196 — see ``arie.config.ApolloPersonConfig``), its evidence
-   is company-scoped and therefore shared by every future lead at the same
-   employer, and cheapest-first is the same convention
-   ``arie.providers.catalog``'s simulated ordering already uses.
-2. **Apollo (person)** second, and only if company evidence left the decision
-   genuinely open. Person evidence is per-person by construction, so it can
-   never be amortised across a company the way firmographics can — buying it
-   before finding out whether it is needed is the expensive mistake.
+1. **Abstract (company, ~$0.00165/call)** first. Its evidence is
+   company-scoped and therefore shared by every future lead at the same
+   employer; the cheapest fact is also the most reusable one.
+2. **Hunter (person, ~$0.0049/success)** second — the cheaper of the two
+   person providers, and only if company evidence left the decision open.
+3. **Apollo (person, ~$0.0196/success)** last: the most expensive lookup runs
+   only when the cheaper person provider missed, failed, or covered too little.
 
-This is **not** a marketplace or an EVoI optimiser over live providers, and
-turning it into one is a separate step with its own validation. Two providers
-in a fixed order is enough to make the interesting question — *was the second
-call necessary?* — a real one that ``arie.jobs.handlers``' live loop answers
-per lead, which a single-provider pipeline could not.
+All three unit prices are modelled from published plan rates, not vendor-billed
+figures — see each config class in ``arie.config`` for its derivation. The
+default order is overridable for experiments via ``LIVE_PROVIDER_ORDER``
+(:func:`acquisition_order`), because "cheapest first" is a reasoned prior, not
+a measured result — the provider bake-off (``scripts/provider_bakeoff.py``)
+exists to replace the prior with data before any reordering is made default.
+
+This is still **not** a marketplace or an EVoI optimiser over live providers.
+Three providers in a configurable deterministic order is enough to measure
+which order is right; learning the order is a later, separately-validated step.
 """
 
-LIVE_PROVIDER_NAMES: tuple[str, ...] = (ABSTRACT_PROVIDER_NAME, APOLLO_PROVIDER_NAME)
+LIVE_PROVIDER_NAMES: tuple[str, ...] = (
+    ABSTRACT_PROVIDER_NAME,
+    HUNTER_PROVIDER_NAME,
+    APOLLO_PROVIDER_NAME,
+)
 """Every provider name that would bill a real account, wired or not.
 
-Currently identical to :data:`REGISTERED_LIVE_PROVIDER_NAMES` — Apollo used to
-sit here alone, as a contract with no client and no key, precisely so its spend
-would be capped from the moment it was wired rather than from the moment
-someone remembered to add it. It is now wired, and the two tuples agree again.
-
-They are still separate names, and should stay separate: the budget guard must
-cover the superset (anything that *could* bill), while the handler and the
-receipt's "providers not called" must reflect the subset actually built. The
-day a third contract lands ahead of its adapter, this is the tuple it goes in
-first.
+Currently identical to :data:`REGISTERED_LIVE_PROVIDER_NAMES`. They are still
+separate names, and should stay separate: the budget guard must cover the
+superset (anything that *could* bill), while the handler and the receipt's
+"providers not called" must reflect the subset actually built. Apollo spent a
+phase in this tuple alone — contract defined, adapter not yet wired — so its
+spend was capped from its first real call; the next contract that lands ahead
+of its adapter goes in this tuple first, same as Apollo did.
 """
 
 

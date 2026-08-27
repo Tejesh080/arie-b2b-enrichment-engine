@@ -259,7 +259,8 @@ def test_every_registered_provider_is_covered_by_the_daily_cap() -> None:
     itself was); it must never be narrower, because that is a registered
     provider spending money outside the cap."""
     assert set(REGISTERED_LIVE_PROVIDER_NAMES) <= set(LIVE_PROVIDER_NAMES)
-    assert REGISTERED_LIVE_PROVIDER_NAMES == (ABSTRACT_PROVIDER_NAME, APOLLO_PROVIDER_NAME)
+    # Three registered providers, every one of them inside the cap's filter.
+    assert len(REGISTERED_LIVE_PROVIDER_NAMES) == 3
 
 
 def test_no_simulated_catalogue_provider_counts_against_the_live_budget() -> None:

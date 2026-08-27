@@ -53,11 +53,12 @@ _TRACER = get_tracer("arie.ledger")
 _RECORD_PROVIDER_CALL = """
     INSERT INTO provider_calls (
         lead_id, provider, entity_type, entity_id, idempotency_key,
-        completed_at, latency_ms, cost_usd, status, cache_hit, raw_response_ref
+        completed_at, latency_ms, cost_usd, status, cache_hit, raw_response_ref,
+        error_kind, credits_used, cost_basis
     ) VALUES (
         %(lead_id)s, %(provider)s, %(entity_type)s, %(entity_id)s, %(idempotency_key)s,
         %(completed_at)s, %(latency_ms)s, %(cost_usd)s, %(status)s, %(cache_hit)s,
-        %(raw_response_ref)s
+        %(raw_response_ref)s, %(error_kind)s, %(credits_used)s, %(cost_basis)s
     )
     ON CONFLICT (idempotency_key) DO UPDATE
         SET idempotency_key = provider_calls.idempotency_key
@@ -164,6 +165,9 @@ class PostgresCostLedger:
         cache_hit: bool = False,
         raw_response_ref: str | None = None,
         completed_at: datetime | None = None,
+        error_kind: str | None = None,
+        credits_used: float | Decimal | None = None,
+        cost_basis: str | None = None,
     ) -> LedgerWrite:
         """Record one provider call. Idempotent on `idempotency_key`.
 
@@ -172,6 +176,17 @@ class PostgresCostLedger:
         production totals mean the same thing. Any `cost_usd` passed alongside
         ``cache_hit=True`` is the price the call *would* have cost and is
         deliberately not billed.
+
+        The three provenance fields (0010) are optional and unbilled — pure
+        record-keeping. `error_kind` is the adapter's stable failure vocabulary
+        (the quota-cooldown guard reads `quota_exhausted`/`insufficient_credits`
+        rows back out of this ledger); `credits_used` is the vendor's own
+        metering unit where the vendor counts credits rather than currency; and
+        `cost_basis` names what `cost_usd` *is* — a modelled credit equivalent,
+        a modelled list price, or (reserved) a vendor-billed figure. A cache
+        hit zeroes `credits_used` the same way it zeroes cost: nothing was
+        consumed, and recording the would-have-been figure would double-count
+        the original call's.
         """
         billed_cost = Decimal(0) if cache_hit else usd(cost_usd)
         billed_latency = 0 if cache_hit else int(latency_ms)
@@ -201,6 +216,11 @@ class PostgresCostLedger:
                         "status": str(status),
                         "cache_hit": cache_hit,
                         "raw_response_ref": raw_response_ref,
+                        "error_kind": error_kind,
+                        "credits_used": None
+                        if cache_hit or credits_used is None
+                        else Decimal(str(credits_used)),
+                        "cost_basis": None if cache_hit else cost_basis,
                     },
                 )
                 row = cur.fetchone()

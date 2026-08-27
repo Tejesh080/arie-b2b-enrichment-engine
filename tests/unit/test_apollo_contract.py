@@ -49,23 +49,22 @@ def test_the_provider_declares_exactly_the_two_fields_it_closes_the_gap_on() -> 
         assert field_name in SCORED_FIELDS
 
 
-def test_apollo_is_wired_second_in_the_live_acquisition_order() -> None:
-    """This test used to assert the opposite — that Apollo was *not* registered
-    — because the phase before this one deliberately shipped the normalization
-    contract without a transport, so the mapping could be reviewed before a
-    paid provider was wired in. That review happened; the adapter now exists in
-    ``arie.providers.live_apollo``.
+def test_apollo_is_wired_last_in_the_live_acquisition_order() -> None:
+    """This test has tracked Apollo's position through three phases: first it
+    asserted Apollo was *not* registered (contract-only, pre-transport), then
+    that it ran second behind Abstract, and now — with Hunter wired as the
+    cheaper person provider — that it runs *last* of three.
 
-    What is worth pinning now is the ordering, not the mere membership. Apollo
-    must come *after* the company provider: it costs an order of magnitude more
-    and its evidence is per-person, so it can never be amortised across a
-    company the way firmographics can. A refactor that reorders this tuple
-    would silently start paying for person enrichment on leads that were
-    already a confident reject on firmographics alone."""
+    The pin that survives all three phases is the same one: Apollo is the most
+    expensive lookup in the pipeline ($0.0196/success against Hunter's $0.0049
+    and Abstract's $0.00165), so every cheaper source must get its chance to
+    settle the decision first. A refactor that moves Apollo earlier would
+    silently start paying the highest unit price for evidence a cheaper vendor
+    might have supplied."""
     from arie.live.providers import REGISTERED_LIVE_PROVIDER_NAMES
-    from arie.providers.live_abstract import PROVIDER_NAME as ABSTRACT_PROVIDER_NAME
 
-    assert REGISTERED_LIVE_PROVIDER_NAMES == (ABSTRACT_PROVIDER_NAME, APOLLO_PROVIDER_NAME)
+    assert REGISTERED_LIVE_PROVIDER_NAMES[-1] == APOLLO_PROVIDER_NAME
+    assert len(REGISTERED_LIVE_PROVIDER_NAMES) == 3
 
 
 def test_the_contract_module_has_no_http_client_and_no_credentials() -> None:

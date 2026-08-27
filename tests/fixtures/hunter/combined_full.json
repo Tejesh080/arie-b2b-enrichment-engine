@@ -1,0 +1,42 @@
+{
+  "data": {
+    "person": {
+      "id": "hx_1a2b3c",
+      "name": {
+        "fullName": "Dana Okafor",
+        "givenName": "Dana",
+        "familyName": "Okafor"
+      },
+      "email": "dana.okafor@northwind-analytics.test",
+      "location": "Sydney, Australia",
+      "employment": {
+        "domain": "northwind-analytics.test",
+        "name": "Northwind Analytics",
+        "title": "VP of Sales",
+        "role": "sales",
+        "subRole": "sales_executive",
+        "seniority": "executive"
+      },
+      "linkedin": {
+        "handle": "in/dana-okafor-example"
+      }
+    },
+    "company": {
+      "id": "hxc_9z8y7x",
+      "name": "Northwind Analytics",
+      "domain": "northwind-analytics.test",
+      "category": {
+        "sector": "Information Technology",
+        "industry": "Computer Software",
+        "subIndustry": "Analytics Software"
+      },
+      "metrics": {
+        "employees": 240,
+        "employeesRange": "201-500"
+      }
+    }
+  },
+  "meta": {
+    "email": "dana.okafor@northwind-analytics.test"
+  }
+}

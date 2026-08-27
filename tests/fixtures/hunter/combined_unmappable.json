@@ -1,0 +1,29 @@
+{
+  "data": {
+    "person": {
+      "name": {
+        "fullName": "Alex Vance"
+      },
+      "email": "alex@vibes.test",
+      "employment": {
+        "name": "Vibes Inc",
+        "title": "Vibes Curator",
+        "role": "chief_vibes",
+        "seniority": "sparkle_tier_3"
+      }
+    },
+    "company": {
+      "name": "Vibes Inc",
+      "domain": "vibes.test",
+      "category": {
+        "industry": "Interpretive Vibe Consulting"
+      },
+      "metrics": {
+        "employees": "many"
+      }
+    }
+  },
+  "meta": {
+    "email": "alex@vibes.test"
+  }
+}

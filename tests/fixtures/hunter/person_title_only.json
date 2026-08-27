@@ -1,0 +1,15 @@
+{
+  "data": {
+    "name": {
+      "fullName": "Alex Chen"
+    },
+    "email": "alex.chen@copperfield.test",
+    "employment": {
+      "name": "Copperfield",
+      "title": "Head of Growth Marketing"
+    }
+  },
+  "meta": {
+    "email": "alex.chen@copperfield.test"
+  }
+}

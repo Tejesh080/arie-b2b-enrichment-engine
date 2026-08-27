@@ -338,6 +338,72 @@ class ApolloPersonConfig:
 
 
 @dataclass(frozen=True)
+class HunterConfig:
+    """Config for the third real enrichment adapter — ``arie.providers.live_hunter``.
+
+    Hunter's Combined Enrichment endpoint (``hunter.io/api-documentation/v2``):
+    ``GET https://api.hunter.io/v2/combined/find?email=...`` with an ``X-API-KEY``
+    header, returning one Clearbit-style ``{person, company}`` pair. The person's
+    ``employment.seniority``/``employment.role``/``employment.title`` become
+    ARIE's ``title_seniority``/``title_function``; the company half rides along
+    for the Abstract-overlap comparison and is deliberately not persisted as
+    evidence yet — see ``arie.providers.live_hunter``'s module docstring.
+
+    Combined rather than the narrower ``people/find`` because Hunter prices both
+    in the same class (0.2 credits per enriched email) and combined returns the
+    company data the provider bake-off needs to measure whether Hunter could
+    ever stand in for Abstract — one call answers both questions.
+    """
+
+    api_key: str = field(default_factory=lambda: os.getenv("HUNTER_API_KEY", ""))
+    """Sent as the ``X-API-KEY`` request header, never as a query parameter —
+    Hunter documents both mechanisms, and the header keeps the credential out
+    of URLs the way the Apollo adapter already does."""
+
+    base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "HUNTER_BASE_URL", "https://api.hunter.io/v2/combined/find"
+        )
+    )
+    """The exact endpoint, used verbatim. Overriding it to
+    ``.../v2/people/find`` yields the person-only variant with the same request
+    shape (both take ``email``) and no company preview."""
+
+    timeout_seconds: float = field(
+        default_factory=lambda: _env_float("HUNTER_TIMEOUT_SECONDS", 10.0)
+    )
+
+    cost_usd_per_success: float = field(
+        default_factory=lambda: _env_float("HUNTER_ENRICHMENT_COST_USD", 0.0049)
+    )
+    """A MODELLED USD equivalent of the 0.2 credits Hunter consumes for a
+    successful enrichment — not a dollar figure Hunter reports, and never to be
+    read as billed spend.
+
+    Derivation, same discipline as ``ApolloPersonConfig.cost_usd_per_success``:
+    Hunter's published Starter plan at time of writing is $49/month for 2,000
+    credits/month => $0.0245/credit, and Hunter's credit table prices an API
+    enrichment at 0.2 credits => $0.0049 per successful enrichment. Hunter's
+    own help centre states no credits are consumed when nothing is found, so a
+    miss is ledgered at zero — the same bill-on-match semantics as Apollo, and
+    the opposite of Abstract's bill-every-lookup.
+
+    That puts the three vendors in the price order the acquisition loop walks
+    them: Abstract $0.00165, Hunter $0.0049, Apollo $0.0196 — cheapest first,
+    person providers cheapest-first among themselves."""
+
+    credits_per_success: float = 0.2
+    """Hunter's own metering unit for one successful API enrichment. Not
+    env-configurable: it is a property of Hunter's published credit table, not
+    a knob. Recorded on the ledger row (``provider_calls.credits_used``) next
+    to the modelled dollars so neither figure can be mistaken for the other."""
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key)
+
+
+@dataclass(frozen=True)
 class LiveBudgetConfig:
     """Hard spend ceilings for ``PROVIDER_MODE=live`` (Live V1 Foundation, Phase 6).
 
@@ -425,4 +491,5 @@ OBSERVABILITY = ObservabilityConfig()
 LLM = LLMConfig()
 LIVE_PROVIDER = LiveProviderConfig()
 APOLLO_PERSON = ApolloPersonConfig()
+HUNTER = HunterConfig()
 LIVE_BUDGET = LiveBudgetConfig()

@@ -1,0 +1,30 @@
+{
+  "data": {
+    "person": {
+      "name": {
+        "fullName": "Robin Ashworth"
+      },
+      "email": "robin@meridian-labs.test",
+      "employment": {
+        "name": "Meridian Labs",
+        "title": null,
+        "role": "marketing",
+        "seniority": "executive"
+      }
+    },
+    "company": {
+      "name": "Meridian Labs",
+      "domain": "meridian-labs.test",
+      "category": {
+        "industry": "Financial Services"
+      },
+      "metrics": {
+        "employees": null,
+        "employeesRange": "11-50"
+      }
+    }
+  },
+  "meta": {
+    "email": "robin@meridian-labs.test"
+  }
+}

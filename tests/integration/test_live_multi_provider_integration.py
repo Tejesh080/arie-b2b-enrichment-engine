@@ -39,6 +39,7 @@ from arie.jobs.worker import JobContext, JobHandler
 from arie.live.budget import DAILY_BUDGET_EXHAUSTED, PER_LEAD_BUDGET_EXHAUSTED
 from arie.live.safety import PERMITTED_LIVE_STATUSES
 from arie.providers.base import EnrichmentProvider
+from arie.providers.hunter_contract import HUNTER_PROVIDER_NAME as HUNTER
 from arie.providers.live_abstract import PROVIDER_NAME as ABSTRACT
 from arie.providers.live_abstract import AbstractCompanyEnrichmentProvider
 from arie.providers.live_apollo import APOLLO_PROVIDER_NAME as APOLLO
@@ -365,7 +366,9 @@ def test_case_b_an_open_company_decision_triggers_the_person_lookup(
     receipt = _receipt(api_client, body)
     calls = _called(receipt)
     assert set(calls) == {ABSTRACT, APOLLO}
-    assert receipt["providers"]["not_called"] == []
+    # This suite injects the Abstract+Apollo pair; Hunter is registered but
+    # not built here, and the receipt reports exactly that.
+    assert receipt["providers"]["not_called"] == [HUNTER]
     assert receipt["stopping"]["reason_code"] == "all_providers_called"
     # Both fields the person provider exists to supply are now known, and the
     # receipt says which vendor each came from — not "the live provider".
@@ -408,7 +411,7 @@ def test_case_a_a_settled_company_decision_skips_the_person_lookup_entirely(
 
     receipt = _receipt(api_client, body)
     assert set(_called(receipt)) == {ABSTRACT}
-    assert receipt["providers"]["not_called"] == [APOLLO]
+    assert receipt["providers"]["not_called"] == [HUNTER, APOLLO]
     assert receipt["stopping"]["reason_code"] == "confidence_reached"
     assert float(receipt["cost"]["provider_cost_usd"]) == pytest.approx(_ABSTRACT_COST)
 
@@ -545,7 +548,7 @@ def test_an_exhausted_daily_budget_stops_acquisition_before_the_first_call(
         DAILY_BUDGET_EXHAUSTED,
     }
     assert receipt["providers"]["called"] == []
-    assert sorted(receipt["providers"]["not_called"]) == sorted([ABSTRACT, APOLLO])
+    assert sorted(receipt["providers"]["not_called"]) == sorted([ABSTRACT, HUNTER, APOLLO])
     assert LeadStatus(receipt["lead_status"]) in PERMITTED_LIVE_STATUSES
 
 
@@ -820,7 +823,7 @@ def test_a_free_mail_lead_skips_the_company_provider_and_still_gets_person_evide
 
     receipt = _receipt(api_client, body)
     assert set(_called(receipt)) == {APOLLO}
-    assert receipt["providers"]["not_called"] == [ABSTRACT]
+    assert receipt["providers"]["not_called"] == [ABSTRACT, HUNTER]
     # NOT `no_domain_available`: something was reachable and was reached. That
     # code is now reserved for a lead no provider could serve at all.
     assert receipt["stopping"]["reason_code"] == "all_providers_called"

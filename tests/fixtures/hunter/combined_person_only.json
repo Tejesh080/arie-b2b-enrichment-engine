@@ -1,0 +1,20 @@
+{
+  "data": {
+    "person": {
+      "name": {
+        "fullName": "Sam Reyes"
+      },
+      "email": "sam.reyes@harborline.test",
+      "employment": {
+        "name": "Harborline",
+        "title": "Director of Marketing",
+        "role": "marketing",
+        "seniority": "director"
+      }
+    },
+    "company": null
+  },
+  "meta": {
+    "email": "sam.reyes@harborline.test"
+  }
+}

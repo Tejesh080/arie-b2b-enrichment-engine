@@ -38,6 +38,7 @@ from arie.jobs.handlers import SimulatedEnrichmentRuntime, build_handlers, build
 from arie.jobs.queue import PostgresJobQueue
 from arie.jobs.worker import JobHandler, run_worker_cycle
 from arie.providers.apollo_contract import APOLLO_PROVIDER_NAME
+from arie.providers.hunter_contract import HUNTER_PROVIDER_NAME
 from arie.providers.live_abstract import PROVIDER_NAME, AbstractCompanyEnrichmentProvider
 
 pytestmark = pytest.mark.integration
@@ -206,7 +207,7 @@ def test_a_lead_with_no_corpus_membership_is_enriched_by_the_live_provider(
     # asserted `[]` while Abstract was the only registered provider; the honest
     # value changed when a second one was wired, and a receipt that still
     # claimed "nothing else was available" would be the bug.
-    assert receipt["providers"]["not_called"] == [APOLLO_PROVIDER_NAME]
+    assert receipt["providers"]["not_called"] == [HUNTER_PROVIDER_NAME, APOLLO_PROVIDER_NAME]
     assert receipt["shadow"] is False
 
 
