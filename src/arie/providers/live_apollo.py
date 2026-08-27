@@ -378,7 +378,17 @@ def _status_error_kind(status_code: int) -> str | None:
     if status_code == 200:
         return None
     if status_code in (401, 403):
+        # Per Apollo's documented table: 401 is a bad key, 403 is a plan
+        # without API access (API_INACCESSIBLE) — both credential/plan
+        # problems a retry cannot fix.
         return "authentication_failed"
+    if status_code == 402:
+        # Not in Apollo's documented status table (which says itself it is
+        # incomplete) — 402 is the conventional insufficient-credits status,
+        # mapped explicitly so an exhausted allowance lands on the error kind
+        # the quota cooldown watches instead of on `unexpected_status:402`,
+        # which would re-dial a dead quota on every lead.
+        return "quota_exhausted"
     if status_code == 429:
         return "rate_limited"
     if status_code == 422:

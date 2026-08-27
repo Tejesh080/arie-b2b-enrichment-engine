@@ -42,15 +42,18 @@ from arie.ledger.store import LeadCost, PostgresCostLedger
 from arie.live.budget import DAILY_BUDGET_EXHAUSTED, PER_LEAD_BUDGET_EXHAUSTED
 from arie.live.providers import REGISTERED_LIVE_PROVIDER_NAMES
 from arie.live.safety import LIVE_GUARD_REASON
+from arie.live.strategy import LIVE_POLICY_NAMES as LIVE_POLICY_NAME_SET
 from arie.providers.catalog import ALL_PROVIDERS
-from arie.providers.live_abstract import LIVE_POLICY_NAME
 from arie.scoring.rules import QUALIFY_THRESHOLD, REJECT_THRESHOLD
 from arie.statemachine.transitions import FAILURE
 
 LIVE_PROVIDER_NAMES: tuple[str, ...] = REGISTERED_LIVE_PROVIDER_NAMES
 """Kept as a module-level name for existing callers/tests; the definition now
 lives in ``arie.live.providers`` so the spend caps and this receipt cannot
-disagree about which providers are real."""
+disagree about which providers are real. Which receipts count as live is
+likewise centralised: ``arie.live.strategy.LIVE_POLICY_NAMES`` covers the
+optimized and evaluation strategies plus the legacy single-provider name that
+stored rows still carry."""
 
 RECEIPT_VERSION = "1"
 
@@ -79,6 +82,20 @@ _STOP_REASON_EXPLANATIONS: dict[str, str] = {
         "already known — this lead was not assessed on complete information, and the "
         "failure is recorded against the provider rather than against the lead. Other "
         "providers may still have answered; see the per-provider list above."
+    ),
+    "provider_unavailable": (
+        "A live data provider was deliberately not called because it recently reported its "
+        "account allowance exhausted (a credit/quota error) and is in a temporary cooldown. "
+        "No call was made and nothing was spent on it; acquisition continued with the other "
+        "providers. The decision reflects the evidence that was obtainable without it."
+    ),
+    "evaluation_complete": (
+        "This lead ran under the private provider-evaluation strategy, which deliberately "
+        "consults overlapping data providers for the same lead so their coverage, quality, "
+        "and agreement can be measured against each other. Acquisition ended because every "
+        "provider had been consulted (or visibly skipped for cache, budget, or cooldown "
+        "reasons) — not because confidence was reached. Evaluation runs are never "
+        "autonomous and their per-lead spend runs under a separate, explicit budget."
     ),
     PER_LEAD_BUDGET_EXHAUSTED: (
         "Enriching this lead any further would exceed its per-lead live spend cap, so no "
@@ -373,7 +390,7 @@ def build_receipt(
     # guessing.
     catalogue = (
         LIVE_PROVIDER_NAMES
-        if receipt_row is not None and receipt_row["policy_name"] == LIVE_POLICY_NAME
+        if receipt_row is not None and receipt_row["policy_name"] in LIVE_POLICY_NAME_SET
         else ALL_PROVIDERS
     )
     not_called = tuple(name for name in catalogue if name not in called_names)
@@ -423,7 +440,7 @@ def build_receipt(
             final_status=lead.status,
             human_override=human_override,
             autonomy_guard=(
-                LIVE_GUARD_REASON if receipt_row["policy_name"] == LIVE_POLICY_NAME else None
+                LIVE_GUARD_REASON if receipt_row["policy_name"] in LIVE_POLICY_NAME_SET else None
             ),
         ),
         score=ReceiptScore(

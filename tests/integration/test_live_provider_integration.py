@@ -198,7 +198,10 @@ def test_a_lead_with_no_corpus_membership_is_enriched_by_the_live_provider(
     assert all(row[2] == PROVIDER_NAME for row in evidence_rows)
 
     assert receipt_row is not None
-    assert receipt_row[0] == "live_single_provider"
+    # `live_single_provider` was this column's value while exactly one real
+    # provider existed; the optimized live strategy now writes its own name,
+    # and the legacy value survives only in rows written before the rename.
+    assert receipt_row[0] == "live_optimized"
 
     receipt = api_client.get(f"/leads/{body['lead_id']}/receipt").json()
     assert receipt["providers"]["called"][0]["provider"] == PROVIDER_NAME

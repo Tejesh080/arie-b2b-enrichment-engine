@@ -16,7 +16,7 @@ impossible to reach by accident.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 from arie.providers.apollo_contract import APOLLO_PROVIDER_NAME
 from arie.providers.base import EnrichmentProvider
@@ -78,8 +78,12 @@ of its adapter goes in this tuple first, same as Apollo did.
 """
 
 
-def acquisition_order(providers: Iterable[EnrichmentProvider]) -> tuple[EnrichmentProvider, ...]:
-    """Sort ``providers`` into :data:`REGISTERED_LIVE_PROVIDER_NAMES` order.
+def acquisition_order(
+    providers: Iterable[EnrichmentProvider],
+    *,
+    order: Sequence[str] | None = None,
+) -> tuple[EnrichmentProvider, ...]:
+    """Sort ``providers`` into acquisition order — the default, or an override.
 
     Called by ``arie.jobs.handlers``' live builder on whatever set it ends up
     with — the ones it constructed itself, or ones a test or
@@ -89,11 +93,31 @@ def acquisition_order(providers: Iterable[EnrichmentProvider]) -> tuple[Enrichme
     to type; an injected pair in the wrong order would otherwise silently
     exercise a different policy than production runs.
 
-    A provider whose name is not in the tuple sorts last, preserving its
+    ``order`` (from ``LIVE_PROVIDER_ORDER``, via the live builder) is an
+    experiment knob for testing alternative waterfalls before any becomes
+    default: names it lists come first, in its order; registered providers it
+    omits keep their registered relative order after; a name that matches no
+    registered provider raises — a typo'd experiment must fail loudly, not
+    silently run the default while claiming otherwise. It is priority only and
+    cannot exclude a provider.
+
+    A provider whose name is registered nowhere sorts last, preserving its
     relative position among other unknowns. That keeps an experimental adapter
     runnable without editing this module, while guaranteeing it can never
     displace a known provider from its reviewed position.
     """
-    known = {name: index for index, name in enumerate(REGISTERED_LIVE_PROVIDER_NAMES)}
+    if order:
+        unknown = [name for name in order if name not in REGISTERED_LIVE_PROVIDER_NAMES]
+        if unknown:
+            raise ValueError(
+                f"LIVE_PROVIDER_ORDER names unregistered providers {unknown!r} — "
+                f"registered: {list(REGISTERED_LIVE_PROVIDER_NAMES)}"
+            )
+        priority = list(dict.fromkeys(order)) + [
+            name for name in REGISTERED_LIVE_PROVIDER_NAMES if name not in order
+        ]
+    else:
+        priority = list(REGISTERED_LIVE_PROVIDER_NAMES)
+    known = {name: index for index, name in enumerate(priority)}
     ordered = list(providers)
     return tuple(sorted(ordered, key=lambda provider: known.get(provider.name, len(known))))

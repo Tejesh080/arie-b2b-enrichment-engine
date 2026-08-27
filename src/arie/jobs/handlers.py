@@ -76,6 +76,7 @@ survived, the retry is served from cache and doesn't even re-fetch.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -87,7 +88,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from arie.approval.workflow import request_review
-from arie.config import POLICY, RUNTIME
+from arie.config import LIVE_BUDGET, LIVE_STRATEGY, POLICY, RUNTIME, LiveStrategyConfig
 from arie.core.types import (
     Decision,
     Entity,
@@ -102,6 +103,8 @@ from arie.evidence.ttl_policy import ttl_for_field
 from arie.identity.normalize import domain_from_email, normalize_domain, normalize_email
 from arie.ledger.store import PostgresCostLedger
 from arie.live.budget import LiveSpendGuard
+from arie.live.cooldown import PROVIDER_UNAVAILABLE, ProviderCooldownGuard
+from arie.live.evaluation import classify_agreement, overall_agreement
 from arie.live.providers import acquisition_order
 from arie.live.safety import (
     LIVE_GUARD_REASON,
@@ -109,14 +112,18 @@ from arie.live.safety import (
     guarded_route,
     verify_live_status,
 )
+from arie.live.strategy import (
+    EVALUATION_PARALLEL,
+    EVALUATION_POLICY_NAME,
+    OPTIMIZED_POLICY_NAME,
+    LiveStrategy,
+    resolve_strategy,
+)
 from arie.observability.tracing import get_tracer, set_attributes, traced
 from arie.policy.base import EvidenceCache, PolicyOutcome, RunContext
 from arie.providers.base import EnrichmentProvider, ProviderRegistry
 from arie.providers.catalog import BY_NAME
-from arie.providers.live_abstract import (
-    LIVE_POLICY_NAME,
-    AbstractCompanyEnrichmentProvider,
-)
+from arie.providers.live_abstract import AbstractCompanyEnrichmentProvider
 from arie.providers.live_apollo import ApolloPersonEnrichmentProvider
 from arie.providers.live_hunter import HunterEnrichmentProvider
 from arie.providers.simulated import CallLedger, build_from_leads
@@ -601,6 +608,7 @@ def build_handlers(
     provider_mode: str | None = None,
     live_provider: EnrichmentProvider | None = None,
     live_providers: Sequence[EnrichmentProvider] | None = None,
+    live_strategy: LiveStrategy | None = None,
 ) -> dict[str, JobHandler]:
     """The worker's production handler registry.
 
@@ -632,7 +640,11 @@ def build_handlers(
     if mode == "simulated":
         return _build_simulated_handlers(pool, resolved_runtime)
     return _build_live_handlers(
-        pool, resolved_runtime, live_provider=live_provider, live_providers=live_providers
+        pool,
+        resolved_runtime,
+        live_provider=live_provider,
+        live_providers=live_providers,
+        live_strategy=live_strategy,
     )
 
 
@@ -915,6 +927,12 @@ class _LiveAcquisitionOutcome:
     *other* sources — e.g. Apollo when Hunter already supplied both person
     fields. Not a cache hit (nothing of theirs was served) and not a ledger
     row (no call was made); the audit trail is where the skip is visible."""
+    unavailable: tuple[str, ...] = ()
+    """Providers skipped because the quota cooldown says their account
+    allowance is spent (``arie.live.cooldown``). Deliberately not called —
+    no ledger row is fabricated for a call that never happened; the skip is
+    visible here and, when nothing better ended acquisition, in the
+    ``provider_unavailable`` stop reason."""
     failed: tuple[str, ...] = ()
     cost_usd: float = 0.0
 
@@ -926,6 +944,7 @@ class _LiveAcquisitionOutcome:
             "unreachable": list(self.unreachable),
             "not_needed": list(self.not_needed),
             "redundant": list(self.redundant),
+            "unavailable": list(self.unavailable),
             "failed": list(self.failed),
             "cost_usd": self.cost_usd,
             "stop_reason": self.stop_reason,
@@ -941,6 +960,7 @@ def _acquire_live_evidence(
     evidence_store: PostgresEvidenceStore,
     cost_ledger: PostgresCostLedger,
     spend_guard: LiveSpendGuard,
+    cooldown_guard: ProviderCooldownGuard,
     model: ConfidenceModel,
     now: datetime,
 ) -> _LiveAcquisitionOutcome:
@@ -996,6 +1016,7 @@ def _acquire_live_evidence(
     unreachable: list[str] = []
     not_needed: list[str] = []
     redundant: list[str] = []
+    unavailable: list[str] = []
     failed: list[str] = []
     cost_usd = 0.0
     stop_reason: str | None = None
@@ -1047,6 +1068,16 @@ def _acquire_live_evidence(
                 redundant.append(provider.name)
             continue
 
+        # Cooldown before budget: a provider whose quota is spent should not
+        # consume a budget-allowance ledger read per lead, and the two skips
+        # mean different things — "the account cannot afford it" versus "the
+        # vendor cannot sell it right now". Cache/redundant checks stay above
+        # this line on purpose: serving already-held evidence during a
+        # cooldown is free and correct.
+        if cooldown_guard.cooling_down_until(provider.name) is not None:
+            unavailable.append(provider.name)
+            continue
+
         allowance = spend_guard.allowance(
             lead_id=lead_id, estimated_cost_usd=provider.base_cost_usd
         )
@@ -1096,6 +1127,7 @@ def _acquire_live_evidence(
             called=called,
             cache_hits=cache_hits,
             unreachable=unreachable,
+            unavailable=unavailable,
             failed=failed,
         )
 
@@ -1107,6 +1139,7 @@ def _acquire_live_evidence(
         unreachable=tuple(unreachable),
         not_needed=tuple(not_needed),
         redundant=tuple(redundant),
+        unavailable=tuple(unavailable),
         failed=tuple(failed),
         cost_usd=cost_usd,
     )
@@ -1120,6 +1153,7 @@ def _resolve_terminal_stop_reason(
     called: list[str],
     cache_hits: list[str],
     unreachable: list[str],
+    unavailable: list[str],
     failed: list[str],
 ) -> str:
     """Why acquisition stopped, when it stopped by running out of providers.
@@ -1134,12 +1168,15 @@ def _resolve_terminal_stop_reason(
        reached, this lead was still decided on incomplete information, and
        ``all_providers_called`` would claim the missing evidence does not exist
        rather than that ARIE failed to fetch it.
-    3. ``no_domain_available`` only when *nothing* was reachable — no call, no
+    3. ``provider_unavailable`` if a provider was skipped on quota cooldown and
+       nothing above already explains the stop — a deliberate skip, so it must
+       not masquerade as this-lead failure (2) or as full consultation (5).
+    4. ``no_domain_available`` only when *nothing* was reachable — no call, no
        cache hit, and at least one provider skipped for a missing identifier.
        Requiring all three is what stops a lead that was enriched by a person
        provider from reporting "no domain" merely because a company provider
        was also skipped.
-    4. ``all_providers_called`` otherwise: everything available was consulted
+    5. ``all_providers_called`` otherwise: everything available was consulted
        and the question is still open.
     """
     settled = _enough_evidence(scoring, has_evidence=bool(_all_evidence(evidence)), model=model)
@@ -1147,6 +1184,8 @@ def _resolve_terminal_stop_reason(
         return settled
     if failed:
         return _STOP_PROVIDER_FAILED
+    if unavailable:
+        return PROVIDER_UNAVAILABLE
     if unreachable and not called and not cache_hits:
         return _STOP_NO_IDENTIFIER
     return _STOP_ALL_CALLED
@@ -1235,6 +1274,325 @@ def _ledger_live_call(
     )
 
 
+_EVALUATION_COMPLETE = "evaluation_complete"
+"""The evaluation strategy's own terminal stop reason: every provider was
+deliberately consulted (or deliberately skipped for cache/cooldown/budget,
+each visibly), and acquisition ended because the comparison is done — not
+because confidence was reached. The optimized vocabulary would misdescribe
+this: ``all_providers_called`` implies selective acquisition ran out of
+options, and ``confidence_reached`` implies an early stop that evaluation
+mode deliberately never takes."""
+
+
+def _acquire_evaluation_parallel(
+    *,
+    providers: tuple[EnrichmentProvider, ...],
+    identity: _LeadIdentity,
+    lead_id: UUID,
+    job_id: UUID,
+    evidence_store: PostgresEvidenceStore,
+    cost_ledger: PostgresCostLedger,
+    spend_guard: LiveSpendGuard,
+    cooldown_guard: ProviderCooldownGuard,
+    now: datetime,
+) -> tuple[_LiveAcquisitionOutcome, dict[str, Any]]:
+    """The ``evaluation_parallel`` strategy: measure the person providers
+    against each other on one lead.
+
+    Deliberately different from :func:`_acquire_live_evidence` in exactly two
+    ways, and identical in every other:
+
+    * **No early stop.** The point is overlap measurement; a stopping rule
+      that skips the second person provider would remove the comparison the
+      mode exists to make. (The autonomy guard is untouched — the lead still
+      terminates at a human regardless of anything measured here.)
+    * **Person providers run concurrently.** Company enrichment still runs
+      first, sequentially — its evidence is the shared baseline — and then
+      every callable person provider is submitted to a small bounded thread
+      pool. ``httpx.Client`` is thread-safe for requests, each adapter bounds
+      its own call with its own timeout, and no database handle crosses a
+      thread: results are collected first and ledgered/persisted afterwards in
+      the main thread, in registered provider order so runs are deterministic.
+
+    What is *not* different: the same ``LiveSpendGuard`` arithmetic (with the
+    evaluation budget — a separate cap, never a bypass), the same cooldown
+    guard, the same per-call ledger rows with the same provenance columns, the
+    same evidence store, and the same true-cache rule — a provider whose own
+    prior answer is still fresh is served from cache and recorded as a cache
+    hit, never re-called just to re-test code. Redundancy from *other* sources
+    does not skip a person provider here: both vendors answering the same
+    question is the experiment.
+
+    Budget checks are cumulative-predictive: each candidate's allowance is
+    asked with the still-unspent estimates of the candidates already admitted
+    ahead of it, so two concurrent submissions cannot each individually fit
+    under a cap their sum exceeds.
+
+    **Failure isolation.** An operational failure is already a result (the
+    adapters never raise for one). A genuine *bug* raised by one future is
+    re-raised — but only after every other future's real result has been
+    ledgered and persisted, so one provider's crash can never lose the record
+    of another provider's spend.
+
+    Returns the acquisition outcome plus the evaluation record — per-provider
+    status/latency/cost/credits/fields/raw-title and the cross-provider
+    agreement classification — which the handler freezes into the receipt's
+    evidence snapshot. No raw payloads, no PII beyond the job title and the
+    matched name the receipt already carries.
+    """
+    refs = _live_entity_refs(identity)
+    evidence = _fresh_live_evidence(evidence_store, refs, now)
+
+    called: list[str] = []
+    cache_hits: list[str] = []
+    unreachable: list[str] = []
+    unavailable: list[str] = []
+    failed: list[str] = []
+    cost_usd = 0.0
+    budget_stop: str | None = None
+    person_records: dict[str, dict[str, Any]] = {}
+    person_fields: dict[str, dict[str, Any]] = {}
+
+    company_providers = [p for p in providers if p.entity_type == "company"]
+    person_providers = [p for p in providers if p.entity_type == "person"]
+
+    # ------------------------------------------------ company phase, sequential
+    for provider in company_providers:
+        ref = refs.get(provider.entity_type)
+        if ref is None:
+            unreachable.append(provider.name)
+            continue
+        held_rows = evidence.get(ref.entity_type, ())
+        if set(provider.provides_fields) <= {item.field_name for item in held_rows}:
+            if provider.name in {item.source for item in held_rows}:
+                cost_ledger.record_provider_call(
+                    idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
+                    provider=provider.name,
+                    entity_type=ref.entity_type,
+                    entity_id=ref.entity_id,
+                    status=ProviderStatus.SUCCESS,
+                    cost_usd=0.0,
+                    latency_ms=0.0,
+                    lead_id=lead_id,
+                    cache_hit=True,
+                )
+                cache_hits.append(provider.name)
+            continue
+        if cooldown_guard.cooling_down_until(provider.name) is not None:
+            unavailable.append(provider.name)
+            continue
+        allowance = spend_guard.allowance(
+            lead_id=lead_id, estimated_cost_usd=provider.base_cost_usd
+        )
+        if not allowance.permitted:
+            assert allowance.reason is not None  # set whenever not permitted
+            budget_stop = budget_stop or allowance.reason
+            continue
+        result = provider.fetch(ref.as_entity())
+        called.append(provider.name)
+        cost_usd += result.cost_usd
+        _ledger_live_call(
+            cost_ledger,
+            job_id=job_id,
+            lead_id=lead_id,
+            provider_name=provider.name,
+            ref=ref,
+            result=result,
+        )
+        if result.status in (ProviderStatus.ERROR, ProviderStatus.TIMEOUT):
+            failed.append(provider.name)
+        if result.status is ProviderStatus.SUCCESS and result.fields:
+            evidence_store.put_many(
+                Evidence(
+                    entity_type=ref.entity_type,
+                    entity_id=ref.entity_id,
+                    field_name=field_name,
+                    value=value,
+                    source=provider.name,
+                    confidence=result.confidence,
+                    ttl_seconds=ttl_for_field(field_name),
+                    fetched_at=now,
+                )
+                for field_name, value in result.fields.items()
+            )
+            evidence = _fresh_live_evidence(evidence_store, refs, now)
+
+    # ------------------------------------------------- person phase, concurrent
+    pending_estimate = 0.0
+    to_call: list[tuple[EnrichmentProvider, _LiveEntityRef]] = []
+    for provider in person_providers:
+        ref = refs.get(provider.entity_type)
+        if ref is None:
+            unreachable.append(provider.name)
+            continue
+        held_rows = evidence.get(ref.entity_type, ())
+        own_rows = [item for item in held_rows if item.source == provider.name]
+        if set(provider.provides_fields) <= {item.field_name for item in own_rows}:
+            # This provider's own prior answer is still fresh — Phase 12's
+            # "never call twice for the same unchanged identity". Served from
+            # cache and it still participates in the comparison: a cached
+            # answer is that provider's answer.
+            cost_ledger.record_provider_call(
+                idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
+                provider=provider.name,
+                entity_type=ref.entity_type,
+                entity_id=ref.entity_id,
+                status=ProviderStatus.SUCCESS,
+                cost_usd=0.0,
+                latency_ms=0.0,
+                lead_id=lead_id,
+                cache_hit=True,
+            )
+            cache_hits.append(provider.name)
+            cached_fields = {item.field_name: item.value for item in own_rows}
+            person_fields[provider.name] = cached_fields
+            person_records[provider.name] = {
+                "served_from": "cache",
+                "status": str(ProviderStatus.SUCCESS),
+                "fields": cached_fields,
+                "cost_usd": 0.0,
+            }
+            continue
+        until = cooldown_guard.cooling_down_until(provider.name)
+        if until is not None:
+            unavailable.append(provider.name)
+            person_records[provider.name] = {
+                "served_from": "skipped_quota_cooldown",
+                "cooling_down_until": until.isoformat(),
+            }
+            continue
+        allowance = spend_guard.allowance(
+            lead_id=lead_id, estimated_cost_usd=provider.base_cost_usd + pending_estimate
+        )
+        if not allowance.permitted:
+            assert allowance.reason is not None  # set whenever not permitted
+            budget_stop = budget_stop or allowance.reason
+            person_records[provider.name] = {
+                "served_from": "skipped_budget",
+                "reason": allowance.reason,
+            }
+            continue
+        pending_estimate += provider.base_cost_usd
+        to_call.append((provider, ref))
+
+    collected: list[
+        tuple[EnrichmentProvider, _LiveEntityRef, ProviderResult | None, BaseException | None]
+    ] = []
+    if to_call:
+        with ThreadPoolExecutor(max_workers=min(len(to_call), 4)) as executor:
+            futures = {
+                executor.submit(provider.fetch, ref.as_entity()): (provider, ref)
+                for provider, ref in to_call
+            }
+            for future in as_completed(futures):
+                provider, ref = futures[future]
+                try:
+                    collected.append((provider, ref, future.result(), None))
+                except BaseException as exc:
+                    collected.append((provider, ref, None, exc))
+
+    # Deterministic processing order regardless of completion order.
+    position = {provider.name: index for index, provider in enumerate(providers)}
+    collected.sort(key=lambda item: position[item[0].name])
+
+    bug: BaseException | None = None
+    for provider, ref, fetched, raised in collected:
+        if raised is not None or fetched is None:
+            bug = bug if bug is not None else raised
+            continue
+        result = fetched
+        called.append(provider.name)
+        cost_usd += result.cost_usd
+        _ledger_live_call(
+            cost_ledger,
+            job_id=job_id,
+            lead_id=lead_id,
+            provider_name=provider.name,
+            ref=ref,
+            result=result,
+        )
+        if result.status in (ProviderStatus.ERROR, ProviderStatus.TIMEOUT):
+            failed.append(provider.name)
+        if result.status is ProviderStatus.SUCCESS and result.fields:
+            evidence_store.put_many(
+                Evidence(
+                    entity_type=ref.entity_type,
+                    entity_id=ref.entity_id,
+                    field_name=field_name,
+                    value=value,
+                    source=provider.name,
+                    confidence=result.confidence,
+                    ttl_seconds=ttl_for_field(field_name),
+                    fetched_at=now,
+                )
+                for field_name, value in result.fields.items()
+            )
+        person_fields[provider.name] = dict(result.fields)
+        matched = result.raw.get("matched_identity")
+        record: dict[str, Any] = {
+            "served_from": "live_call",
+            "status": str(result.status),
+            "fields": dict(result.fields),
+            "latency_ms": round(result.latency_ms, 1),
+            "cost_usd": result.cost_usd,
+        }
+        if result.raw.get("credits_consumed") is not None:
+            record["credits_consumed"] = result.raw["credits_consumed"]
+        if result.raw.get("error_kind") is not None:
+            record["error_kind"] = result.raw["error_kind"]
+        if isinstance(matched, dict) and matched.get("title"):
+            record["raw_title"] = matched["title"]
+        normalization = result.raw.get("normalization")
+        if isinstance(normalization, dict) and normalization.get("unmapped"):
+            record["unmapped"] = normalization["unmapped"]
+        person_records[provider.name] = record
+
+    if bug is not None:
+        # Every real result above is already ledgered and persisted; only now
+        # may a genuine caller bug fail the job into the ordinary retry path.
+        raise bug
+
+    evidence = _fresh_live_evidence(evidence_store, refs, now)
+    scoring = score_evidence(_all_evidence(evidence), now)
+
+    compared = {
+        name: fields
+        for name, fields in person_fields.items()
+        if name in person_records
+        and person_records[name].get("served_from") in ("live_call", "cache")
+    }
+    field_agreement = classify_agreement(compared, ("title_seniority", "title_function"))
+    agreement = {**field_agreement, "overall": overall_agreement(field_agreement)}
+
+    if budget_stop is not None:
+        stop_reason = budget_stop
+    elif failed:
+        stop_reason = _STOP_PROVIDER_FAILED
+    elif unavailable:
+        stop_reason = PROVIDER_UNAVAILABLE
+    else:
+        stop_reason = _EVALUATION_COMPLETE
+
+    outcome = _LiveAcquisitionOutcome(
+        scoring=scoring,
+        stop_reason=stop_reason,
+        called=tuple(called),
+        cache_hits=tuple(cache_hits),
+        unreachable=tuple(unreachable),
+        not_needed=(),
+        redundant=(),
+        unavailable=tuple(unavailable),
+        failed=tuple(failed),
+        cost_usd=cost_usd,
+    )
+    evaluation = {
+        "strategy": EVALUATION_PARALLEL,
+        "person_providers": person_records,
+        "agreement": agreement,
+    }
+    return outcome, evaluation
+
+
 def _default_live_providers() -> tuple[EnrichmentProvider, ...]:
     """Build every registered live adapter, or fail loudly saying which key is missing.
 
@@ -1283,7 +1641,19 @@ def _resolve_live_providers(
         resolved = (live_provider,)
     else:
         resolved = _default_live_providers()
-    return acquisition_order(resolved)
+    return acquisition_order(resolved, order=_configured_order())
+
+
+def _configured_order() -> tuple[str, ...] | None:
+    """``LIVE_PROVIDER_ORDER`` parsed, or ``None`` for the registered default.
+
+    Read here, in the live builder's path, and nowhere else — the same
+    only-live-reads-it discipline as the strategy itself. Validation of the
+    names happens inside ``acquisition_order``, loudly.
+    """
+    raw = LIVE_STRATEGY.provider_order
+    names = tuple(name.strip() for name in raw.split(",") if name.strip())
+    return names or None
 
 
 def _build_live_handlers(
@@ -1292,6 +1662,7 @@ def _build_live_handlers(
     *,
     live_provider: EnrichmentProvider | None = None,
     live_providers: Sequence[EnrichmentProvider] | None = None,
+    live_strategy: LiveStrategy | None = None,
 ) -> dict[str, JobHandler]:
     """``PROVIDER_MODE=live`` — the real multi-provider acquisition path, any
     ingested lead (no corpus restriction).
@@ -1338,12 +1709,26 @@ def _build_live_handlers(
     this, and widening the evidence is not evidence that the threshold
     transfers.
     """
+    # An injected strategy goes through the same validation as the env one —
+    # a test or script passing a typo must fail the same loud way.
+    strategy: LiveStrategy = resolve_strategy(
+        None if live_strategy is None else LiveStrategyConfig(strategy=live_strategy)
+    )
     providers = _resolve_live_providers(live_provider=live_provider, live_providers=live_providers)
     evidence_store = PostgresEvidenceStore(pool)
     cost_ledger = PostgresCostLedger(pool)
-    spend_guard = LiveSpendGuard(pool)
+    # The evaluation strategy deliberately calls overlapping providers, so it
+    # runs under its own explicit per-lead cap — the same guard, the same
+    # arithmetic, the same shared daily ceiling, never a bypass.
+    spend_guard = LiveSpendGuard(
+        pool, LIVE_BUDGET.for_evaluation() if strategy == EVALUATION_PARALLEL else None
+    )
+    cooldown_guard = ProviderCooldownGuard(pool)
     model = resolved_runtime.policy.model
     autonomy_allowed = autonomy_allowed_for("live")
+    policy_name = (
+        EVALUATION_POLICY_NAME if strategy == EVALUATION_PARALLEL else OPTIMIZED_POLICY_NAME
+    )
 
     def compute_score(ctx: JobContext) -> None:
         job = ctx.job
@@ -1362,17 +1747,32 @@ def _build_live_handlers(
             identity = _load_identity(ctx.conn, job.lead_id)
             version = _walk_to_decision(ctx.conn, lead_id=job.lead_id, version=ctx.lead_version)
 
-            acquisition = _acquire_live_evidence(
-                providers=providers,
-                identity=identity,
-                lead_id=job.lead_id,
-                job_id=job.job_id,
-                evidence_store=evidence_store,
-                cost_ledger=cost_ledger,
-                spend_guard=spend_guard,
-                model=model,
-                now=datetime.now(UTC),
-            )
+            evaluation: dict[str, Any] | None = None
+            if strategy == EVALUATION_PARALLEL:
+                acquisition, evaluation = _acquire_evaluation_parallel(
+                    providers=providers,
+                    identity=identity,
+                    lead_id=job.lead_id,
+                    job_id=job.job_id,
+                    evidence_store=evidence_store,
+                    cost_ledger=cost_ledger,
+                    spend_guard=spend_guard,
+                    cooldown_guard=cooldown_guard,
+                    now=datetime.now(UTC),
+                )
+            else:
+                acquisition = _acquire_live_evidence(
+                    providers=providers,
+                    identity=identity,
+                    lead_id=job.lead_id,
+                    job_id=job.job_id,
+                    evidence_store=evidence_store,
+                    cost_ledger=cost_ledger,
+                    spend_guard=spend_guard,
+                    cooldown_guard=cooldown_guard,
+                    model=model,
+                    now=datetime.now(UTC),
+                )
             scoring = acquisition.scoring
 
             confidence = model.predict(scoring)
@@ -1407,10 +1807,19 @@ def _build_live_handlers(
                         "score_lower": scoring.bounds.lower,
                         "score_upper": scoring.bounds.upper,
                         "stop_reason": acquisition.stop_reason,
-                        "policy_name": LIVE_POLICY_NAME,
+                        "policy_name": policy_name,
                         "scorer_version": scoring.breakdown.model_version,
                         "confidence_calibration": model.method,
-                        "evidence_snapshot": Jsonb(_evidence_snapshot(scoring)),
+                        "evidence_snapshot": Jsonb(
+                            _evidence_snapshot(scoring)
+                            if evaluation is None
+                            # The evaluation record is frozen into the snapshot
+                            # (additively — readers index known keys) so an
+                            # evaluation receipt carries its own comparison:
+                            # per-provider results and the agreement verdicts,
+                            # identified by policy_name above.
+                            else {**_evidence_snapshot(scoring), "evaluation": evaluation}
+                        ),
                     },
                 )
 
@@ -1438,6 +1847,7 @@ def _build_live_handlers(
                     "arie.lead.final_status": str(final),
                     "arie.stop_reason": acquisition.stop_reason,
                     "arie.shadow": identity.is_shadow,
+                    "arie.live_strategy": strategy,
                     **{f"arie.acquisition.{k}": v for k, v in acquisition.audit().items()},
                 },
             )

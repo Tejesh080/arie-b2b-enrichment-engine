@@ -68,9 +68,12 @@ handler builder, never by ``arie.providers.simulated.build_registry``."""
 PROVIDES_FIELDS: tuple[str, ...] = ("employee_count", "industry")
 
 LIVE_POLICY_NAME = "live_single_provider"
-"""``decision_receipts.policy_name`` value the live handler writes — lets
-``arie.api.receipt`` tell a live-mode receipt apart from a simulated one
-without a new column."""
+"""LEGACY ``decision_receipts.policy_name`` — what the live handler wrote while
+exactly one real provider existed. The handler now writes
+``arie.live.strategy.OPTIMIZED_POLICY_NAME`` (or the evaluation name), and the
+receipt matches against ``arie.live.strategy.LIVE_POLICY_NAMES``, which keeps
+this value so stored rows never stop resolving as live receipts. Nothing
+writes it anymore; it exists for reading history."""
 
 # Declared source-reliability confidence for a SUCCESS result. An assumption,
 # exactly in the spirit of arie.providers.catalog's ProviderSpec fields

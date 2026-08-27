@@ -121,6 +121,53 @@ def test_live_provider_mode_builds_a_handler_with_an_injected_provider(
     assert "compute_score" in handlers
 
 
+def test_the_simulated_path_is_structurally_immune_to_the_strategy_knob(
+    runtime: SimulatedEnrichmentRuntime, unopened_pool: ConnectionPool
+) -> None:
+    """The public demo runs PROVIDER_MODE=simulated, and the provider-strategy
+    machinery must be unable to touch it. Proven behaviourally: a strategy
+    value that the live builder rejects loudly (below) is inert on the
+    simulated builder, because only the live path ever resolves it."""
+    handlers = build_handlers(
+        unopened_pool,
+        runtime=runtime,
+        provider_mode="simulated",
+        live_strategy="garbage",  # type: ignore[arg-type]
+    )
+    assert "compute_score" in handlers
+
+
+def test_a_garbage_strategy_fails_the_live_build_loudly(
+    runtime: SimulatedEnrichmentRuntime, unopened_pool: ConnectionPool
+) -> None:
+    """The other half of the pair above: the same injected value that the
+    simulated builder ignored refuses to build a live worker — the missing-key
+    treatment, applied to strategy misconfiguration."""
+    from arie.live.strategy import UnsupportedLiveStrategyError
+
+    with pytest.raises(UnsupportedLiveStrategyError, match="garbage"):
+        build_handlers(
+            unopened_pool,
+            runtime=runtime,
+            provider_mode="live",
+            live_provider=_FakeLiveProvider(),
+            live_strategy="garbage",  # type: ignore[arg-type]
+        )
+
+
+def test_the_evaluation_strategy_builds_a_live_handler(
+    runtime: SimulatedEnrichmentRuntime, unopened_pool: ConnectionPool
+) -> None:
+    handlers = build_handlers(
+        unopened_pool,
+        runtime=runtime,
+        provider_mode="live",
+        live_provider=_FakeLiveProvider(),
+        live_strategy="evaluation_parallel",
+    )
+    assert "compute_score" in handlers
+
+
 def test_live_provider_mode_without_a_configured_key_fails_clearly(
     runtime: SimulatedEnrichmentRuntime,
     unopened_pool: ConnectionPool,

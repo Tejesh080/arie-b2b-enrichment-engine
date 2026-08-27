@@ -404,6 +404,60 @@ class HunterConfig:
 
 
 @dataclass(frozen=True)
+class LiveStrategyConfig:
+    """How ``PROVIDER_MODE=live`` walks its providers — see ``arie.live.strategy``.
+
+    Two modes, and the distinction is the point of this class existing:
+
+    * ``optimized`` (the default) — providers are called selectively and
+      sequentially, cheapest first, stopping as soon as the existing evidence/
+      confidence logic says further evidence is unnecessary. This is ARIE's
+      actual operating behaviour; calling every provider for every lead would
+      defeat the system's purpose.
+    * ``evaluation_parallel`` — a private, server-side experiment mode in which
+      the person providers are deliberately called *concurrently for the same
+      lead* so their coverage, quality, latency, and overlap can be measured
+      against each other. It exists to gather the data that will justify (or
+      overturn) the optimized order; it is not an operating mode, must never be
+      the default, and must never be enabled for the anonymous public demo —
+      which runs ``PROVIDER_MODE=simulated`` and structurally never reads this
+      class (``arie.jobs.handlers._build_simulated_handlers`` has no reference
+      to it, and a test pins that).
+
+    **Deliberately not validated here.** Every other config class validates in
+    ``__post_init__``; this one stores raw strings and lets
+    ``arie.live.strategy.resolve_strategy`` do the checking, so that the value
+    is only ever *read* — and can only ever fail — on the live path. A typo'd
+    strategy on a simulated deployment (the public demo) must be inert, not an
+    import-time crash of a process that would never have used it.
+    """
+
+    strategy: str = field(default_factory=lambda: os.getenv("LIVE_PROVIDER_STRATEGY", "optimized"))
+
+    provider_order: str = field(default_factory=lambda: os.getenv("LIVE_PROVIDER_ORDER", ""))
+    """Optional comma-separated provider names overriding the default
+    (cheapest-first) acquisition order — an experiment knob for testing
+    alternative waterfalls, validated against the registered names by
+    ``arie.live.providers.acquisition_order``. Empty means the registered
+    default. This is priority only: names listed come first in the given
+    order, registered providers not listed keep their relative order after.
+    It cannot *exclude* a provider — a live worker runs every registered
+    adapter or does not start."""
+
+    quota_cooldown_seconds: float = field(
+        default_factory=lambda: _env_float("LIVE_PROVIDER_QUOTA_COOLDOWN_SECONDS", 3600.0)
+    )
+    """How long a provider that hit a credit/quota wall is left uncalled.
+
+    Enforced by ``arie.live.cooldown.ProviderCooldownGuard`` against the same
+    durable ledger the spend caps read, so it holds across workers and
+    restarts. An hour by default: long enough that an exhausted monthly quota
+    is probed ~24 times a day instead of once per lead (no retry storm, no
+    per-lead latency tax), short enough that a topped-up account resumes the
+    same hour. ``0`` disables the cooldown entirely."""
+
+
+@dataclass(frozen=True)
 class LiveBudgetConfig:
     """Hard spend ceilings for ``PROVIDER_MODE=live`` (Live V1 Foundation, Phase 6).
 
@@ -449,6 +503,18 @@ class LiveBudgetConfig:
     honest response is to stop and ask a human, which is exactly what
     exhausting it does."""
 
+    evaluation_per_lead_usd: float = field(
+        default_factory=lambda: _env_float("LIVE_EVALUATION_PER_LEAD_BUDGET_USD", 0.10)
+    )
+    """Per-lead ceiling for the ``evaluation_parallel`` strategy, which
+    *deliberately* calls overlapping providers and therefore spends more per
+    lead than optimized mode ever should. A separate, explicit number rather
+    than a bypass: evaluation runs still go through the same ``LiveSpendGuard``
+    with the same predictive check and the same shared daily cap — only the
+    per-lead figure differs, and only in the mode that documents why. $0.10
+    covers the full three-provider sweep ($0.00165 + $0.0049 + $0.0196 ≈
+    $0.026) with headroom, while still bounding a pathological lead at a dime."""
+
     def __post_init__(self) -> None:
         if self.per_lead_usd > self.daily_usd:
             raise ValueError(
@@ -456,8 +522,37 @@ class LiveBudgetConfig:
                 f"LIVE_PROVIDER_DAILY_BUDGET_USD={self.daily_usd} — one lead could "
                 "consume the entire daily budget, which makes the daily cap meaningless"
             )
-        if self.daily_usd < 0 or self.per_lead_usd < 0:
+        if self.daily_usd < 0 or self.per_lead_usd < 0 or self.evaluation_per_lead_usd < 0:
             raise ValueError("live budget caps must not be negative")
+
+    def for_evaluation(self) -> LiveBudgetConfig:
+        """This config with the evaluation per-lead cap in the driving seat.
+
+        The evaluation handler builds its ``LiveSpendGuard`` from this, so the
+        guard's arithmetic, refusal vocabulary, and daily ceiling are exactly
+        the production ones — a separate budget, never a separate code path.
+
+        The exceeds-daily check lives here rather than in ``__post_init__``,
+        deliberately: the evaluation cap's default (a dime) only has to fit
+        under the daily cap in the one mode that spends it. Validating it
+        eagerly would make ``LiveBudgetConfig(daily_usd=0.0, per_lead_usd=0.0)``
+        — the legitimate "block all spending" configuration, which several
+        tests and any panic-stop deployment use — unconstructible because of a
+        default for a mode not in use. Same lazy-where-live discipline as
+        ``LiveStrategyConfig``; still loud at startup, because the evaluation
+        builder calls this before the first job runs.
+        """
+        if self.evaluation_per_lead_usd > self.daily_usd:
+            raise ValueError(
+                f"LIVE_EVALUATION_PER_LEAD_BUDGET_USD={self.evaluation_per_lead_usd} exceeds "
+                f"LIVE_PROVIDER_DAILY_BUDGET_USD={self.daily_usd} — one evaluation lead "
+                "could consume the entire daily budget"
+            )
+        return LiveBudgetConfig(
+            daily_usd=self.daily_usd,
+            per_lead_usd=self.evaluation_per_lead_usd,
+            evaluation_per_lead_usd=self.evaluation_per_lead_usd,
+        )
 
 
 @dataclass(frozen=True)
@@ -492,4 +587,5 @@ LLM = LLMConfig()
 LIVE_PROVIDER = LiveProviderConfig()
 APOLLO_PERSON = ApolloPersonConfig()
 HUNTER = HunterConfig()
+LIVE_STRATEGY = LiveStrategyConfig()
 LIVE_BUDGET = LiveBudgetConfig()
