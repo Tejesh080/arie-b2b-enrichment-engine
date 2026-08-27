@@ -1,0 +1,13 @@
+email,domain,full_name,company_name,persona
+dana.okafor@northwind-analytics.test,northwind-analytics.test,Dana Okafor,Northwind Analytics,agree
+kai.morrow@harborline.test,harborline.test,Kai Morrow,Harborline,conflict
+sam.reyes@copperfield.test,copperfield.test,Sam Reyes,Copperfield,hunter_only
+robin.ashworth@meridian-labs.test,meridian-labs.test,Robin Ashworth,Meridian Labs,apollo_only
+lee.tanaka@bluewharf.test,bluewharf.test,Lee Tanaka,Bluewharf,both_miss
+alex.vance@vibes.test,vibes.test,Alex Vance,Vibes Inc,unmappable
+noor.haddad@cobalt-forge.test,cobalt-forge.test,Noor Haddad,Cobalt Forge,agree
+iris.walcott@stonebridge-co.test,stonebridge-co.test,Iris Walcott,Stonebridge,abstract_sufficient
+omar.castell@driftline.test,driftline.test,Omar Castell,Driftline,conflict
+june.abara@lanternworks.test,lanternworks.test,June Abara,Lanternworks,hunter_only
+theo.brandt@quartzrow.test,quartzrow.test,Theo Brandt,Quartz Row,agree
+mira.solano@ferngate.test,ferngate.test,Mira Solano,Ferngate,abstract_sufficient

@@ -65,3 +65,6 @@ supabase/.temp/
 # project ref in its URL, so it is ignored now.
 .claude/
 .mcp.json
+
+# Provider bake-off run artifacts (may contain real identities from user-supplied CSVs)
+data/evaluation/runs/

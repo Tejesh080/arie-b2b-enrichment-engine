@@ -240,20 +240,26 @@ never in this repo.**
 | `LEAD_BUDGET_USD_CAP`, `TARGET_AUTONOMOUS_ERROR_RATE`, `LATENCY_PENALTY_USD_PER_SEC`, `WORKER_POLL_INTERVAL_SEC`, `WORKER_MAX_ATTEMPTS`, `WORKER_LEASE_SECONDS` | `arie-worker`, optional | policy/runtime defaults apply if unset |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME` | shared, optional | tracing stays off if unset |
 
-`APOLLO_API_KEY` **is** read on any worker running `PROVIDER_MODE=live` —
-that mode builds both real adapters at startup and refuses to start with either
-key missing, rather than silently running a half-blind pipeline that still
-reports coverage and cost. `DEEPSEEK_API_KEY` and the
-Firecrawl/Hunter/Langfuse/OpenAI/Supabase-client placeholders in `.env.example`
-are not read by any path the API or worker actually run — do not configure them
-on Railway.
+`APOLLO_API_KEY` and `HUNTER_API_KEY` **are** read on any worker running
+`PROVIDER_MODE=live` — that mode builds every registered adapter (Abstract,
+Hunter, Apollo) at startup and refuses to start with any key missing, rather
+than silently running a thinner pipeline that still reports coverage and cost.
+`LIVE_PROVIDER_STRATEGY`, `LIVE_PROVIDER_ORDER`,
+`LIVE_EVALUATION_PER_LEAD_BUDGET_USD`, and
+`LIVE_PROVIDER_QUOTA_COOLDOWN_SECONDS` are likewise live-only (see
+`.env.example`); the simulated public demo structurally never reads them.
+`DEEPSEEK_API_KEY` and the Firecrawl/Langfuse/OpenAI/Supabase-client
+placeholders in `.env.example` are not read by any path the API or worker
+actually run — do not configure them on Railway.
 
 **Provider safety.** Deploy with `PROVIDER_MODE=simulated` first and prove
 the hosted core — API, worker, Supabase, migrations, health, lead processing
 — end to end before ever touching `PROVIDER_MODE=live`: flipping it makes
 the worker call the real Abstract API — and, when company evidence leaves the
-decision open, the real Apollo API — for *any* ingested lead, not only corpus
-identities. To return to zero real-provider spend, set
+decision open, the real Hunter and then Apollo APIs — for *any* ingested lead,
+not only corpus identities. Never set `LIVE_PROVIDER_STRATEGY=evaluation_parallel`
+on a deployment serving anonymous traffic: it deliberately buys overlapping
+person evidence per lead and exists only for controlled private experiments. To return to zero real-provider spend, set
 `PROVIDER_MODE=simulated` on `arie-worker` and redeploy it; nothing else
 needs to change.
 

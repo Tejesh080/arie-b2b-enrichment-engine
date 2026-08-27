@@ -233,10 +233,61 @@ Apollo's intent and job-change data is deliberately unused: `buying_intent` is
 the largest field in the ruleset and the vendor's methodology is not
 inspectable.
 
-### Two providers, and the second one is conditional
+### Third provider: Hunter combined enrichment
 
-Ordering is fixed and deterministic — Abstract, then Apollo
-(`arie.live.providers.REGISTERED_LIVE_PROVIDER_NAMES`). Company evidence is an
+Hunter's Combined Enrichment (`GET /v2/combined/find`, `X-API-KEY` header)
+returns a Clearbit-style person+company pair for one email at **0.2 credits per
+successful enrichment** — modelled at ~$0.0049 from the published Starter plan,
+making it the cheaper of the two person providers and second in the default
+order. Its no-match is a **404** (free), and its error table is inverted from
+convention: 403 means rate-limited, 429 means quota exhausted — the adapter
+maps per Hunter's documentation, not per habit.
+
+Two Hunter-specific mapping decisions live in `arie.providers.hunter_contract`:
+seniority is parsed **title-first** (Hunter's five-value enum folds C-level and
+VP into one `executive` bucket, and trusting it first would over-credit every
+VP), while function keeps the enum-first rule (no coarseness problem). The
+combined response's company half — Abstract's own two fields — rides on the
+result as a canonical-audit preview for the bake-off and is deliberately **not
+persisted as evidence** until measurements justify it.
+
+### Strategies, cooldowns, and the bake-off
+
+`LIVE_PROVIDER_STRATEGY` selects between the **optimized** waterfall (the
+default: selective, sequential, cheapest-first, early-stopping — with two
+person providers selling the same fields, a provider whose fields are already
+held from *another* source is skipped as redundant with no fabricated ledger
+row) and **evaluation_parallel**, a private experiment mode that calls both
+person providers concurrently per lead under its own explicit budget, records
+every call separately, classifies cross-provider agreement
+(AGREE/PARTIAL/CONFLICT/UNKNOWN over canonical values, symmetrically — no rule
+prefers a vendor), and self-identifies on the receipt
+(`versions.policy = live_evaluation_parallel`). Conflicting answers keep both
+provenance rows, feed the merge layer's score-relevant `contested` flag, and
+land in front of a human.
+
+A provider that returns a credit/quota-exhausted error (Apollo 402, Hunter
+429, Abstract 422) enters a ledger-backed cooldown
+(`LIVE_PROVIDER_QUOTA_COOLDOWN_SECONDS`): the quota row in `provider_calls`
+(migration 0010 added `error_kind`, `credits_used`, `cost_basis`) keeps every
+worker from re-dialling a dead allowance, with no retry storm and no new
+infrastructure. Leads that needed the cooled provider stop with
+`provider_unavailable` and go to a human; everything else continues.
+
+`scripts/provider_bakeoff.py` is the measurement instrument: a controlled
+identity list in, per-provider match/title/canonical/usable rates, latency
+percentiles, credits, modelled cost-per-useful-result, cross-provider
+agreement, and the Hunter-vs-Abstract company overlap out — plus how often
+Abstract alone would have ended optimized acquisition, computed with the
+pipeline's own stopping rule. `--mock` proves the harness with zero spend;
+real runs require every key, `--confirm-live-spend`, a `--limit`, and a
+`--max-spend-usd` ceiling, and cache their results so re-runs never re-spend.
+
+### Conditional acquisition (the optimized default)
+
+Ordering is deterministic — Abstract, then Hunter, then Apollo
+(`arie.live.providers.REGISTERED_LIVE_PROVIDER_NAMES`, overridable for
+experiments via `LIVE_PROVIDER_ORDER`). Company evidence is an
 order of magnitude cheaper and is shared by every future lead at the same
 employer; person evidence is per-person and can never be amortised that way, so
 buying it before finding out whether it is needed is the expensive mistake.

@@ -92,12 +92,15 @@ verify against current code/docs before using if this page is old.
   reconstructs *why* any past decision stopped where it did from persisted
   state alone.
 - Shipped real third-party provider integrations (Abstract API company
-  enrichment, Apollo person enrichment) behind the same `EnrichmentProvider`
-  protocol the simulator implements, with a deterministic acquisition order
-  that calls the more expensive person lookup *only* when company evidence
-  leaves the decision open — plus a shadow-evaluation mode that runs the full
-  pipeline alongside an existing workflow with zero authoritative effect, gated
-  so it can never accidentally spend real money outside explicit opt-in.
+  enrichment, Hunter combined enrichment, Apollo person enrichment) behind the
+  same `EnrichmentProvider` protocol the simulator implements, with a
+  deterministic cheapest-first acquisition order that calls each more expensive
+  lookup *only* when cheaper evidence leaves the decision open, a private
+  parallel evaluation strategy plus bake-off harness for measuring the vendors
+  against each other before any order is declared optimal, ledger-backed quota
+  cooldowns, and a shadow-evaluation mode that runs the full pipeline alongside
+  an existing workflow with zero authoritative effect — all gated so nothing
+  can accidentally spend real money outside explicit opt-in.
 - Deployed the backend to Railway (two services, one Docker image, sharing a
   Postgres queue and a hosted Supabase database) and the frontend to Vercel,
   then proved it live end-to-end through the public API: an autonomous
@@ -242,11 +245,13 @@ known, named gap, not an oversight discovered here.
 The synthetic benchmark's honesty is also its limit — it proves the policy
 beats alternatives against a *modeled* provider/noise distribution, not
 against real-world data drift, adversarial providers, or vendor-specific
-failure modes. Two real providers are wired (Abstract API company
-enrichment and Apollo person enrichment, four of seven scored fields
-between them), and only the first has made real billed calls — Apollo's
-contract is verified against its published documentation and covered by
-fixture/mock tests, which is not the same as verified against the API.
+failure modes. Three real providers are wired (Abstract API company
+enrichment, Hunter combined enrichment, Apollo person enrichment — four of
+seven scored fields between them), and only the first has made real billed
+calls — Hunter's and Apollo's contracts are verified against the vendors'
+published documentation and covered by fixture/mock tests, which is not the
+same as verified against the APIs. The cheapest-first provider order is a
+reasoned prior awaiting the bake-off's measurements, not a result.
 The only concurrency proof against the hosted deployment is small — 5
 leads submitted simultaneously against the same identity, all settled
 correctly with no duplicate processing (below) — not real load testing. No

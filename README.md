@@ -166,16 +166,25 @@ spend. Everything
 around it is real: real Postgres queue, real worker, real persistence, real
 receipts, real human-review workflow, real n8n orchestration.
 
-**Two real provider integrations exist**, both behind the same interface the
-simulator implements: Abstract API's Company Enrichment (firmographics) and
-Apollo's People Enrichment (seniority and function). Abstract was verified with
-real billed calls, and verifying it turned up a genuine bug on the first one,
-documented rather than quietly fixed. Apollo is complete and green against
-fixtures and mocked transports; its one real smoke call is pending an API key.
+**Three real provider integrations exist**, all behind the same interface the
+simulator implements: Abstract API's Company Enrichment (firmographics),
+Hunter's Combined Enrichment, and Apollo's People Enrichment (both supplying
+seniority and function, deliberately overlapping so they can be compared).
+Abstract was verified with real billed calls — verifying it turned up a genuine
+bug on the first one, documented rather than quietly fixed. Hunter and Apollo
+are complete and green against fixtures and mocked transports; their real smoke
+calls are pending API keys.
 
-Live mode calls them in a fixed order and calls the second one *only if the
-first left the decision open* — so a lead that firmographics already answer
-confidently costs one cheap call, not two.
+Live mode has two explicit strategies. The **optimized** default walks the
+providers cheapest-first (Abstract $0.00165 → Hunter ~$0.0049 → Apollo
+~$0.0196, all modelled figures) and stops the moment existing evidence answers
+the question — a lead that firmographics already settle costs one cheap call,
+not three. A private **evaluation** strategy deliberately calls the person
+providers in parallel on controlled identities so their coverage, quality,
+latency, credits, and agreement can be measured (`scripts/provider_bakeoff.py`)
+before any waterfall order is declared the winner. A provider whose credits run
+out is cooled down from the durable ledger rather than re-dialled, and the
+pipeline continues on the remaining vendors.
 
 Details of both: [provider-integration.md](docs/provider-integration.md).
 
@@ -229,14 +238,17 @@ frozen corpus, and prints their receipts.
 
 - The benchmark is synthetic. It proves the policy against a modelled provider
   distribution, not against real-world data drift or vendor-specific failures.
-- Two real providers are wired, populating four of seven scored fields.
+- Three real providers are wired, populating four of seven scored fields.
   `buying_intent`, `recent_trigger_event`, and `disqualifying_flag` have no
   trustworthy source and stay honestly unknown — which keeps the score floor at
   zero for every live lead.
-- Apollo's adapter has not yet made a real API call. Its contract was verified
-  against Apollo's published documentation and every path is covered by fixture
-  and mock tests, but "verified against the docs" is not "verified against the
-  API".
+- Hunter's and Apollo's adapters have not yet made a real API call. Both
+  contracts were verified against the vendors' published documentation and
+  every path is covered by fixture and mock tests, but "verified against the
+  docs" is not "verified against the API".
+- The cheapest-first provider order is a reasoned prior, not a measured result.
+  The bake-off harness exists to replace it with data; until a controlled live
+  run happens, no order claims to be optimal.
 - No auth, no tenancy. This is a single-tenant proof, not a product.
 - The hosted concurrency check is small — five simultaneous submissions
   completed without duplicate processing. That is not load testing.
