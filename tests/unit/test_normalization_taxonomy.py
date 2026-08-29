@@ -376,6 +376,32 @@ def test_a_banded_headcount_collapses_to_its_lower_bound() -> None:
     assert normalize_employee_count("201-1000") == 201
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # The real Hunter combined-enrichment payloads from the 2026-08-29
+        # abstract-hunter-live-1 experiment: "51-200"-style plain bands parsed
+        # fine, but "10K-50K" fell through to UNKNOWN — this is that gap.
+        ("10K-50K", 10_000),
+        ("1K-5K", 1_000),
+        ("100K+", 100_000),
+        ("1.5K-5K", 1_500),
+        ("1M+", 1_000_000),
+        ("10k-50k", 10_000),  # lowercase, as Hunter's own JSON ships it
+        ("1.5M+", 1_500_000),
+    ],
+)
+def test_k_and_m_suffixed_bands_collapse_to_their_lower_bound(raw: str, expected: int) -> None:
+    assert normalize_employee_count(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["several thousand", "10X-50X", "many", "10K-", "-50K"])
+def test_malformed_km_looking_strings_stay_unknown_not_invented(raw: str) -> None:
+    """A string that merely resembles a k/m band must not become a number —
+    the whole point of the k/m parser is not to guess."""
+    assert normalize_employee_count(raw) == UNKNOWN
+
+
 # ------------------------------------------------------------ surface form --
 
 

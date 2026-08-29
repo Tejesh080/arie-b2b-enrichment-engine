@@ -935,20 +935,53 @@ def function_from_title(title: Any) -> str:
 EMPLOYEE_COUNT_MIN = 1
 EMPLOYEE_COUNT_MAX = 10_000_000
 
-_RANGE_RE = re.compile("^(\\d[\\d,]*)(?:-|to|\\u2013|\\u2014)(\\d[\\d,]*)$")
-_PLUS_RE = re.compile(r"^(\d[\d,]*)\+$")
+# A token is a plain comma-grouped integer, optionally with a decimal
+# fraction, optionally suffixed with a `k`/`m` order-of-magnitude marker
+# ("10,000", "1.5", "10k", "1.5m") — one pattern for both range endpoints
+# and the bare-number fallback, so "10K-50K" and "51-200" parse through the
+# same path rather than the suffix form silently falling through to UNKNOWN.
+_TOKEN_PATTERN = r"\d[\d,]*(?:\.\d+)?[km]?"
+_TOKEN_RE = re.compile(r"^(\d[\d,]*(?:\.\d+)?)([km])?$")
+_RANGE_RE = re.compile("^(" + _TOKEN_PATTERN + ")(?:-|to|\\u2013|\\u2014)(" + _TOKEN_PATTERN + ")$")
+_PLUS_RE = re.compile("^(" + _TOKEN_PATTERN + r")\+$")
+
+_UNIT_MULTIPLIERS: dict[str, int] = {"k": 1_000, "m": 1_000_000}
+
+
+def _parse_employee_count_token(token: str) -> int | None:
+    """One already-lowercased token to an int, or ``None`` if it isn't one.
+
+    Never invents a number: a string that doesn't match the plain-or-k/m-
+    suffixed numeric shape returns ``None`` rather than guessing.
+    """
+    match = _TOKEN_RE.match(token)
+    if match is None:
+        return None
+    number_part, unit = match.groups()
+    try:
+        value = float(number_part.replace(",", ""))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if unit is not None:
+        value *= _UNIT_MULTIPLIERS[unit]
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def normalize_employee_count(raw: Any) -> int | str:
     """Validate a headcount, returning an ``int`` or ``UNKNOWN``.
 
-    Accepts the three shapes vendors actually ship — a number, a banded string
-    (``"51-200"``), and an open-ended band (``"1001+"``) — and returns
-    ``UNKNOWN`` for anything else, including a value outside
+    Accepts the shapes vendors actually ship — a number, a banded string
+    (``"51-200"``), an open-ended band (``"1001+"``), and the same two forms
+    with a `k`/`m` order-of-magnitude suffix (``"10K-50K"``, ``"1.5M+"``) —
+    and returns ``UNKNOWN`` for anything else, including a value outside
     ``[EMPLOYEE_COUNT_MIN, EMPLOYEE_COUNT_MAX]``. A band collapses to its lower
-    bound: ``"51-200"`` becomes 51, the conservative reading — taking the
-    midpoint of ``"201-1000"`` would silently move a company between the
-    scorer's size tiers on a number no provider actually reported.
+    bound: ``"51-200"`` becomes 51 and ``"10K-50K"`` becomes 10000, the
+    conservative reading — taking the midpoint of ``"201-1000"`` would
+    silently move a company between the scorer's size tiers on a number no
+    provider actually reported, and the same argument applies to a k/m band.
 
     ``UNKNOWN`` rather than ``0`` for a bad reading is the numeric half of this
     package's central distinction: a headcount of 0 is a *known* company size
@@ -969,11 +1002,9 @@ def normalize_employee_count(raw: Any) -> int | str:
         return UNKNOWN
 
     band = _RANGE_RE.match(text) or _PLUS_RE.match(text)
-    if band is not None:
-        text = band.group(1)
+    token = band.group(1) if band is not None else text
 
-    try:
-        value = int(float(text.replace(",", "")))
-    except (TypeError, ValueError, OverflowError):
+    parsed = _parse_employee_count_token(token)
+    if parsed is None:
         return UNKNOWN
-    return value if EMPLOYEE_COUNT_MIN <= value <= EMPLOYEE_COUNT_MAX else UNKNOWN
+    return parsed if EMPLOYEE_COUNT_MIN <= parsed <= EMPLOYEE_COUNT_MAX else UNKNOWN
