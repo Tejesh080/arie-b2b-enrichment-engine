@@ -168,6 +168,28 @@ def test_the_evaluation_strategy_builds_a_live_handler(
     assert "compute_score" in handlers
 
 
+def test_an_injected_stop_check_builds_a_live_handler_under_the_optimized_name(
+    runtime: SimulatedEnrichmentRuntime, unopened_pool: ConnectionPool
+) -> None:
+    """Option C's verification path: live_stop_check is accepted alongside
+    the two named strategies without needing a third one — it overrides
+    _acquire_live_evidence's stopping rule, not which named strategy
+    resolve_strategy sees. Proven structurally, same as the other
+    build-time-only assertions in this file: this cannot exercise the
+    stop_check itself without a database, only that the plumbing accepts it
+    and still produces a working handler."""
+    from arie.jobs.handlers import _option_c_stop_check
+
+    handlers = build_handlers(
+        unopened_pool,
+        runtime=runtime,
+        provider_mode="live",
+        live_provider=_FakeLiveProvider(),
+        live_stop_check=_option_c_stop_check,
+    )
+    assert "compute_score" in handlers
+
+
 def test_live_provider_mode_without_a_configured_key_fails_clearly(
     runtime: SimulatedEnrichmentRuntime,
     unopened_pool: ConnectionPool,

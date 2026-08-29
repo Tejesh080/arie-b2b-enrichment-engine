@@ -13,12 +13,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from scripts.live_experiment_abstract_hunter import (
     SHARED_DB_NAME,
     _db_identity,
     _ingest_command,
     _load_identities_from_file,
     _run_preflight,
+    _select_identities,
 )
 
 from arie.providers.hunter_contract import HUNTER_PROVIDER_NAME
@@ -133,6 +135,25 @@ def test_ingest_command_carries_full_name_through() -> None:
     assert command.source == "live-experiment-abstract-hunter"
     assert command.external_ref == "r:0"
     assert command.is_shadow is False
+
+
+def test_select_identities_filters_and_reorders() -> None:
+    identities = [
+        {"validation_id": "v01", "email": "a@example.com"},
+        {"validation_id": "v02", "email": "b@example.com"},
+        {"validation_id": "v03", "email": "c@example.com"},
+    ]
+
+    selected = _select_identities(identities, "v03,v01")
+
+    assert [row["validation_id"] for row in selected] == ["v03", "v01"]
+
+
+def test_select_identities_rejects_an_unknown_id() -> None:
+    identities = [{"validation_id": "v01", "email": "a@example.com"}]
+
+    with pytest.raises(ValueError, match="v99"):
+        _select_identities(identities, "v01,v99")
 
 
 def test_ingest_command_normalizes_a_missing_full_name_to_none() -> None:

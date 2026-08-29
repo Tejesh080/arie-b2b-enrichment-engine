@@ -618,6 +618,7 @@ def build_handlers(
     live_provider: EnrichmentProvider | None = None,
     live_providers: Sequence[EnrichmentProvider] | None = None,
     live_strategy: LiveStrategy | None = None,
+    live_stop_check: _StopCheck | None = None,
 ) -> dict[str, JobHandler]:
     """The worker's production handler registry.
 
@@ -636,6 +637,16 @@ def build_handlers(
     "run exactly this one", not "add this to the default set". Whichever is
     used, the result is sorted into ``arie.live.providers.acquisition_order``
     so an injected set cannot exercise a different ordering than production.
+
+    `live_stop_check` only matters for the non-``evaluation_parallel``
+    branch — it is threaded straight to ``_acquire_live_evidence``'s own
+    ``stop_check`` (default ``None`` there resolves to
+    ``_default_stop_check``, today's unchanged "optimized" behaviour). This
+    is how a script can exercise ``_option_c_stop_check`` for real without
+    ``optimized``/``evaluation_parallel`` — the only two names
+    ``resolve_strategy`` recognises — changing at all; the receipt's own
+    `policy_name` still reads whichever of those two ran, since this
+    injects a *stopping rule*, not a new named, selectable strategy.
     """
     mode = provider_mode if provider_mode is not None else RUNTIME.provider_mode
     if mode not in ("simulated", "live"):
@@ -654,6 +665,7 @@ def build_handlers(
         live_provider=live_provider,
         live_providers=live_providers,
         live_strategy=live_strategy,
+        stop_check=live_stop_check,
     )
 
 
@@ -1924,6 +1936,7 @@ def _build_live_handlers(
     live_provider: EnrichmentProvider | None = None,
     live_providers: Sequence[EnrichmentProvider] | None = None,
     live_strategy: LiveStrategy | None = None,
+    stop_check: _StopCheck | None = None,
 ) -> dict[str, JobHandler]:
     """``PROVIDER_MODE=live`` — the real multi-provider acquisition path, any
     ingested lead (no corpus restriction).
@@ -2036,6 +2049,7 @@ def _build_live_handlers(
                     outcome_guard=outcome_guard,
                     model=model,
                     now=datetime.now(UTC),
+                    stop_check=stop_check or _default_stop_check,
                 )
             scoring = acquisition.scoring
 

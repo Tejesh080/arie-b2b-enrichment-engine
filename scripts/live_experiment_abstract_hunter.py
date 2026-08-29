@@ -43,11 +43,28 @@ approved cost ceiling, then exits — it never ingests a lead or calls a
 provider, and does not require ``--confirm-live-spend``. Otherwise, never
 runs without ``--confirm-live-spend``.
 
+**Two strategies.** ``--strategy evaluation_parallel`` (the default) is the
+proof above — no early stop, both providers on every lead. ``--strategy
+option_c`` instead runs Abstract first and calls Hunter only when
+``arie.jobs.handlers._option_c_stop_check`` judges its fields
+decision-relevant (see ``arie.live.person_relevance``), via
+``build_handlers``'s ``live_stop_check`` injection point — not a third named
+``LiveStrategy``, so the receipt's own ``policy_name`` still reads
+``live_optimized``; ``stopping.reason_code`` (``person_evidence_not_material``
+for a skip) is the truthful signal for which rule actually ran. ``--select``
+restricts a ``--identities-file`` run to specific ``validation_id``s (e.g.
+``--select v02,v11,v01,v09``) — for a small, targeted live verification
+against a handful of leads rather than the full set.
+
     python scripts/live_experiment_abstract_hunter.py --confirm-live-spend
 
     python scripts/live_experiment_abstract_hunter.py \\
         --identities-file data/evaluation/runs/validation-20-2026-08-30/identities.json \\
         --preflight
+
+    python scripts/live_experiment_abstract_hunter.py \\
+        --identities-file data/evaluation/runs/validation-20-2026-08-30/identities.json \\
+        --select v02,v11,v01,v09 --strategy option_c --confirm-live-spend
 """
 
 from __future__ import annotations
@@ -70,7 +87,7 @@ from arie.api.main import build_state
 from arie.api.receipt import build_receipt
 from arie.config import HUNTER, LIVE_PROVIDER
 from arie.core.types import Entity, EntityType, ProviderResult
-from arie.jobs.handlers import build_handlers
+from arie.jobs.handlers import _option_c_stop_check, build_handlers
 from arie.jobs.worker import run_worker_cycle
 from arie.migrations import checksum_of, migration_files
 from arie.providers.hunter_contract import HUNTER_PROVIDER_NAME
@@ -274,6 +291,28 @@ def _load_identities_from_file(path: Path) -> tuple[list[dict[str, str]], int]:
     return eligible, excluded
 
 
+def _select_identities(identities: list[dict[str, str]], select: str) -> list[dict[str, str]]:
+    """Restricts ``identities`` to the comma-separated ``validation_id``s in
+    ``select``, in the order given (not the file's own order) — so a
+    verification run can list "the two calls, then the two skips" and have
+    the printed/ingested order match.
+
+    Raises ``ValueError`` naming any id not present, rather than silently
+    ingesting fewer leads than asked for — the same "never silently drop"
+    discipline ``--identities-file``'s own LOW-quality exclusion documents
+    its departure from, deliberately, one line up.
+    """
+    wanted = [vid.strip() for vid in select.split(",") if vid.strip()]
+    by_id = {identity.get("validation_id", ""): identity for identity in identities}
+    missing = [vid for vid in wanted if vid not in by_id]
+    if missing:
+        raise ValueError(
+            f"--select named validation_id(s) not present among eligible identities: "
+            f"{missing}. Available: {sorted(by_id)}."
+        )
+    return [by_id[vid] for vid in wanted]
+
+
 def _db_identity(conninfo: str) -> tuple[str, str, str]:
     """(host, port, dbname) — what makes two connection strings the same database."""
     parts = urlsplit(conninfo)
@@ -470,6 +509,28 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--select",
+        default=None,
+        help=(
+            "Comma-separated validation_ids to restrict a --identities-file run to "
+            "(e.g. v02,v11,v01,v09) — for a small, targeted live run against specific "
+            "leads rather than the full set. Order is preserved; unknown ids are a "
+            "hard error, never silently dropped."
+        ),
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=("evaluation_parallel", "option_c"),
+        default="evaluation_parallel",
+        help=(
+            "evaluation_parallel (default): both providers on every lead, no early "
+            "stop. option_c: Abstract first, Hunter only when "
+            "arie.jobs.handlers._option_c_stop_check judges it decision-relevant — "
+            "injected via build_handlers' live_stop_check, not a third named "
+            "LiveStrategy (see the module docstring)."
+        ),
+    )
+    parser.add_argument(
         "--preflight",
         action="store_true",
         help=(
@@ -522,6 +583,16 @@ def main() -> int:
         identities, excluded_count = _load_identities_from_file(args.identities_file)
     else:
         identities, excluded_count = IDENTITIES, 0
+
+    if args.select is not None:
+        if args.identities_file is None:
+            print("--select requires --identities-file.", file=sys.stderr)
+            return 1
+        try:
+            identities = _select_identities(identities, args.select)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
 
     db_url: str = args.db_url or (VALIDATION_DB_URL if args.identities_file else LOCAL_DB_URL)
     out_dir: Path = args.out or (
@@ -580,12 +651,23 @@ def main() -> int:
         try:
             # evaluation_parallel: no early stop, both providers attempted on every
             # lead (see module docstring) — Apollo is simply absent from this list,
-            # never built, never referenced.
-            handlers = build_handlers(
-                state.pool,
-                provider_mode="live",
-                live_providers=[abstract, hunter],
-                live_strategy="evaluation_parallel",
+            # never built, never referenced. option_c: the default "optimized"
+            # strategy resolution, with Hunter gated by _option_c_stop_check via
+            # live_stop_check instead of evaluation_parallel's always-call-both.
+            handlers = (
+                build_handlers(
+                    state.pool,
+                    provider_mode="live",
+                    live_providers=[abstract, hunter],
+                    live_stop_check=_option_c_stop_check,
+                )
+                if args.strategy == "option_c"
+                else build_handlers(
+                    state.pool,
+                    provider_mode="live",
+                    live_providers=[abstract, hunter],
+                    live_strategy="evaluation_parallel",
+                )
             )
 
             lead_ids: list[UUID] = []
@@ -644,6 +726,12 @@ def main() -> int:
                 "run_id": run_id,
                 "identities_file": str(args.identities_file) if args.identities_file else None,
                 "excluded_low_quality_count": excluded_count,
+                "strategy": args.strategy,
+                "selected_validation_ids": (
+                    [identity.get("validation_id") for identity in identities]
+                    if args.select
+                    else None
+                ),
                 "leads": [],
             }
             with state.pool.connection() as conn:
