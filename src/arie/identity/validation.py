@@ -16,12 +16,36 @@ case that fooled a human reader too.
 **Deterministic, not fuzzy — the same discipline `arie.identity.normalize`
 already commits to.** No similarity score, no edit-distance threshold, no
 nickname table. A name either resolves to the same (first, last) token pair
-after Unicode-fold and punctuation-strip, or it does not; there is no partial
-credit that could quietly wave a mismatch through. Where there is nothing to
-compare (most cold inbound leads carry no ``full_name`` before enrichment —
-that field usually doesn't exist until a provider fills it in), the verdict
-says so honestly (``UNVERIFIABLE``/``PROBABLE``) rather than defaulting to
-either extreme.
+after Unicode-fold and punctuation-strip, or it does not — with exactly one
+narrow, deliberate exception (below). There is no other partial credit that
+could quietly wave a mismatch through. Where there is nothing to compare
+(most cold inbound leads carry no ``full_name`` before enrichment — that
+field usually doesn't exist until a provider fills it in), the verdict says
+so honestly (``UNVERIFIABLE``/``PROBABLE``) rather than defaulting to either
+extreme.
+
+**The one exception: a conservative first-name variant on an exact surname
+match.** Hunter, asked about ``tobi@shopify.com``, correctly resolved that
+mailbox to Tobias Lutke — Tobi Lütke's own legal first name, honestly
+returned in full where the lead source had it in its short form. A same-
+company match this same, this close, was reading as a full ``MISMATCH``,
+indistinguishable from the genuinely different Patrick Bosmans at
+``patrick@stripe.com`` two rows over — a false negative this module must not
+manufacture any more than it manufactures a false positive.
+``_is_conservative_first_name_variant`` is deliberately the narrowest fix
+that closes it: not an edit-distance threshold, not a nickname lookup table
+(no "Bob"/"Robert" table to keep in sync, no false-positive risk from an
+entry that turns out to be wrong for a given culture) — one first name must
+be an exact, case/diacritic-folded **prefix** of the other, both at least
+three characters, and the **surname must match exactly**. That is a single
+string operation, easy to audit, and only reachable at all when the surname
+signal already agrees — it can never turn a genuine surname mismatch (Patrick
+Collison / Patrick Bosmans, Zheng Zhang / Zhang Zheng, Yiu Lee / Lee Yiu, all
+still ``MISMATCH``) into anything softer. A variant match is treated as no
+name signal at all for scoring purposes — it can cap a lead at ``PROBABLE``
+alongside an agreeing domain, exactly like a lead with no name to check in
+the first place, but it can never by itself push a verdict to ``VERIFIED``:
+only an exact name match earns that.
 
 **What this module does not do.** It never decides *which* vendor is right,
 never scores a lead, and never persists anything — it is a pure function from
@@ -141,14 +165,52 @@ def _name_key(raw: str) -> tuple[str, str] | None:
     return (tokens[0], tokens[-1])
 
 
-def _name_signal(requested: RequestedIdentity, returned: ReturnedIdentity) -> _SIGNAL:
+def _is_conservative_first_name_variant(first_a: str, first_b: str) -> bool:
+    """One first name is an exact prefix of the other, both at least three
+    characters — e.g. "tobi" of "tobias". Deliberately a single string
+    operation, not an edit-distance score or a nickname lookup table: it
+    cannot drift, needs no maintenance, and has no failure mode where an
+    entry turns out to be wrong. The three-character floor keeps a bare
+    initial ("A" of "Aaron") from qualifying."""
+    if len(first_a) < 3 or len(first_b) < 3:
+        return False
+    shorter, longer = (first_a, first_b) if len(first_a) <= len(first_b) else (first_b, first_a)
+    return longer.startswith(shorter)
+
+
+def _name_signal(
+    requested: RequestedIdentity, returned: ReturnedIdentity
+) -> tuple[_SIGNAL, str | None]:
+    """The name signal, plus an extra reason to surface when it's a
+    conservative first-name variant rather than an exact match (see the
+    module docstring's "one exception")."""
     if requested.full_name is None or returned.full_name is None:
-        return "unknown"
+        return "unknown", None
     requested_key = _name_key(requested.full_name)
     returned_key = _name_key(returned.full_name)
     if requested_key is None or returned_key is None:
-        return "unknown"
-    return "match" if requested_key == returned_key else "mismatch"
+        return "unknown", None
+    if requested_key == returned_key:
+        return "match", None
+
+    requested_first, requested_last = requested_key
+    returned_first, returned_last = returned_key
+    if requested_last == returned_last and _is_conservative_first_name_variant(
+        requested_first, returned_first
+    ):
+        # Same surname, first name a conservative variant — not a false-
+        # negative MISMATCH for a nickname, but not an exact match either.
+        # "unknown" here (not "match") is what keeps this incapable of
+        # reaching VERIFIED on its own: it can only ever contribute the way a
+        # missing name would, i.e. cap a lead at PROBABLE alongside an
+        # agreeing domain. A genuine surname disagreement still falls through
+        # to "mismatch" below, unaffected by this branch.
+        return (
+            "unknown",
+            "returned name is a conservative first-name variant of the expected name "
+            "(surname matches exactly)",
+        )
+    return "mismatch", None
 
 
 def _expected_domain(requested: RequestedIdentity) -> str | None:
@@ -218,7 +280,10 @@ def validate_identity(
       ``PROBABLE`` — a single corroborating signal cannot rule out a
       same-domain wrong-person match on its own. This is the common real
       shape: most cold leads carry no expected name, so a domain-only match
-      caps here, never at ``VERIFIED``.
+      caps here, never at ``VERIFIED``. A conservative first-name variant on
+      an exact surname match (see the module docstring) is treated the same
+      way as no name at all — it can help a lead reach ``PROBABLE`` alongside
+      an agreeing domain, never ``VERIFIED`` by itself.
     * **Nothing comparable** on either side is ``UNVERIFIABLE``.
     """
     if returned.full_name is None and returned.employer_domain is None and returned.email is None:
@@ -226,7 +291,7 @@ def validate_identity(
 
     domain = _domain_signal(requested, returned)
     email = _email_signal(requested, returned)
-    name = _name_signal(requested, returned)
+    name, name_variant_reason = _name_signal(requested, returned)
 
     reasons: list[str] = []
     if domain == "match":
@@ -241,6 +306,8 @@ def validate_identity(
         reasons.append("returned name matches the expected name")
     elif name == "mismatch":
         reasons.append("returned name does not match the expected name")
+    elif name_variant_reason is not None:
+        reasons.append(name_variant_reason)
 
     if "mismatch" in (domain, email, name):
         return IdentityValidation(MISMATCH, tuple(reasons))
