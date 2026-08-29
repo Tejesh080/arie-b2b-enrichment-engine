@@ -75,7 +75,7 @@ survived, the retry is served from cache and doesn't even re-fetch.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -113,6 +113,7 @@ from arie.live.budget import LiveSpendGuard
 from arie.live.cooldown import PROVIDER_UNAVAILABLE, ProviderCooldownGuard
 from arie.live.evaluation import classify_agreement, overall_agreement
 from arie.live.outcome_cache import RECENT_MISS, RECENT_PARTIAL, ProviderOutcomeGuard
+from arie.live.person_relevance import person_evidence_is_decision_relevant
 from arie.live.providers import acquisition_order
 from arie.live.safety import (
     LIVE_GUARD_REASON,
@@ -862,6 +863,12 @@ _STOP_CONFIDENT = "confidence_reached"
 _STOP_PROVIDER_FAILED = "provider_failed"
 _STOP_ALL_CALLED = "all_providers_called"
 _STOP_NO_IDENTIFIER = "no_domain_available"
+_STOP_PERSON_EVIDENCE_NOT_MATERIAL = "person_evidence_not_material"
+"""Option C's own stop reason — see ``_option_c_stop_check``. Distinct from
+``_STOP_SETTLED``: this fires when the *overall* bounds are still open (some
+other unknown field could still move the score) but a specific person
+provider's own fields, resolved as favorably as possible, provably could
+not — a narrower, provider-specific claim ``_STOP_SETTLED`` does not make."""
 """Retained spelling. It reads company-specific and is now the general "no
 provider had an identifier it could use for this lead", but it is a stable
 ``decision_receipts.stop_reason`` value with an explanation entry in
@@ -910,6 +917,64 @@ def _enough_evidence(
     if has_evidence and model.predict(scoring) >= model.tau:
         return _STOP_CONFIDENT
     return None
+
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    # A real (non-annotation) assignment, unlike every other use of
+    # ConfidenceModel in this module — those are all deferred by `from
+    # __future__ import annotations`, but a type alias is evaluated at
+    # import time, so it needs the same TYPE_CHECKING guard the import
+    # itself already has, or a live worker would NameError on startup.
+    _StopCheck = Callable[[ScoringResult, bool, ConfidenceModel, EnrichmentProvider], str | None]
+"""One check, asked before every provider in ``_acquire_live_evidence``'s
+loop: ``(scoring, has_evidence, model, next_provider) -> stop_reason |
+None``. ``next_provider`` is what lets a stop check answer differently for a
+company provider than a person one, which ``_enough_evidence`` alone cannot
+do — it has no opinion on which provider is next, deliberately, since the
+"optimized" strategy's stopping rule never depended on that."""
+
+
+def _default_stop_check(
+    scoring: ScoringResult,
+    has_evidence: bool,
+    model: ConfidenceModel,
+    _next_provider: EnrichmentProvider,
+) -> str | None:
+    """The "optimized" strategy's stopping rule, adapted to ``_StopCheck``'s
+    signature. Behaviour is unchanged from calling ``_enough_evidence``
+    directly — this only exists so ``_acquire_live_evidence`` has one
+    parameter, not a special-cased default."""
+    return _enough_evidence(scoring, has_evidence=has_evidence, model=model)
+
+
+def _option_c_stop_check(
+    scoring: ScoringResult,
+    _has_evidence: bool,
+    _model: ConfidenceModel,
+    next_provider: EnrichmentProvider,
+) -> str | None:
+    """Option C: Abstract first, Hunter only when its still-unknown fields
+    could materially change the recommendation.
+
+    A company provider (Abstract) is always attempted — gated only by the
+    same settled-bounds check every strategy already honours, which cannot
+    fire before any evidence exists anyway. A person provider (Hunter) is
+    attempted only when ``arie.live.person_relevance`` judges its declared
+    fields, resolved as favorably as possible, capable of changing the
+    recommendation reached from company evidence alone.
+
+    Never reads the calibrated confidence model — Option C's stopping rule
+    is deterministic bounds/best-case arithmetic only (``model`` is accepted
+    for signature parity with :data:`_StopCheck`, never called), not the
+    probabilistic judgement about the whole lead that ``_enough_evidence``'s
+    confidence branch makes.
+    """
+    if scoring.bounds.is_settled:
+        return _STOP_SETTLED
+    if next_provider.entity_type != "person":
+        return None
+    relevance = person_evidence_is_decision_relevant(scoring, next_provider.provides_fields)
+    return None if relevance.should_call else _STOP_PERSON_EVIDENCE_NOT_MATERIAL
 
 
 @dataclass(frozen=True)
@@ -1032,9 +1097,19 @@ def _acquire_live_evidence(
     outcome_guard: ProviderOutcomeGuard,
     model: ConfidenceModel,
     now: datetime,
+    stop_check: _StopCheck = _default_stop_check,
 ) -> _LiveAcquisitionOutcome:
     """Walk the live providers in order, stopping as soon as more evidence
     stops being worth buying.
+
+    ``stop_check`` decides that, asked before every provider — defaults to
+    the "optimized" strategy's own rule (:func:`_default_stop_check`, an
+    exact behavioural wrapper around :func:`_enough_evidence`), so every
+    existing caller is unaffected. Option C passes
+    :func:`_option_c_stop_check` instead; nothing else in this loop —
+    caching, cooldown, budget, ledgering, identity validation — changes with
+    it, which is the point: the strategies differ only in *when* to stop,
+    never in what happens once a provider is actually called.
 
     This is the generalisation of P5's single-provider loop, and it is
     deliberately a generalisation rather than a rewrite: every step below
@@ -1092,9 +1167,7 @@ def _acquire_live_evidence(
     identity_findings: list[dict[str, Any]] = []
 
     for index, provider in enumerate(providers):
-        stop_reason = _enough_evidence(
-            scoring, has_evidence=bool(_all_evidence(evidence)), model=model
-        )
+        stop_reason = stop_check(scoring, bool(_all_evidence(evidence)), model, provider)
         if stop_reason is not None:
             not_needed = [candidate.name for candidate in providers[index:]]
             break

@@ -17,9 +17,18 @@ import pytest
 
 from arie.core.types import Entity, EntityType, Evidence, ProviderResult
 from arie.evidence.ttl_policy import ttl_for_field
-from arie.jobs.handlers import _enough_evidence, _live_entity_refs, _resolve_live_providers
+from arie.jobs.handlers import (
+    _STOP_PERSON_EVIDENCE_NOT_MATERIAL,
+    _STOP_SETTLED,
+    _default_stop_check,
+    _enough_evidence,
+    _live_entity_refs,
+    _option_c_stop_check,
+    _resolve_live_providers,
+)
 from arie.live.providers import REGISTERED_LIVE_PROVIDER_NAMES, acquisition_order
 from arie.providers.apollo_contract import APOLLO_PROVIDER_NAME
+from arie.providers.hunter_contract import HUNTER_PROVIDER_NAME
 from arie.providers.live_abstract import PROVIDER_NAME as ABSTRACT_PROVIDER_NAME
 from arie.scoring.engine import score_evidence
 
@@ -207,3 +216,80 @@ def test_bounds_cannot_settle_on_company_evidence_alone_and_that_is_honest() -> 
     assert not scoring.bounds.is_settled
     assert scoring.bounds.lower == 0.0
     assert "disqualifying_flag" in scoring.signals.unknown_fields
+
+
+# --------------------------------------------------------- option c stopping --
+
+_HUNTER = _StubProvider(
+    name=HUNTER_PROVIDER_NAME,
+    entity_type="person",
+    provides_fields=("title_seniority", "title_function"),
+)
+
+
+def test_default_stop_check_is_exactly_enough_evidence_for_any_provider() -> None:
+    """The parameterisation must not change existing behaviour: passing no
+    stop_check to _acquire_live_evidence has to be indistinguishable from
+    calling _enough_evidence directly, for a company provider or a person
+    one — _default_stop_check has no opinion on which provider is next."""
+    scoring = score_evidence(
+        _company_evidence(industry="construction", employee_count=5), datetime.now(UTC)
+    )
+    direct = _enough_evidence(scoring, has_evidence=True, model=_StubModel(0.8))  # type: ignore[arg-type]
+
+    for provider in (_ABSTRACT, _HUNTER):
+        assert (
+            _default_stop_check(scoring, True, _StubModel(0.8), provider)  # type: ignore[arg-type]
+            == direct
+        )
+
+
+def test_option_c_always_calls_the_company_provider_first() -> None:
+    """With no evidence at all, bounds are trivially unsettled and Abstract
+    is not a person provider — option_c must never refuse the first call."""
+    scoring = score_evidence([], datetime.now(UTC))
+    assert (
+        _option_c_stop_check(scoring, False, _StubModel(0.99), _ABSTRACT)  # type: ignore[arg-type]
+        is None
+    )
+
+
+def test_option_c_skips_hunter_when_its_fields_cannot_change_the_recommendation() -> None:
+    """A tiny nonprofit: even Hunter's best possible title fields could not
+    lift the score into contention. option_c must skip it, and never touch
+    the confidence model to decide that (a model scored to always say
+    'keep buying' proves the skip came from the bounds/best-case check)."""
+    scoring = score_evidence(
+        _company_evidence(industry="nonprofit", employee_count=5), datetime.now(UTC)
+    )
+    result = _option_c_stop_check(scoring, True, _StubModel(0.0), _HUNTER)  # type: ignore[arg-type]
+    assert result == _STOP_PERSON_EVIDENCE_NOT_MATERIAL
+
+
+def test_option_c_calls_hunter_when_its_best_case_could_flip_the_recommendation() -> None:
+    """A mid-size software company: best-case title_seniority/title_function
+    would cross QUALIFY_THRESHOLD. option_c must call Hunter even though a
+    confidence model set to always say 'stop' would otherwise have ended
+    acquisition here under the optimized strategy."""
+    scoring = score_evidence(
+        _company_evidence(industry="software", employee_count=150), datetime.now(UTC)
+    )
+    optimized_would_stop = _enough_evidence(
+        scoring,
+        has_evidence=True,
+        model=_StubModel(0.99),  # type: ignore[arg-type]
+    )
+    assert optimized_would_stop == "confidence_reached"
+
+    result = _option_c_stop_check(scoring, True, _StubModel(0.99), _HUNTER)  # type: ignore[arg-type]
+    assert result is None
+
+
+def test_option_c_stops_on_settled_bounds_the_same_way_optimized_does() -> None:
+    """A disqualified lead's bounds pin to zero regardless of strategy — this
+    must still be the strongest, cheapest possible skip under option_c too."""
+    scoring = score_evidence(_company_evidence(disqualifying_flag=True), datetime.now(UTC))
+    assert scoring.bounds.is_settled
+
+    result = _option_c_stop_check(scoring, True, _StubModel(0.0), _HUNTER)  # type: ignore[arg-type]
+    assert result == _STOP_SETTLED

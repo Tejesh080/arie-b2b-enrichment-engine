@@ -89,6 +89,13 @@ _STOP_REASON_EXPLANATIONS: dict[str, str] = {
         "No call was made and nothing was spent on it; acquisition continued with the other "
         "providers. The decision reflects the evidence that was obtainable without it."
     ),
+    "person_evidence_not_material": (
+        "A person data provider (e.g. Hunter) was deliberately not called: given the "
+        "company evidence already collected, even that provider's most favorable possible "
+        "seniority/function fields could not have changed the recommendation. The decision "
+        "reflects company evidence alone — this is a deterministic bounds check, not a "
+        "confidence judgement, and never authorises an autonomous decision on its own."
+    ),
     "evaluation_complete": (
         "This lead ran under the private provider-evaluation strategy, which deliberately "
         "consults overlapping data providers for the same lead so their coverage, quality, "

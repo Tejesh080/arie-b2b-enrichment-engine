@@ -219,6 +219,32 @@ def field_points(field_name: str, value: Any) -> float:
     return 0.0
 
 
+_BEST_CASE_CATEGORICAL_VALUES: dict[str, dict[str, float]] = {
+    "industry": _INDUSTRY_POINTS,
+    "title_seniority": _SENIORITY_POINTS,
+    "title_function": _FUNCTION_POINTS,
+}
+
+
+def best_case_value(field_name: str) -> Any | None:
+    """The categorical value that earns ``field_name``'s ``MAX_FIELD_POINTS``
+    ceiling, or ``None`` if the field has no single best categorical value
+    (a continuous field like ``employee_count``/``buying_intent``/
+    ``recent_trigger_event``, the disqualifier, or an unrecognised name).
+
+    Exists so a caller deciding whether a still-unknown field is worth buying
+    can ask "if this resolved as favorably as possible, would the
+    recommendation change?" via :func:`score_facts`/:func:`decide`, without
+    needing to know this module's point tables itself — the "reuse the
+    scoring machinery, don't duplicate it" rule applied to acquisition
+    strategy, not just to the scorer's own callers.
+    """
+    points = _BEST_CASE_CATEGORICAL_VALUES.get(field_name)
+    if points is None:
+        return None
+    return max(points, key=points.get)  # type: ignore[arg-type]
+
+
 def is_disqualified(facts: Mapping[str, Any]) -> bool:
     return facts.get(DISQUALIFIER_FIELD) is True
 
