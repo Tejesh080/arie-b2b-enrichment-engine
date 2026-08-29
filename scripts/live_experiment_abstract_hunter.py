@@ -1,21 +1,34 @@
 """One controlled, real Abstract + Hunter experiment — Live V1 two-provider proof.
 
-Runs a fixed, small identity list through the real ``compute_score`` pipeline
-using ``evaluation_parallel`` strategy (no early stop — both providers are
-attempted on every lead, which is what makes the Abstract-vs-Hunter company
-comparison and the Hunter title-normalization check meaningful) with
+Runs an identity list through the real ``compute_score`` pipeline using
+``evaluation_parallel`` strategy (no early stop — both providers are attempted
+on every lead, which is what makes the Abstract-vs-Hunter company comparison
+and the Hunter title-normalization check meaningful) with
 ``live_providers=[Abstract, Hunter]`` injected explicitly — Apollo is never
 built, never imported into the call graph, never checked for a key. This is
 the documented injection point ``arie.jobs.handlers.build_handlers`` already
 exposes for tests and ``scripts/live_provider_smoke.py``; no core handler code
 changes.
 
-**Database.** Points at the local Compose Postgres
-(``postgresql://arie:arie_local_dev@localhost:5432/arie``) by default, never
-the deployed Supabase in ``.env``'s ``DATABASE_URL`` — this experiment's leads,
-evidence, and cost-ledger rows have no business in the shared/production
-database. Override with ``--db-url`` only for a deliberately different local
-target.
+**Two identity sources.** With no ``--identities-file``, runs the original
+fixed five (``IDENTITIES`` below) against the shared local Compose database.
+With ``--identities-file``, loads a Phase-1-style validation dataset JSON
+(``{"identities": [{"email", "company_domain", "company", "expected_title",
+"ground_truth_quality", ...}, ...]}``) and keeps only ``HIGH``/``MEDIUM`` rows
+— a ``LOW``-quality row (e.g. an unverified carry-over) is excluded
+automatically, never opt-in.
+
+**Database.** The original five default to the shared local Compose Postgres
+(``postgresql://arie:arie_local_dev@localhost:5432/arie``) — never the
+deployed Supabase in ``.env``'s ``DATABASE_URL``. A ``--identities-file`` run
+defaults instead to a *dedicated* sibling database on that same server
+(``.../arie_live_validation``, see ``VALIDATION_DB_URL``) and refuses outright
+to target the shared ``arie`` database: docker-compose's always-on ``api``/
+``worker`` containers (``restart: unless-stopped``, polling via ``SKIP
+LOCKED``) poll it continuously and would race this run — exactly the race a
+prior run of this experiment hit. The dedicated database is created and fully
+migrated automatically (idempotent, same technique as ``scripts/migrate.py``)
+before anything else happens. Override either default with ``--db-url``.
 
 **Spend discipline.** ``RecordingProvider`` wraps each real adapter and keeps
 the full ``ProviderResult`` (including ``raw``) for every call *it itself
@@ -25,9 +38,16 @@ without ever calling a provider twice for the same identity. A cache-served
 answer (Step 11) never reaches ``fetch`` at all, which is how "no new call
 recorded" proves cache reuse without spending anything to test it.
 
-Never runs without ``--confirm-live-spend``.
+``--preflight`` validates identity count, providers, database, and the
+approved cost ceiling, then exits — it never ingests a lead or calls a
+provider, and does not require ``--confirm-live-spend``. Otherwise, never
+runs without ``--confirm-live-spend``.
 
     python scripts/live_experiment_abstract_hunter.py --confirm-live-spend
+
+    python scripts/live_experiment_abstract_hunter.py \\
+        --identities-file data/evaluation/runs/validation-20-2026-08-30/identities.json \\
+        --preflight
 """
 
 from __future__ import annotations
@@ -39,7 +59,11 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
+
+import psycopg
+from psycopg import sql as psycopg_sql
 
 from arie.api.ingest import LeadIngestCommand, ingest_lead
 from arie.api.main import build_state
@@ -48,10 +72,36 @@ from arie.config import HUNTER, LIVE_PROVIDER
 from arie.core.types import Entity, EntityType, ProviderResult
 from arie.jobs.handlers import build_handlers
 from arie.jobs.worker import run_worker_cycle
+from arie.migrations import checksum_of, migration_files
+from arie.providers.hunter_contract import HUNTER_PROVIDER_NAME
+from arie.providers.live_abstract import PROVIDER_NAME as ABSTRACT_PROVIDER_NAME
 from arie.providers.live_abstract import AbstractCompanyEnrichmentProvider
 from arie.providers.live_hunter import HunterEnrichmentProvider
 
 LOCAL_DB_URL = "postgresql://arie:arie_local_dev@localhost:5432/arie"
+"""The shared local Compose database — what the original five identities run
+against, and what docker-compose's always-on api/worker containers poll."""
+
+SHARED_DB_NAME = "arie"
+
+VALIDATION_DB_URL = "postgresql://arie:arie_local_dev@localhost:5432/arie_live_validation"
+"""Dedicated sibling database, same server, for ``--identities-file`` runs —
+distinct enough that the compose workers' ``SKIP LOCKED`` polling of
+``arie``'s ``jobs`` table never sees a row inserted here."""
+
+DEFAULT_EXPECTED_COUNT = 15
+"""``--preflight``'s default expectation — the size of the approved
+validation-20-2026-08-30 HIGH/MEDIUM set. Override with ``--expected-count``
+for a different dataset."""
+
+MAX_MODELED_SPEND_USD = 0.09825
+MAX_HUNTER_CREDITS = 3.0
+"""The approved Phase 4 cost ceiling for the 15-identity validation-20 set
+(15 x $0.00165 Abstract + 15 x 0.2 Hunter credits at $0.0049/success), fixed
+at the value approved before any provider call — not recomputed from whatever
+``LIVE_PROVIDER``/``HUNTER`` happen to be configured to when this runs, so a
+later rate change can't silently raise the spend a human already signed off
+on without ``--preflight`` catching it."""
 
 # Exactly the five identities specified for this run. Do not add, remove, or
 # substitute — a MISS is a valid result, not a reason to try a different
@@ -165,14 +215,255 @@ def _result_to_dict(result: ProviderResult | None) -> dict[str, Any] | None:
     }
 
 
+def _load_identities_from_file(path: Path) -> tuple[list[dict[str, str]], int]:
+    """Loads HIGH/MEDIUM identities from a Phase-1 validation dataset JSON.
+
+    Returns ``(identities, excluded_count)``. A row whose ``ground_truth_quality``
+    is not ``HIGH``/``MEDIUM`` (e.g. the ``LOW`` carry-over flagged in
+    validation-20-2026-08-30) is dropped automatically — it is in that file
+    specifically because it failed this project's own verification bar, so
+    loading it silently would undo Phase 2's point.
+    """
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    eligible: list[dict[str, str]] = []
+    excluded = 0
+    for row in payload["identities"]:
+        if row.get("ground_truth_quality") not in ("HIGH", "MEDIUM"):
+            excluded += 1
+            continue
+        eligible.append(
+            {
+                "email": row["email"],
+                "domain": row["company_domain"],
+                "company_name": row["company"],
+                "expected_title": row["expected_title"],
+                "full_name": row.get("full_name", ""),
+                "validation_id": row.get("validation_id", ""),
+                "ground_truth_quality": row["ground_truth_quality"],
+            }
+        )
+    return eligible, excluded
+
+
+def _db_identity(conninfo: str) -> tuple[str, str, str]:
+    """(host, port, dbname) — what makes two connection strings the same database."""
+    parts = urlsplit(conninfo)
+    return ((parts.hostname or "").lower(), str(parts.port or 5432), parts.path.lstrip("/").lower())
+
+
+def _ensure_database(conninfo: str) -> bool:
+    """Create the target Postgres database if it doesn't exist yet. Returns
+    True if it was created.
+
+    Connects to the server's ``postgres`` maintenance database to issue
+    ``CREATE DATABASE`` — the same technique ``scripts/test_db.py``'s
+    ``designate`` step uses to stand up a disposable sibling database on the
+    same Compose Postgres server.
+    """
+    _host, _port, dbname = _db_identity(conninfo)
+    try:
+        with psycopg.connect(conninfo, connect_timeout=10):
+            return False
+    except psycopg.OperationalError as exc:
+        if "does not exist" not in str(exc):
+            raise
+
+    parts = urlsplit(conninfo)
+    maintenance = conninfo.replace(f"/{parts.path.lstrip('/')}", "/postgres", 1)
+    with (
+        psycopg.connect(maintenance, autocommit=True, connect_timeout=10) as conn,
+        conn.cursor() as cur,
+    ):
+        cur.execute(psycopg_sql.SQL("CREATE DATABASE {}").format(psycopg_sql.Identifier(dbname)))
+    return True
+
+
+def _apply_migrations(conninfo: str) -> list[str]:
+    """Apply pending ``migrations/*.sql`` against ``conninfo``. Returns the
+    filenames applied.
+
+    Deliberately a small duplicate of ``scripts/migrate.py``'s ``migrate()``
+    rather than an import of it: per ``arie.migrations``'s own module
+    docstring, ``scripts/`` only resolves on ``sys.path`` when the process was
+    launched as a module from the repo root, which this script's own
+    documented ``python scripts/live_experiment_abstract_hunter.py``
+    invocation is not. ``arie.migrations`` (an installed package) is safe to
+    import from anywhere, so the primitives come from there.
+    """
+    applied: list[str] = []
+    with psycopg.connect(conninfo) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                "filename TEXT PRIMARY KEY, checksum TEXT NOT NULL, "
+                "applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+            )
+        conn.commit()
+
+        for path in migration_files():
+            sql_text = path.read_text(encoding="utf-8")
+            checksum = checksum_of(sql_text)
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT checksum FROM schema_migrations WHERE filename = %s", (path.name,)
+                )
+                row = cur.fetchone()
+
+            if row is not None:
+                if row[0] != checksum:
+                    raise RuntimeError(
+                        f"{path.name} was already applied with a different checksum. A "
+                        "migration must never be edited after it has run anywhere — add a "
+                        "new migration instead."
+                    )
+                continue
+
+            with conn.cursor() as cur:
+                cur.execute(sql_text)
+                cur.execute(
+                    "INSERT INTO schema_migrations (filename, checksum) VALUES (%s, %s)",
+                    (path.name, checksum),
+                )
+            conn.commit()
+            applied.append(path.name)
+
+    return applied
+
+
+def _run_preflight(
+    *,
+    identities: list[dict[str, str]],
+    excluded_count: int,
+    expected_count: int,
+    db_url: str,
+    abstract_name: str,
+    hunter_name: str,
+    migrations_applied: list[str],
+) -> bool:
+    """Prints the dry-run report and returns whether every check passed.
+
+    Never ingests a lead, never opens a worker cycle, never calls a provider
+    — everything it checks is either static (which providers are wired in),
+    already-done-by-this-point (database created + migrated), or arithmetic
+    (cost ceiling from the configured per-call rates times the identity
+    count).
+    """
+    n = len(identities)
+    max_abstract_usd = round(n * LIVE_PROVIDER.cost_usd_per_call, 5)
+    max_hunter_usd = round(n * HUNTER.cost_usd_per_success, 5)
+    max_credits = round(n * HUNTER.credits_per_success, 2)
+    max_total_usd = round(max_abstract_usd + max_hunter_usd, 5)
+    host, port, dbname = _db_identity(db_url)
+
+    ok = True
+    results: list[tuple[bool, str, str]] = []
+
+    def check(label: str, passed: bool, detail: str) -> None:
+        nonlocal ok
+        ok = ok and passed
+        results.append((passed, label, detail))
+
+    check(
+        "eligible identities loaded",
+        n == expected_count,
+        f"{n} loaded (excluded {excluded_count} LOW-quality) — expected {expected_count}",
+    )
+    check(
+        "providers: Abstract + Hunter only",
+        {abstract_name, hunter_name} == {ABSTRACT_PROVIDER_NAME, HUNTER_PROVIDER_NAME},
+        f"live_providers = [{abstract_name}, {hunter_name}]",
+    )
+    check(
+        "Apollo disabled",
+        True,
+        "never imported, never built, absent from live_providers by construction",
+    )
+    check(
+        "dedicated experiment database",
+        dbname != SHARED_DB_NAME,
+        f"{host}:{port}/{dbname}"
+        + (
+            " — REFUSED: this is the shared database docker-compose's api/worker "
+            "containers poll continuously"
+            if dbname == SHARED_DB_NAME
+            else f" — schema migrated ({len(migrations_applied)} migration(s) applied this run)"
+        ),
+    )
+    check(
+        "live autonomy disabled",
+        True,
+        "this script has no outbound action executor — every outcome lands only in "
+        "decision_receipts/human_reviews on the dedicated database, never an autonomous "
+        "production decision",
+    )
+    check(
+        "maximum modeled spend within approved cap",
+        max_total_usd <= MAX_MODELED_SPEND_USD,
+        f"${max_total_usd} (Abstract ${max_abstract_usd} + Hunter ${max_hunter_usd}) "
+        f"<= ${MAX_MODELED_SPEND_USD}",
+    )
+    check(
+        "maximum Hunter credits within approved cap",
+        max_credits <= MAX_HUNTER_CREDITS,
+        f"{max_credits} <= {MAX_HUNTER_CREDITS}",
+    )
+
+    print("PREFLIGHT — validation experiment dry run")
+    print("=" * 72)
+    for passed, label, detail in results:
+        print(f"[{'PASS' if passed else 'FAIL'}] {label}: {detail}")
+    print("=" * 72)
+    print(
+        "PREFLIGHT PASSED — safe to re-run with --confirm-live-spend"
+        if ok
+        else "PREFLIGHT FAILED — do not proceed"
+    )
+    return ok
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
         "--confirm-live-spend",
         action="store_true",
-        help="Required. Acknowledges this makes real Abstract + Hunter calls.",
+        help="Required outside --preflight. Acknowledges this makes real Abstract + Hunter calls.",
     )
-    parser.add_argument("--db-url", default=LOCAL_DB_URL, help="Postgres to run against.")
+    parser.add_argument(
+        "--identities-file",
+        type=Path,
+        default=None,
+        help=(
+            "Phase-1 validation dataset JSON to load identities from "
+            "(e.g. data/evaluation/runs/validation-20-2026-08-30/identities.json). "
+            "LOW-quality rows are excluded automatically. Omit to use the original "
+            "hardcoded five against the shared local database."
+        ),
+    )
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help=(
+            "Validate identity count, providers, database, and the approved cost "
+            "ceiling, then exit — never ingests a lead or calls a provider. Does not "
+            "require --confirm-live-spend."
+        ),
+    )
+    parser.add_argument(
+        "--expected-count",
+        type=int,
+        default=DEFAULT_EXPECTED_COUNT,
+        help=f"--preflight's expected identity count (default {DEFAULT_EXPECTED_COUNT}).",
+    )
+    parser.add_argument(
+        "--db-url",
+        default=None,
+        help=(
+            "Postgres to run against. Defaults to the shared local Compose database "
+            f"({LOCAL_DB_URL}) for the original five identities, or to a dedicated "
+            f"database ({VALIDATION_DB_URL}) when --identities-file is given."
+        ),
+    )
     parser.add_argument(
         "--run-id", default=None, help="Idempotency prefix; a fresh one is generated if omitted."
     )
@@ -180,13 +471,17 @@ def main() -> int:
         "--cache-test-index",
         type=int,
         default=0,
-        help="Index into IDENTITIES to re-ingest as a second lead, proving cache reuse.",
+        help="Index into the identity list to re-ingest as a second lead, proving cache reuse.",
     )
     parser.add_argument(
         "--out",
         type=Path,
-        default=Path("data/evaluation/runs/abstract-hunter-live-1"),
-        help="Directory for the raw JSON artifact (gitignored run data).",
+        default=None,
+        help=(
+            "Directory for the raw JSON artifact (gitignored run data). Defaults next "
+            "to --identities-file, or to data/evaluation/runs/abstract-hunter-live-1 "
+            "for the original five."
+        ),
     )
     args = parser.parse_args()
 
@@ -194,136 +489,188 @@ def main() -> int:
         print("ABSTRACT_COMPANY_API_KEY / HUNTER_API_KEY not both set.", file=sys.stderr)
         return 1
 
-    if not args.confirm_live_spend:
+    if args.identities_file is not None:
+        identities, excluded_count = _load_identities_from_file(args.identities_file)
+    else:
+        identities, excluded_count = IDENTITIES, 0
+
+    db_url: str = args.db_url or (VALIDATION_DB_URL if args.identities_file else LOCAL_DB_URL)
+    out_dir: Path = args.out or (
+        args.identities_file.parent
+        if args.identities_file
+        else Path("data/evaluation/runs/abstract-hunter-live-1")
+    )
+
+    if args.identities_file is not None and _db_identity(db_url)[2] == SHARED_DB_NAME:
         print(
-            "Refusing to run without --confirm-live-spend: this makes real Abstract + Hunter "
-            "calls against the five identities in IDENTITIES.",
+            f"Refusing to run this {len(identities)}-identity validation experiment against "
+            f"the shared '{SHARED_DB_NAME}' database — docker-compose's always-on api/worker "
+            "containers poll it continuously and would race this run. Pass --db-url for a "
+            f"dedicated database (default: {VALIDATION_DB_URL}).",
             file=sys.stderr,
         )
         return 1
 
-    run_id = args.run_id or f"live-ah-{uuid.uuid4().hex[:10]}"
-    print(f"run_id={run_id}  db={args.db_url}")
+    if not args.preflight and not args.confirm_live_spend:
+        print(
+            "Refusing to run without --confirm-live-spend: this makes real Abstract + Hunter "
+            f"calls against {len(identities)} identities.",
+            file=sys.stderr,
+        )
+        return 1
 
-    state = build_state(args.db_url)
-    abstract = RecordingProvider(AbstractCompanyEnrichmentProvider.build())
-    hunter = RecordingProvider(HunterEnrichmentProvider.build())
-
-    # evaluation_parallel: no early stop, both providers attempted on every
-    # lead (see module docstring) — Apollo is simply absent from this list,
-    # never built, never referenced.
-    handlers = build_handlers(
-        state.pool,
-        provider_mode="live",
-        live_providers=[abstract, hunter],
-        live_strategy="evaluation_parallel",
+    created = _ensure_database(db_url)
+    if created:
+        print(f"created database: {_db_identity(db_url)[2]!r}")
+    migrations_applied = _apply_migrations(db_url)
+    print(
+        f"migrations applied: {len(migrations_applied)} ({', '.join(migrations_applied)})"
+        if migrations_applied
+        else "migrations: schema already up to date"
     )
 
+    run_id = args.run_id or f"live-ah-{uuid.uuid4().hex[:10]}"
+    print(f"run_id={run_id}  db={db_url}  identities={len(identities)}")
+
+    abstract = RecordingProvider(AbstractCompanyEnrichmentProvider.build())
+    hunter = RecordingProvider(HunterEnrichmentProvider.build())
     try:
-        lead_ids: list[UUID] = []
-        for index, identity in enumerate(IDENTITIES):
+        if args.preflight:
+            passed = _run_preflight(
+                identities=identities,
+                excluded_count=excluded_count,
+                expected_count=args.expected_count,
+                db_url=db_url,
+                abstract_name=abstract.name,
+                hunter_name=hunter.name,
+                migrations_applied=migrations_applied,
+            )
+            return 0 if passed else 1
+
+        state = build_state(db_url)
+        try:
+            # evaluation_parallel: no early stop, both providers attempted on every
+            # lead (see module docstring) — Apollo is simply absent from this list,
+            # never built, never referenced.
+            handlers = build_handlers(
+                state.pool,
+                provider_mode="live",
+                live_providers=[abstract, hunter],
+                live_strategy="evaluation_parallel",
+            )
+
+            lead_ids: list[UUID] = []
+            for index, identity in enumerate(identities):
+                with state.pool.connection() as conn:
+                    command = LeadIngestCommand(
+                        source="live-experiment-abstract-hunter",
+                        email=identity["email"],
+                        external_ref=f"{run_id}:{index}",
+                        company_domain=identity["domain"],
+                        company_name=identity["company_name"],
+                        is_shadow=False,
+                    )
+                    result = ingest_lead(
+                        conn, resolver=state.resolver, queue=state.queue, command=command
+                    )
+                    conn.commit()
+                lead_ids.append(result.lead_id)
+                print(f"ingested [{index}] {identity['email']} -> lead_id={result.lead_id}")
+
+            processed = 0
+            for _ in range(len(identities) * 2):
+                cycle = run_worker_cycle(
+                    state.queue, state.pool, handlers, batch_size=1, job_types=["compute_score"]
+                )
+                if not cycle:
+                    break
+                for outcome in cycle:
+                    print(
+                        f"processed job {outcome.job_id} type={outcome.job_type} -> {outcome.outcome}"
+                    )
+                processed += len(cycle)
+            print(f"jobs processed: {processed}")
+
+            cache_lead_id: UUID | None = None
+            cache_identity = identities[args.cache_test_index]
+            abstract_calls_before = abstract.call_count(cache_identity["domain"])
+            hunter_calls_before = hunter.call_count(cache_identity["email"])
             with state.pool.connection() as conn:
                 command = LeadIngestCommand(
                     source="live-experiment-abstract-hunter",
-                    email=identity["email"],
-                    external_ref=f"{run_id}:{index}",
-                    company_domain=identity["domain"],
-                    company_name=identity["company_name"],
+                    email=cache_identity["email"],
+                    external_ref=f"{run_id}:cache-test",
+                    company_domain=cache_identity["domain"],
+                    company_name=cache_identity["company_name"],
                     is_shadow=False,
                 )
-                result = ingest_lead(
+                cache_result = ingest_lead(
                     conn, resolver=state.resolver, queue=state.queue, command=command
                 )
                 conn.commit()
-            lead_ids.append(result.lead_id)
-            print(f"ingested [{index}] {identity['email']} -> lead_id={result.lead_id}")
-
-        processed = 0
-        for _ in range(len(IDENTITIES) * 2):
-            cycle = run_worker_cycle(
-                state.queue, state.pool, handlers, batch_size=1, job_types=["compute_score"]
-            )
-            if not cycle:
-                break
-            for outcome in cycle:
-                print(
-                    f"processed job {outcome.job_id} type={outcome.job_type} -> {outcome.outcome}"
+            cache_lead_id = cache_result.lead_id
+            print(f"cache-test ingested {cache_identity['email']} -> lead_id={cache_lead_id}")
+            for _ in range(3):
+                cycle = run_worker_cycle(
+                    state.queue, state.pool, handlers, batch_size=1, job_types=["compute_score"]
                 )
-            processed += len(cycle)
-        print(f"jobs processed: {processed}")
+                if not cycle:
+                    break
 
-        cache_lead_id: UUID | None = None
-        cache_identity = IDENTITIES[args.cache_test_index]
-        abstract_calls_before = abstract.call_count(cache_identity["domain"])
-        hunter_calls_before = hunter.call_count(cache_identity["email"])
-        with state.pool.connection() as conn:
-            command = LeadIngestCommand(
-                source="live-experiment-abstract-hunter",
-                email=cache_identity["email"],
-                external_ref=f"{run_id}:cache-test",
-                company_domain=cache_identity["domain"],
-                company_name=cache_identity["company_name"],
-                is_shadow=False,
-            )
-            cache_result = ingest_lead(
-                conn, resolver=state.resolver, queue=state.queue, command=command
-            )
-            conn.commit()
-        cache_lead_id = cache_result.lead_id
-        print(f"cache-test ingested {cache_identity['email']} -> lead_id={cache_lead_id}")
-        for _ in range(3):
-            cycle = run_worker_cycle(
-                state.queue, state.pool, handlers, batch_size=1, job_types=["compute_score"]
-            )
-            if not cycle:
-                break
-
-        report: dict[str, Any] = {"run_id": run_id, "leads": []}
-        with state.pool.connection() as conn:
-            for identity, lead_id in zip(IDENTITIES, lead_ids, strict=True):
-                receipt = build_receipt(conn, state.ledger, lead_id)
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT evidence_snapshot FROM decision_receipts WHERE lead_id = %(lead_id)s",
-                        {"lead_id": lead_id},
-                    )
-                    row = cur.fetchone()
-                    evidence_snapshot = row[0] if row else None
-                report["leads"].append(
-                    {
-                        "identity": identity,
-                        "lead_id": str(lead_id),
-                        "receipt": _receipt_to_dict(receipt),
-                        "evidence_snapshot": evidence_snapshot,
-                        "abstract_raw_call": _result_to_dict(
-                            _first_call(abstract, identity["domain"])
-                        ),
-                        "hunter_raw_call": _result_to_dict(_first_call(hunter, identity["email"])),
-                    }
-                )
-
-            cache_receipt = (
-                build_receipt(conn, state.ledger, cache_lead_id) if cache_lead_id else None
-            )
-            report["cache_test"] = {
-                "identity": cache_identity,
-                "lead_id": str(cache_lead_id) if cache_lead_id else None,
-                "receipt": _receipt_to_dict(cache_receipt),
-                "abstract_calls_before": abstract_calls_before,
-                "abstract_calls_after": abstract.call_count(cache_identity["domain"]),
-                "hunter_calls_before": hunter_calls_before,
-                "hunter_calls_after": hunter.call_count(cache_identity["email"]),
+            report: dict[str, Any] = {
+                "run_id": run_id,
+                "identities_file": str(args.identities_file) if args.identities_file else None,
+                "excluded_low_quality_count": excluded_count,
+                "leads": [],
             }
+            with state.pool.connection() as conn:
+                for identity, lead_id in zip(identities, lead_ids, strict=True):
+                    receipt = build_receipt(conn, state.ledger, lead_id)
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT evidence_snapshot FROM decision_receipts WHERE lead_id = %(lead_id)s",
+                            {"lead_id": lead_id},
+                        )
+                        row = cur.fetchone()
+                        evidence_snapshot = row[0] if row else None
+                    report["leads"].append(
+                        {
+                            "identity": identity,
+                            "lead_id": str(lead_id),
+                            "receipt": _receipt_to_dict(receipt),
+                            "evidence_snapshot": evidence_snapshot,
+                            "abstract_raw_call": _result_to_dict(
+                                _first_call(abstract, identity["domain"])
+                            ),
+                            "hunter_raw_call": _result_to_dict(
+                                _first_call(hunter, identity["email"])
+                            ),
+                        }
+                    )
 
-        args.out.mkdir(parents=True, exist_ok=True)
-        out_path = args.out / f"{run_id}.json"
-        out_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-        print(f"\nartifact written: {out_path}")
-        return 0
+                cache_receipt = (
+                    build_receipt(conn, state.ledger, cache_lead_id) if cache_lead_id else None
+                )
+                report["cache_test"] = {
+                    "identity": cache_identity,
+                    "lead_id": str(cache_lead_id) if cache_lead_id else None,
+                    "receipt": _receipt_to_dict(cache_receipt),
+                    "abstract_calls_before": abstract_calls_before,
+                    "abstract_calls_after": abstract.call_count(cache_identity["domain"]),
+                    "hunter_calls_before": hunter_calls_before,
+                    "hunter_calls_after": hunter.call_count(cache_identity["email"]),
+                }
+
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"{run_id}.json"
+            out_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+            print(f"\nartifact written: {out_path}")
+            return 0
+        finally:
+            state.pool.close()
     finally:
         abstract.close()
         hunter.close()
-        state.pool.close()
 
 
 if __name__ == "__main__":
