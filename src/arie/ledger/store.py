@@ -52,13 +52,13 @@ _TRACER = get_tracer("arie.ledger")
 # against the charge it already made.
 _RECORD_PROVIDER_CALL = """
     INSERT INTO provider_calls (
-        lead_id, provider, entity_type, entity_id, idempotency_key,
+        organization_id, lead_id, provider, entity_type, entity_id, idempotency_key,
         completed_at, latency_ms, cost_usd, status, cache_hit, raw_response_ref,
         error_kind, credits_used, cost_basis, suppressed_reason
     ) VALUES (
-        %(lead_id)s, %(provider)s, %(entity_type)s, %(entity_id)s, %(idempotency_key)s,
-        %(completed_at)s, %(latency_ms)s, %(cost_usd)s, %(status)s, %(cache_hit)s,
-        %(raw_response_ref)s, %(error_kind)s, %(credits_used)s, %(cost_basis)s,
+        %(organization_id)s, %(lead_id)s, %(provider)s, %(entity_type)s, %(entity_id)s,
+        %(idempotency_key)s, %(completed_at)s, %(latency_ms)s, %(cost_usd)s, %(status)s,
+        %(cache_hit)s, %(raw_response_ref)s, %(error_kind)s, %(credits_used)s, %(cost_basis)s,
         %(suppressed_reason)s
     )
     ON CONFLICT (idempotency_key) DO UPDATE
@@ -68,10 +68,10 @@ _RECORD_PROVIDER_CALL = """
 
 _RECORD_MODEL_CALL = """
     INSERT INTO model_calls (
-        lead_id, model, tier, purpose, escalated_from,
+        organization_id, lead_id, model, tier, purpose, escalated_from,
         prompt_tokens, completion_tokens, cost_usd, latency_ms, idempotency_key
     ) VALUES (
-        %(lead_id)s, %(model)s, %(tier)s, %(purpose)s, %(escalated_from)s,
+        %(organization_id)s, %(lead_id)s, %(model)s, %(tier)s, %(purpose)s, %(escalated_from)s,
         %(prompt_tokens)s, %(completion_tokens)s, %(cost_usd)s, %(latency_ms)s,
         %(idempotency_key)s
     )
@@ -86,10 +86,10 @@ _RECORD_MODEL_CALL = """
 # code that reads as if it did something.
 _RECORD_MODEL_CALL_UNKEYED = """
     INSERT INTO model_calls (
-        lead_id, model, tier, purpose, escalated_from,
+        organization_id, lead_id, model, tier, purpose, escalated_from,
         prompt_tokens, completion_tokens, cost_usd, latency_ms
     ) VALUES (
-        %(lead_id)s, %(model)s, %(tier)s, %(purpose)s, %(escalated_from)s,
+        %(organization_id)s, %(lead_id)s, %(model)s, %(tier)s, %(purpose)s, %(escalated_from)s,
         %(prompt_tokens)s, %(completion_tokens)s, %(cost_usd)s, %(latency_ms)s
     )
     RETURNING call_id, cost_usd
@@ -162,6 +162,7 @@ class PostgresCostLedger:
         status: ProviderStatus,
         cost_usd: float | Decimal,
         latency_ms: float,
+        organization_id: UUID,
         lead_id: UUID | None = None,
         cache_hit: bool = False,
         raw_response_ref: str | None = None,
@@ -206,6 +207,7 @@ class PostgresCostLedger:
             attributes={
                 "arie.provider": provider,
                 "arie.lead_id": lead_id,
+                "arie.organization_id": str(organization_id),
                 "arie.cache_hit": cache_hit,
                 "arie.provider_status": str(status),
             },
@@ -214,6 +216,7 @@ class PostgresCostLedger:
                 cur.execute(
                     _RECORD_PROVIDER_CALL,
                     {
+                        "organization_id": organization_id,
                         "lead_id": lead_id,
                         "provider": provider,
                         "entity_type": entity_type,
@@ -251,6 +254,7 @@ class PostgresCostLedger:
         purpose: str,
         prompt_tokens: int,
         completion_tokens: int,
+        organization_id: UUID,
         lead_id: UUID | None = None,
         latency_ms: float | None = None,
         escalated_from: str | None = None,
@@ -281,6 +285,7 @@ class PostgresCostLedger:
         )
 
         params = {
+            "organization_id": organization_id,
             "lead_id": lead_id,
             "model": model,
             "tier": tier,
@@ -299,6 +304,7 @@ class PostgresCostLedger:
                 "arie.model": model,
                 "arie.model_tier": tier,
                 "arie.lead_id": lead_id,
+                "arie.organization_id": str(organization_id),
                 "arie.purpose": purpose,
             },
         ) as span:

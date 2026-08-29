@@ -32,6 +32,7 @@ from arie.jobs.handlers import SimulatedEnrichmentRuntime, build_handlers, build
 from arie.jobs.queue import PostgresJobQueue
 from arie.jobs.worker import JobHandler, run_worker_cycle
 from arie.providers.catalog import ALL_PROVIDERS
+from arie.tenancy import LEGACY_ORGANIZATION_ID as ORG
 
 pytestmark = pytest.mark.integration
 
@@ -190,8 +191,9 @@ def test_a_dead_lettered_lead_reports_processing_failed_not_pending(
     identical as "no decision_receipts row" otherwise."""
     with db_conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO leads (source, status) VALUES (%s, %s) RETURNING lead_id",
-            ("receipt-it", str(LeadStatus.DEAD_LETTER)),
+            "INSERT INTO leads (source, status, organization_id) VALUES (%s, %s, %s) "
+            "RETURNING lead_id",
+            ("receipt-it", str(LeadStatus.DEAD_LETTER), ORG),
         )
         row = cur.fetchone()
     assert row is not None

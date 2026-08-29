@@ -61,9 +61,9 @@ _INSERT_COMPANY_BY_NAME = """
 """
 
 _UPSERT_PERSON = """
-    INSERT INTO persons (canonical_email, full_name, title, company_id)
-    VALUES (%(email)s, %(full_name)s, %(title)s, %(company_id)s)
-    ON CONFLICT (canonical_email) DO UPDATE SET updated_at = now()
+    INSERT INTO persons (canonical_email, full_name, title, company_id, organization_id)
+    VALUES (%(email)s, %(full_name)s, %(title)s, %(company_id)s, %(organization_id)s)
+    ON CONFLICT (organization_id, canonical_email) DO UPDATE SET updated_at = now()
     RETURNING person_id, canonical_email, company_id, (xmax = 0) AS created
 """
 
@@ -175,11 +175,21 @@ class IdentityResolver:
         conn: psycopg.Connection,
         *,
         email: str,
+        organization_id: UUID,
         full_name: str | None = None,
         title: str | None = None,
         company_id: UUID | None = None,
     ) -> ResolvedPerson:
-        """Resolve a person on a caller-provided connection. Does not commit."""
+        """Resolve a person on a caller-provided connection. Does not commit.
+
+        `organization_id` is required, unlike `company_id` — Productization M1
+        made `persons` tenant-owned (`companies` stays the shared, global
+        identity layer; see `migrations/0012_organizations_and_members.sql`),
+        so two organizations independently ingesting the same email must
+        resolve to two distinct rows rather than colliding on the old global
+        `canonical_email` unique constraint and silently overwriting each
+        other's name/title on `ON CONFLICT`.
+        """
         normalized_email = normalize_email(email)
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -189,6 +199,7 @@ class IdentityResolver:
                     "full_name": full_name,
                     "title": title,
                     "company_id": company_id,
+                    "organization_id": organization_id,
                 },
             )
             row = cur.fetchone()
@@ -205,17 +216,24 @@ class IdentityResolver:
         conn: psycopg.Connection,
         *,
         person_email: str,
+        organization_id: UUID,
         company_domain: str | None = None,
         company_name: str | None = None,
         person_full_name: str | None = None,
         person_title: str | None = None,
     ) -> tuple[ResolvedCompany, ResolvedPerson]:
-        """Resolve company and contact on a caller-provided connection. Does not commit."""
+        """Resolve company and contact on a caller-provided connection. Does not commit.
+
+        `company_id` is shared, global identity (see `resolve_company_in`);
+        `organization_id` scopes only the person row — see
+        `resolve_person_in`'s docstring for why.
+        """
         domain = company_domain or domain_from_email(person_email)
         company = self.resolve_company_in(conn, domain=domain, name=company_name)
         person = self.resolve_person_in(
             conn,
             email=person_email,
+            organization_id=organization_id,
             full_name=person_full_name,
             title=person_title,
             company_id=company.company_id,
@@ -242,6 +260,7 @@ class IdentityResolver:
         self,
         *,
         email: str,
+        organization_id: UUID,
         full_name: str | None = None,
         title: str | None = None,
         company_id: UUID | None = None,
@@ -254,7 +273,12 @@ class IdentityResolver:
         """
         with self._pool.connection() as conn:
             resolved = self.resolve_person_in(
-                conn, email=email, full_name=full_name, title=title, company_id=company_id
+                conn,
+                email=email,
+                organization_id=organization_id,
+                full_name=full_name,
+                title=title,
+                company_id=company_id,
             )
             conn.commit()
         return resolved
@@ -263,6 +287,7 @@ class IdentityResolver:
         self,
         *,
         person_email: str,
+        organization_id: UUID,
         company_domain: str | None = None,
         company_name: str | None = None,
         person_full_name: str | None = None,
@@ -279,6 +304,7 @@ class IdentityResolver:
             resolved = self.resolve_lead_in(
                 conn,
                 person_email=person_email,
+                organization_id=organization_id,
                 company_domain=company_domain,
                 company_name=company_name,
                 person_full_name=person_full_name,

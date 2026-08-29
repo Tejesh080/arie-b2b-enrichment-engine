@@ -34,6 +34,7 @@ from arie.jobs.worker import JobContext, JobHandler
 from arie.live.outcome_cache import ProviderOutcomeGuard
 from arie.providers.hunter_contract import HUNTER_PROVIDER_NAME as HUNTER
 from arie.providers.live_hunter import HunterEnrichmentProvider
+from arie.tenancy import LEGACY_ORGANIZATION_ID as ORG
 
 pytestmark = pytest.mark.integration
 
@@ -629,13 +630,16 @@ def test_outcome_guard_ttl_expiry_makes_the_provider_askable_again(
         status=ProviderStatus.MISS,
         cost_usd=0.0,
         latency_ms=10.0,
+        organization_id=ORG,
     )
     assert write.recorded
 
     guard_within_ttl = ProviderOutcomeGuard(
         live_pool, LiveOutcomeCacheConfig(miss_ttl_seconds=3600.0)
     )
-    assert guard_within_ttl.recent_miss(HUNTER, "person", entity_id) is not None
+    assert (
+        guard_within_ttl.recent_miss(HUNTER, "person", entity_id, organization_id=ORG) is not None
+    )
 
     guard_expired = ProviderOutcomeGuard(live_pool, LiveOutcomeCacheConfig(miss_ttl_seconds=0.0))
-    assert guard_expired.recent_miss(HUNTER, "person", entity_id) is None
+    assert guard_expired.recent_miss(HUNTER, "person", entity_id, organization_id=ORG) is None

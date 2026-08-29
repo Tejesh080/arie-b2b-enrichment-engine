@@ -38,7 +38,8 @@ _SELECT_FRESH = """
     SELECT entity_type, entity_id, field_name, value, signal_description,
            source, confidence, effect_on_score, ttl_seconds, fetched_at
     FROM evidence
-    WHERE entity_type = %(entity_type)s AND entity_id = %(entity_id)s
+    WHERE organization_id = %(organization_id)s
+      AND entity_type = %(entity_type)s AND entity_id = %(entity_id)s
       AND field_name = %(field_name)s AND expires_at > %(now)s
     ORDER BY fetched_at DESC
     LIMIT 1
@@ -66,17 +67,18 @@ _SELECT_ALL_FRESH = """
            entity_type, entity_id, field_name, value, signal_description,
            source, confidence, effect_on_score, ttl_seconds, fetched_at
     FROM evidence
-    WHERE entity_type = %(entity_type)s AND entity_id = %(entity_id)s
+    WHERE organization_id = %(organization_id)s
+      AND entity_type = %(entity_type)s AND entity_id = %(entity_id)s
       AND expires_at > %(now)s
     ORDER BY field_name, source, fetched_at DESC
 """
 
 _INSERT = """
     INSERT INTO evidence (
-        entity_type, entity_id, field_name, value, signal_description,
+        organization_id, entity_type, entity_id, field_name, value, signal_description,
         source, confidence, effect_on_score, ttl_seconds, fetched_at
     ) VALUES (
-        %(entity_type)s, %(entity_id)s, %(field_name)s, %(value)s,
+        %(organization_id)s, %(entity_type)s, %(entity_id)s, %(field_name)s, %(value)s,
         %(signal_description)s, %(source)s, %(confidence)s,
         %(effect_on_score)s, %(ttl_seconds)s, %(fetched_at)s
     )
@@ -106,8 +108,9 @@ def _evidence_from_row(row: dict[str, Any]) -> Evidence:
     )
 
 
-def _row_for_insert(evidence: Evidence) -> dict[str, Any]:
+def _row_for_insert(evidence: Evidence, organization_id: UUID) -> dict[str, Any]:
     return {
+        "organization_id": organization_id,
         "entity_type": evidence.entity_type,
         "entity_id": evidence.entity_id,
         "field_name": evidence.field_name,
@@ -158,14 +161,23 @@ class PostgresEvidenceStore:
         entity_id: UUID,
         field_name: str,
         *,
+        organization_id: UUID,
         now: datetime | None = None,
     ) -> Evidence | None:
-        """The single-field cache lookup: freshest non-expired row, or ``None``."""
+        """The single-field cache lookup: freshest non-expired row, or ``None``.
+
+        `organization_id` is required — Productization M1 made `evidence`
+        tenant-owned even for `company`-entity rows (see
+        `migrations/0012_organizations_and_members.sql`'s tenancy-boundary
+        note), so a lookup with no organization scope would silently read
+        across tenants for a shared `company_id`.
+        """
         now = now or datetime.now(UTC)
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 _SELECT_FRESH,
                 {
+                    "organization_id": organization_id,
                     "entity_type": entity_type,
                     "entity_id": entity_id,
                     "field_name": field_name,
@@ -176,29 +188,51 @@ class PostgresEvidenceStore:
             return _evidence_from_row(row) if row is not None else None
 
     def get_all_fresh(
-        self, entity_type: EntityType, entity_id: UUID, *, now: datetime | None = None
+        self,
+        entity_type: EntityType,
+        entity_id: UUID,
+        *,
+        organization_id: UUID,
+        now: datetime | None = None,
     ) -> tuple[Evidence, ...]:
         """Every still-fresh fact known about one entity, across all sources and fields.
 
         This is the shape a policy actually wants before deciding what to buy:
         the full known-facts bundle for one company or person, ready to feed
         into ``arie.scoring.merge.candidates_from_evidence``.
+
+        `organization_id` scopes the read even when `entity_type == "company"`
+        — see `get_fresh`'s docstring.
         """
         now = now or datetime.now(UTC)
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                _SELECT_ALL_FRESH, {"entity_type": entity_type, "entity_id": entity_id, "now": now}
+                _SELECT_ALL_FRESH,
+                {
+                    "organization_id": organization_id,
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "now": now,
+                },
             )
             return tuple(_evidence_from_row(row) for row in cur.fetchall())
 
-    def put(self, evidence: Evidence) -> None:
-        self.put_many((evidence,))
+    def put(self, evidence: Evidence, *, organization_id: UUID) -> None:
+        self.put_many((evidence,), organization_id=organization_id)
 
-    def put_many(self, items: Iterable[Evidence]) -> None:
+    def put_many(self, items: Iterable[Evidence], *, organization_id: UUID) -> None:
         """Persist a batch of facts, e.g. every field one provider call returned.
 
         A single ``executemany`` in one transaction: a provider call either
         lands as evidence in full or not at all, never partially cached.
+
+        `organization_id` is required and applies to every row in the batch —
+        callers never mix entities from two organizations in one call. It is
+        a plain parameter, not a field on `Evidence` itself: `Evidence`
+        (``arie.core.types``) is shared with the DB-free M0 benchmark and
+        ``arie.scoring``/``arie.policy``, none of which has any notion of a
+        tenant, so tenancy stays a persistence-layer concern rather than
+        leaking into the frozen domain type.
 
         Deliberately a plain append, not an upsert: there is no uniqueness
         constraint on ``(entity_type, entity_id, field_name, source)``, so a
@@ -213,7 +247,7 @@ class PostgresEvidenceStore:
         ``DISTINCT ON`` is where "current" gets decided instead, at read
         time, once, rather than every caller needing to remember to dedup.
         """
-        rows = [_row_for_insert(item) for item in items]
+        rows = [_row_for_insert(item, organization_id) for item in items]
         if not rows:
             return
         with self._pool.connection() as conn, conn.cursor() as cur:

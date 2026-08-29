@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -323,7 +324,12 @@ def test_record_extraction_cost_only_bills_request_succeeded_attempts() -> None:
     )
     ledger = _FakeLedger()
 
-    writes = record_extraction_cost(ledger, outcome, idempotency_key_base="lead:abc:extract")  # type: ignore[arg-type]
+    writes = record_extraction_cost(
+        ledger,  # type: ignore[arg-type]
+        outcome,
+        organization_id=uuid4(),
+        idempotency_key_base="lead:abc:extract",
+    )
 
     assert len(writes) == 1, "the network-failed attempt must not be billed"
     (call,) = ledger.calls

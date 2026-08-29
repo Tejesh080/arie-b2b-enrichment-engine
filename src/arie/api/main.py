@@ -54,6 +54,7 @@ from arie.approval.workflow import (
     get_review,
     submit_decision,
 )
+from arie.auth import AuthContext, AuthenticationError, NotAMemberError, resolve_auth_context
 from arie.config import DATABASE, OBSERVABILITY
 from arie.identity.resolver import IdentityResolver
 from arie.jobs.queue import PostgresJobQueue
@@ -205,6 +206,53 @@ def instrument(app: FastAPI) -> None:
 StateDep = Annotated[AppState, Depends(get_state)]
 
 
+def get_auth_context(request: Request, state: StateDep) -> AuthContext:
+    """Productization M1's auth boundary: a Supabase bearer token plus an
+    `X-Organization-Id` header, resolved to an `AuthContext`.
+
+    Every customer-facing endpoint below depends on this, which is what makes
+    "forgetting the organization_id filter" impossible to do *silently* — a
+    handler with no `AuthDep` parameter simply has no organization_id to scope
+    with in the first place. `/healthz` is the one deliberate exception: an
+    infra liveness probe has no caller identity to check.
+    """
+    authorization = request.headers.get("authorization", "")
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing or malformed Authorization header — expected 'Bearer <token>'",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = authorization[len("Bearer ") :].strip()
+
+    org_header = request.headers.get("x-organization-id")
+    if not org_header:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="missing X-Organization-Id header"
+        )
+    try:
+        organization_id = UUID(org_header)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-Organization-Id is not a valid UUID",
+        ) from exc
+
+    try:
+        return resolve_auth_context(state.pool, token=token, organization_id=organization_id)
+    except AuthenticationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+    except NotAMemberError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+
+AuthDep = Annotated[AuthContext, Depends(get_auth_context)]
+
+
 def register_routes(app: FastAPI) -> None:
     @app.get("/healthz", response_model=HealthResponse)
     def healthz(state: StateDep) -> Response:
@@ -263,10 +311,14 @@ def register_routes(app: FastAPI) -> None:
         payload: IngestLeadRequest,
         response: Response,
         state: StateDep,
+        auth: AuthDep,
     ) -> IngestLeadResponse:
         with _transaction(state.pool) as conn:
             result = ingest_lead(
-                conn, resolver=state.resolver, queue=state.queue, command=payload.to_command()
+                conn,
+                resolver=state.resolver,
+                queue=state.queue,
+                command=payload.to_command(organization_id=auth.organization_id),
             )
             conn.commit()
 
@@ -291,9 +343,9 @@ def register_routes(app: FastAPI) -> None:
         )
 
     @app.get("/leads/{lead_id}", response_model=LeadResponse)
-    def get_lead(lead_id: UUID, state: StateDep) -> LeadResponse:
+    def get_lead(lead_id: UUID, state: StateDep, auth: AuthDep) -> LeadResponse:
         with state.pool.connection() as conn:
-            record = fetch_lead(conn, lead_id)
+            record = fetch_lead(conn, lead_id, organization_id=auth.organization_id)
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no lead {lead_id}")
 
@@ -323,7 +375,7 @@ def register_routes(app: FastAPI) -> None:
         )
 
     @app.get("/leads/{lead_id}/receipt", response_model=ReceiptResponse)
-    def get_lead_receipt(lead_id: UUID, state: StateDep) -> ReceiptResponse:
+    def get_lead_receipt(lead_id: UUID, state: StateDep, auth: AuthDep) -> ReceiptResponse:
         """The Decision Receipt — why ARIE stopped spending and what it decided.
 
         Never 404s for a lead that exists but hasn't reached a decision yet;
@@ -332,15 +384,17 @@ def register_routes(app: FastAPI) -> None:
         ``arie.api.receipt.DecisionReceipt``.
         """
         with state.pool.connection() as conn:
-            receipt = build_receipt(conn, state.ledger, lead_id)
+            receipt = build_receipt(
+                conn, state.ledger, lead_id, organization_id=auth.organization_id
+            )
         if receipt is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no lead {lead_id}")
         return ReceiptResponse.from_receipt(receipt)
 
     @app.get("/reviews/{review_id}", response_model=ReviewResponse)
-    def get_review_endpoint(review_id: UUID, state: StateDep) -> ReviewResponse:
+    def get_review_endpoint(review_id: UUID, state: StateDep, auth: AuthDep) -> ReviewResponse:
         with state.pool.connection() as conn:
-            record = get_review(conn, review_id)
+            record = get_review(conn, review_id, organization_id=auth.organization_id)
         if record is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"no review {review_id}"
@@ -365,6 +419,7 @@ def register_routes(app: FastAPI) -> None:
         review_id: UUID,
         payload: ReviewDecisionRequest,
         state: StateDep,
+        auth: AuthDep,
     ) -> ReviewDecisionResponse:
         # Every failure mode below rolls back the whole transaction, including
         # the review's own compare-and-swap update if it got that far — see
@@ -376,6 +431,7 @@ def register_routes(app: FastAPI) -> None:
                 result = submit_decision(
                     conn,
                     review_id=review_id,
+                    organization_id=auth.organization_id,
                     action=payload.action,
                     reviewer=payload.reviewer,
                     notes=payload.notes,

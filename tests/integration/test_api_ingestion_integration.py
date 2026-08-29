@@ -20,7 +20,7 @@ from typing import Any
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
-from tests.integration.conftest import IngestCleanup, source_for
+from tests.integration.conftest import IngestCleanup, authorize_app, source_for
 
 from arie.api.main import AppState, create_app
 from arie.config import POLICY
@@ -470,8 +470,10 @@ def test_failure_during_ingestion_rolls_back_everything_including_identity(
     domain, email = _identity(cleanup_ingest)
     external_ref = f"crm-{uuid.uuid4().hex[:10]}"
     broken = replace(app_state, queue=_ExplodingQueue(app_state.pool))
+    broken_app = create_app(state=broken)
+    authorize_app(broken_app)
 
-    with TestClient(create_app(state=broken), raise_server_exceptions=False) as client:
+    with TestClient(broken_app, raise_server_exceptions=False) as client:
         response = client.post("/leads", json=_payload(email, domain, external_ref=external_ref))
 
     assert response.status_code == 500
@@ -504,8 +506,10 @@ def test_a_rolled_back_request_can_simply_be_retried(
     external_ref = f"crm-{uuid.uuid4().hex[:10]}"
     payload = _payload(email, domain, external_ref=external_ref)
     broken = replace(app_state, queue=_ExplodingQueue(app_state.pool))
+    broken_app = create_app(state=broken)
+    authorize_app(broken_app)
 
-    with TestClient(create_app(state=broken), raise_server_exceptions=False) as client:
+    with TestClient(broken_app, raise_server_exceptions=False) as client:
         assert client.post("/leads", json=payload).status_code == 500
 
     retry = api_client.post("/leads", json=payload)

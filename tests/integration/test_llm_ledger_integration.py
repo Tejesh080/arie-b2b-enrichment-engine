@@ -20,6 +20,7 @@ from tests.integration.conftest import IngestCleanup
 
 from arie.ledger.store import PostgresCostLedger
 from arie.llm.deepseek import PURPOSE, ExtractionAttempt, ExtractionOutcome, record_extraction_cost
+from arie.tenancy import LEGACY_ORGANIZATION_ID as ORG
 
 pytestmark = pytest.mark.integration
 
@@ -57,7 +58,9 @@ def test_a_successful_single_attempt_lands_as_one_priced_row(
     cleanup_ingest.model_call_keys.append(f"{key_base}:attempt0")
 
     outcome = _outcome(_billable(1000, 100))
-    writes = record_extraction_cost(cost_ledger, outcome, idempotency_key_base=key_base)
+    writes = record_extraction_cost(
+        cost_ledger, outcome, organization_id=ORG, idempotency_key_base=key_base
+    )
 
     assert len(writes) == 1
     # 1000 * 0.27/1e6 + 100 * 1.10/1e6, from arie.ledger.pricing.MODEL_PRICES
@@ -81,7 +84,9 @@ def test_a_failed_request_attempt_is_never_billed(
     cleanup_ingest.model_call_keys.append(f"{key_base}:attempt1")
 
     outcome = _outcome(_network_failure(), _billable(500, 50))
-    writes = record_extraction_cost(cost_ledger, outcome, idempotency_key_base=key_base)
+    writes = record_extraction_cost(
+        cost_ledger, outcome, organization_id=ORG, idempotency_key_base=key_base
+    )
 
     assert len(writes) == 1, "only the billable second attempt should reach the ledger"
 
@@ -106,7 +111,9 @@ def test_a_retry_that_still_failed_validation_is_billed_separately_from_the_succ
         _billable(300, 20, error="schema mismatch"),
         _billable(310, 45),
     )
-    writes = record_extraction_cost(cost_ledger, outcome, idempotency_key_base=key_base)
+    writes = record_extraction_cost(
+        cost_ledger, outcome, organization_id=ORG, idempotency_key_base=key_base
+    )
 
     assert len(writes) == 2
     with db_conn.cursor() as cur:
@@ -129,8 +136,12 @@ def test_recording_the_same_outcome_twice_does_not_double_bill(
     cleanup_ingest.model_call_keys.append(f"{key_base}:attempt0")
     outcome = _outcome(_billable(200, 40))
 
-    first = record_extraction_cost(cost_ledger, outcome, idempotency_key_base=key_base)
-    second = record_extraction_cost(cost_ledger, outcome, idempotency_key_base=key_base)
+    first = record_extraction_cost(
+        cost_ledger, outcome, organization_id=ORG, idempotency_key_base=key_base
+    )
+    second = record_extraction_cost(
+        cost_ledger, outcome, organization_id=ORG, idempotency_key_base=key_base
+    )
 
     assert first[0].recorded is True
     assert second[0].recorded is False
@@ -151,7 +162,10 @@ def test_extraction_cost_is_attributable_to_a_lead(
     `GET /leads/{id}` to read from — so a lead's page reflects LLM spend too,
     not only provider spend."""
     with db_conn.cursor() as cur:
-        cur.execute("INSERT INTO leads (source) VALUES ('llm-ledger-test') RETURNING lead_id")
+        cur.execute(
+            "INSERT INTO leads (source, organization_id) VALUES (%s, %s) RETURNING lead_id",
+            ("llm-ledger-test", ORG),
+        )
         row = cur.fetchone()
     assert row is not None
     lead_id = row[0]
@@ -161,7 +175,9 @@ def test_extraction_cost_is_attributable_to_a_lead(
     key_base = f"test-extract-{uuid.uuid4().hex}"
     cleanup_ingest.model_call_keys.append(f"{key_base}:attempt0")
     outcome = _outcome(_billable(1000, 100))
-    record_extraction_cost(cost_ledger, outcome, lead_id=lead_id, idempotency_key_base=key_base)
+    record_extraction_cost(
+        cost_ledger, outcome, organization_id=ORG, lead_id=lead_id, idempotency_key_base=key_base
+    )
 
     cost = cost_ledger.lead_cost(lead_id)
     assert cost is not None

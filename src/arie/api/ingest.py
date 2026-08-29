@@ -58,10 +58,12 @@ _TRACER = get_tracer("arie.api.ingest")
 # already follows. RETURNING it lets the caller report the *actual* persisted
 # value rather than assuming the request's own.
 _INSERT_LEAD = """
-    INSERT INTO leads (person_id, company_id, source, external_ref, budget_usd_cap, is_shadow)
-    VALUES (%(person_id)s, %(company_id)s, %(source)s, %(external_ref)s, %(budget_usd_cap)s,
-            %(is_shadow)s)
-    ON CONFLICT (source, external_ref) WHERE external_ref IS NOT NULL
+    INSERT INTO leads (
+        organization_id, person_id, company_id, source, external_ref, budget_usd_cap, is_shadow
+    )
+    VALUES (%(organization_id)s, %(person_id)s, %(company_id)s, %(source)s, %(external_ref)s,
+            %(budget_usd_cap)s, %(is_shadow)s)
+    ON CONFLICT (organization_id, source, external_ref) WHERE external_ref IS NOT NULL
         DO UPDATE SET updated_at = now()
     RETURNING lead_id, status, version, is_shadow, (xmax = 0) AS created
 """
@@ -78,6 +80,9 @@ class LeadIngestCommand:
 
     source: str
     email: str
+    organization_id: UUID
+    """The caller's organization, resolved from `AuthContext` — never taken
+    from the request body. See `arie.api.schemas.IngestLeadRequest.to_command`."""
     external_ref: str | None = None
     company_domain: str | None = None
     company_name: str | None = None
@@ -132,6 +137,7 @@ def ingest_lead(
             company, person = resolver.resolve_lead_in(
                 conn,
                 person_email=command.email,
+                organization_id=command.organization_id,
                 company_domain=command.company_domain,
                 company_name=command.company_name,
                 person_full_name=command.full_name,
@@ -158,6 +164,7 @@ def ingest_lead(
             cur.execute(
                 _INSERT_LEAD,
                 {
+                    "organization_id": command.organization_id,
                     "person_id": person.person_id,
                     "company_id": company.company_id,
                     "source": command.source,

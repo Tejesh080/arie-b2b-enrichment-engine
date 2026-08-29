@@ -5,6 +5,12 @@ conftest.py). Mirrors the semantics tests/unit/test_evidence_decay.py already
 pins for `Evidence.effective_confidence` — this file is about the *storage*
 layer keeping those semantics intact through a round trip, not re-testing decay
 arithmetic itself.
+
+Every call below passes `organization_id=ORG` — a single fixed constant is
+enough here because each test uses its own fresh `entity_id`, so there is
+nothing cross-tenant to exercise; the dedicated isolation suite
+(`tests/integration/test_tenancy_isolation_integration.py`) is where two
+distinct organizations actually matter.
 """
 
 from __future__ import annotations
@@ -16,6 +22,7 @@ import pytest
 
 from arie.core.types import Evidence
 from arie.evidence.store import PostgresEvidenceStore
+from arie.tenancy import LEGACY_ORGANIZATION_ID as ORG
 
 pytestmark = pytest.mark.integration
 
@@ -43,9 +50,9 @@ def test_fresh_evidence_round_trips(
     entity_id = uuid4()
     cleanup_evidence.append(entity_id)
 
-    evidence_store.put(_evidence(entity_id))
+    evidence_store.put(_evidence(entity_id), organization_id=ORG)
     result = evidence_store.get_fresh(
-        "company", entity_id, "employee_count", now=NOW + timedelta(minutes=1)
+        "company", entity_id, "employee_count", organization_id=ORG, now=NOW + timedelta(minutes=1)
     )
 
     assert result is not None
@@ -60,9 +67,9 @@ def test_expired_evidence_is_not_a_hit(
     entity_id = uuid4()
     cleanup_evidence.append(entity_id)
 
-    evidence_store.put(_evidence(entity_id, ttl_seconds=60))
+    evidence_store.put(_evidence(entity_id, ttl_seconds=60), organization_id=ORG)
     result = evidence_store.get_fresh(
-        "company", entity_id, "employee_count", now=NOW + timedelta(minutes=5)
+        "company", entity_id, "employee_count", organization_id=ORG, now=NOW + timedelta(minutes=5)
     )
 
     assert result is None
@@ -75,9 +82,13 @@ def test_get_fresh_ignores_a_different_entity(
     other_entity_id = uuid4()
     cleanup_evidence.extend([entity_id, other_entity_id])
 
-    evidence_store.put(_evidence(entity_id))
+    evidence_store.put(_evidence(entity_id), organization_id=ORG)
     result = evidence_store.get_fresh(
-        "company", other_entity_id, "employee_count", now=NOW + timedelta(minutes=1)
+        "company",
+        other_entity_id,
+        "employee_count",
+        organization_id=ORG,
+        now=NOW + timedelta(minutes=1),
     )
 
     assert result is None
@@ -89,11 +100,14 @@ def test_get_fresh_returns_the_most_recently_fetched_row(
     entity_id = uuid4()
     cleanup_evidence.append(entity_id)
 
-    evidence_store.put(_evidence(entity_id, value=100, fetched_at=NOW))
-    evidence_store.put(_evidence(entity_id, value=300, fetched_at=NOW + timedelta(minutes=10)))
+    evidence_store.put(_evidence(entity_id, value=100, fetched_at=NOW), organization_id=ORG)
+    evidence_store.put(
+        _evidence(entity_id, value=300, fetched_at=NOW + timedelta(minutes=10)),
+        organization_id=ORG,
+    )
 
     result = evidence_store.get_fresh(
-        "company", entity_id, "employee_count", now=NOW + timedelta(minutes=20)
+        "company", entity_id, "employee_count", organization_id=ORG, now=NOW + timedelta(minutes=20)
     )
 
     assert result is not None
@@ -110,10 +124,13 @@ def test_get_all_fresh_returns_every_field_and_excludes_expired(
         [
             _evidence(entity_id, field_name="employee_count", value=250, ttl_seconds=3600),
             _evidence(entity_id, field_name="industry", value="fintech", ttl_seconds=60),
-        ]
+        ],
+        organization_id=ORG,
     )
 
-    fresh = evidence_store.get_all_fresh("company", entity_id, now=NOW + timedelta(minutes=5))
+    fresh = evidence_store.get_all_fresh(
+        "company", entity_id, organization_id=ORG, now=NOW + timedelta(minutes=5)
+    )
 
     field_names = {e.field_name for e in fresh}
     assert field_names == {"employee_count"}  # "industry" (ttl=60s) has expired by +5min
@@ -126,10 +143,14 @@ def test_get_all_fresh_excludes_other_entities(
     other_entity_id = uuid4()
     cleanup_evidence.extend([entity_id, other_entity_id])
 
-    evidence_store.put(_evidence(entity_id))
-    evidence_store.put(_evidence(other_entity_id, field_name="industry", value="fintech"))
+    evidence_store.put(_evidence(entity_id), organization_id=ORG)
+    evidence_store.put(
+        _evidence(other_entity_id, field_name="industry", value="fintech"), organization_id=ORG
+    )
 
-    fresh = evidence_store.get_all_fresh("company", entity_id, now=NOW + timedelta(minutes=1))
+    fresh = evidence_store.get_all_fresh(
+        "company", entity_id, organization_id=ORG, now=NOW + timedelta(minutes=1)
+    )
 
     assert {e.entity_id for e in fresh} == {entity_id}
 
@@ -171,7 +192,8 @@ def test_get_all_fresh_returns_one_row_per_field_and_source_after_a_mixed_ttl_re
                 ttl_seconds=thirty_days,
                 fetched_at=day_zero,
             ),
-        ]
+        ],
+        organization_id=ORG,
     )
 
     # Day 31: employee_count's TTL expired; the provider is re-called and
@@ -194,10 +216,13 @@ def test_get_all_fresh_returns_one_row_per_field_and_source_after_a_mixed_ttl_re
                 ttl_seconds=thirty_days,
                 fetched_at=NOW,
             ),
-        ]
+        ],
+        organization_id=ORG,
     )
 
-    fresh = evidence_store.get_all_fresh("company", entity_id, now=NOW + timedelta(minutes=1))
+    fresh = evidence_store.get_all_fresh(
+        "company", entity_id, organization_id=ORG, now=NOW + timedelta(minutes=1)
+    )
 
     by_field_and_source = [(e.field_name, e.source) for e in fresh]
     assert len(by_field_and_source) == len(set(by_field_and_source)), (
@@ -220,8 +245,11 @@ def test_put_many_persists_every_item(
             _evidence(entity_id, field_name="employee_count", value=250),
             _evidence(entity_id, field_name="industry", value="fintech"),
             _evidence(entity_id, field_name="title_seniority", value="vp", entity_type="person"),
-        ]
+        ],
+        organization_id=ORG,
     )
 
-    fresh = evidence_store.get_all_fresh("company", entity_id, now=NOW + timedelta(minutes=1))
+    fresh = evidence_store.get_all_fresh(
+        "company", entity_id, organization_id=ORG, now=NOW + timedelta(minutes=1)
+    )
     assert {e.field_name for e in fresh} == {"employee_count", "industry"}

@@ -30,6 +30,7 @@ from arie.evalgen.schema import EvalLead
 from arie.evidence.store import PostgresEvidenceStore
 from arie.identity.normalize import normalize_company_name, normalize_domain
 from arie.identity.resolver import IdentityResolver
+from arie.tenancy import LEGACY_ORGANIZATION_ID
 
 pytestmark = pytest.mark.integration
 
@@ -93,7 +94,10 @@ def test_person_resolves_to_same_id_across_email_variants(
     raw_variants = [f"Jane@{domain.upper()}", f"  jane@{domain}  ", f"jane+newsletter@{domain}"]
     resolved_ids = {
         identity_resolver.resolve_person(
-            email=v, full_name="Jane Doe", company_id=company.company_id
+            email=v,
+            organization_id=LEGACY_ORGANIZATION_ID,
+            full_name="Jane Doe",
+            company_id=company.company_id,
         ).person_id
         for v in raw_variants
     }
@@ -131,8 +135,12 @@ def test_different_emails_never_merge(
     email_a, email_b = f"alice@{domain}", f"bob@{domain}"
     cleanup_identity.emails.extend([email_a, email_b])
 
-    a = identity_resolver.resolve_person(email=email_a, company_id=company.company_id)
-    b = identity_resolver.resolve_person(email=email_b, company_id=company.company_id)
+    a = identity_resolver.resolve_person(
+        email=email_a, organization_id=LEGACY_ORGANIZATION_ID, company_id=company.company_id
+    )
+    b = identity_resolver.resolve_person(
+        email=email_b, organization_id=LEGACY_ORGANIZATION_ID, company_id=company.company_id
+    )
 
     assert a.person_id != b.person_id
 
@@ -170,6 +178,7 @@ def test_two_contacts_at_same_company_share_fresh_evidence(
 
     company_a, _person_a = identity_resolver.resolve_lead(
         person_email=email_a,
+        organization_id=LEGACY_ORGANIZATION_ID,
         company_domain=domain,
         company_name="Shared Co",
         person_full_name="Alice A",
@@ -177,6 +186,7 @@ def test_two_contacts_at_same_company_share_fresh_evidence(
     # Second contact, submitted with a differently-spelled domain.
     company_b, _person_b = identity_resolver.resolve_lead(
         person_email=email_b,
+        organization_id=LEGACY_ORGANIZATION_ID,
         company_domain=f"HTTPS://WWW.{domain.upper()}/",
         company_name="Shared Co",
         person_full_name="Bob B",
@@ -196,12 +206,19 @@ def test_two_contacts_at_same_company_share_fresh_evidence(
             confidence=0.9,
             ttl_seconds=3600,
             fetched_at=NOW,
-        )
+        ),
+        organization_id=LEGACY_ORGANIZATION_ID,
     )
 
-    # Contact B benefits without any provider call of their own.
+    # Contact B benefits without any provider call of their own — both
+    # contacts belong to the same organization, so within-tenant sharing
+    # still holds; see migrations/0012's tenancy-boundary note for why this
+    # is no longer true *across* organizations.
     fresh = evidence_store.get_all_fresh(
-        "company", company_b.company_id, now=NOW + timedelta(minutes=1)
+        "company",
+        company_b.company_id,
+        organization_id=LEGACY_ORGANIZATION_ID,
+        now=NOW + timedelta(minutes=1),
     )
     assert {e.field_name: e.value for e in fresh} == {"industry": "fintech"}
 

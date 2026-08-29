@@ -82,9 +82,11 @@ def test_row_for_insert_wraps_value_for_jsonb() -> None:
         ttl_seconds=5_184_000,
         fetched_at=FETCHED_AT,
     )
-    params = _row_for_insert(evidence)
+    organization_id = uuid4()
+    params = _row_for_insert(evidence, organization_id)
     assert isinstance(params["value"], Jsonb)
     assert params["value"].obj == "vp"
     assert params["entity_id"] == evidence.entity_id
+    assert params["organization_id"] == organization_id
     assert params["confidence"] == 0.9
     assert params["effect_on_score"] is None

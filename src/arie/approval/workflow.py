@@ -143,27 +143,34 @@ class DecisionResult:
 
 
 _REQUEST_REVIEW = """
-    INSERT INTO human_reviews (lead_id, reviewer, original_decision)
-    VALUES (%(lead_id)s, %(reviewer)s, %(original_decision)s)
+    INSERT INTO human_reviews (organization_id, lead_id, reviewer, original_decision)
+    VALUES (%(organization_id)s, %(lead_id)s, %(reviewer)s, %(original_decision)s)
     ON CONFLICT (lead_id) WHERE responded_at IS NULL
         DO UPDATE SET lead_id = human_reviews.lead_id
     RETURNING review_id, (xmax = 0) AS created
 """
 
+# `organization_id` is filtered on `human_reviews` (the row a caller is
+# actually allowed to reach), not re-derived from the `leads` join — a lead's
+# organization_id can never disagree with its own review's (both are written
+# from the same identity at request_review time), but filtering the owning
+# row directly is what makes this query double as the IDOR ownership check:
+# a review from another organization simply doesn't match, and the caller
+# gets the same "not found" it would get for a nonexistent review_id.
 _SELECT_REVIEW = """
     SELECT hr.review_id, hr.lead_id, hr.requested_at, hr.reviewer,
            hr.original_decision, hr.final_decision, hr.notes, hr.responded_at,
            l.status AS lead_status, l.version AS lead_version
     FROM human_reviews hr
     JOIN leads l ON l.lead_id = hr.lead_id
-    WHERE hr.review_id = %(review_id)s
+    WHERE hr.review_id = %(review_id)s AND hr.organization_id = %(organization_id)s
 """
 
 _COMPLETE_REVIEW = """
     UPDATE human_reviews
     SET reviewer = %(reviewer)s, final_decision = %(final_decision)s,
         notes = %(notes)s, responded_at = now()
-    WHERE review_id = %(review_id)s AND responded_at IS NULL
+    WHERE review_id = %(review_id)s AND organization_id = %(organization_id)s AND responded_at IS NULL
     RETURNING lead_id, responded_at
 """
 
@@ -172,6 +179,7 @@ def request_review(
     conn: psycopg.Connection,
     *,
     lead_id: UUID,
+    organization_id: UUID,
     expected_version: int,
     original_decision: str | None,
     reviewer: str | None = None,
@@ -221,7 +229,12 @@ def request_review(
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 _REQUEST_REVIEW,
-                {"lead_id": lead_id, "reviewer": reviewer, "original_decision": original_decision},
+                {
+                    "organization_id": organization_id,
+                    "lead_id": lead_id,
+                    "reviewer": reviewer,
+                    "original_decision": original_decision,
+                },
             )
             row = cur.fetchone()
             assert row is not None
@@ -232,10 +245,18 @@ def request_review(
         return result
 
 
-def get_review(conn: psycopg.Connection, review_id: UUID) -> ReviewRecord | None:
-    """Fetch one review, joined with the lead's live status and version."""
+def get_review(
+    conn: psycopg.Connection, review_id: UUID, *, organization_id: UUID
+) -> ReviewRecord | None:
+    """Fetch one review, joined with the lead's live status and version.
+
+    `organization_id` doubles as the ownership check: a review that exists but
+    belongs to a different organization reads back as ``None``, the same
+    "not found" a genuinely nonexistent `review_id` produces — see
+    `_SELECT_REVIEW`'s own comment for why that is deliberate.
+    """
     with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(_SELECT_REVIEW, {"review_id": review_id})
+        cur.execute(_SELECT_REVIEW, {"review_id": review_id, "organization_id": organization_id})
         row = cur.fetchone()
     if row is None:
         return None
@@ -257,6 +278,7 @@ def submit_decision(
     conn: psycopg.Connection,
     *,
     review_id: UUID,
+    organization_id: UUID,
     action: ReviewAction,
     reviewer: str,
     notes: str | None,
@@ -321,6 +343,7 @@ def submit_decision(
                 _COMPLETE_REVIEW,
                 {
                     "review_id": review_id,
+                    "organization_id": organization_id,
                     "reviewer": reviewer,
                     "final_decision": final_decision,
                     "notes": notes,
@@ -332,6 +355,7 @@ def submit_decision(
             result = _resolve_lost_race(
                 conn,
                 review_id=review_id,
+                organization_id=organization_id,
                 action=action,
                 final_decision=final_decision,
                 reviewer=reviewer,
@@ -403,12 +427,13 @@ def _resolve_lost_race(
     conn: psycopg.Connection,
     *,
     review_id: UUID,
+    organization_id: UUID,
     action: ReviewAction,
     final_decision: str,
     reviewer: str,
     notes: str | None,
 ) -> DecisionResult:
-    existing = get_review(conn, review_id)
+    existing = get_review(conn, review_id, organization_id=organization_id)
     if existing is None:
         raise ReviewNotFoundError(review_id)
     if existing.responded_at is None:

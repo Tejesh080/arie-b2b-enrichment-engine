@@ -49,17 +49,20 @@ from uuid import UUID
 
 import psycopg
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from psycopg_pool import ConnectionPool
 from scripts.migrate import migrate
 from scripts.test_db import IntegrationDatabaseGuardError, assert_not_production, marker_present
 
-from arie.api.main import AppState, build_state, create_app
+from arie.api.main import AppState, build_state, create_app, get_auth_context
+from arie.auth import AuthContext
 from arie.config import IntegrationDatabaseConfig
 from arie.evidence.store import PostgresEvidenceStore
 from arie.identity.resolver import IdentityResolver
 from arie.jobs.queue import PostgresJobQueue
 from arie.ledger.store import PostgresCostLedger
+from arie.tenancy import LEGACY_ORGANIZATION_ID
 
 _SETUP_HINT = (
     "See scripts/test_db.py for setup. In short:\n"
@@ -332,8 +335,40 @@ def app_state(migrated_database: str) -> Iterator[AppState]:
         state.pool.close()
 
 
+def authorize_app(app: FastAPI, auth_context: AuthContext | None = None) -> AuthContext:
+    """Override `get_auth_context` on an app built directly with `create_app`.
+
+    For the handful of tests that need their own app instance (a broken
+    collaborator swapped in via `dataclasses.replace`, a real uvicorn server)
+    rather than the shared `api_client` fixture — same override, same reason:
+    see `api_client`'s own docstring. Returns the `AuthContext` used, so a
+    caller that needs the organization/user id back doesn't have to duplicate
+    the default.
+    """
+    context = auth_context or AuthContext(
+        user_id=uuid.uuid4(), organization_id=LEGACY_ORGANIZATION_ID, role="owner"
+    )
+    app.dependency_overrides[get_auth_context] = lambda: context
+    return context
+
+
 @pytest.fixture
-def api_client(app_state: AppState) -> Iterator[TestClient]:
+def test_auth_context() -> AuthContext:
+    """The identity `api_client` authenticates every request as, by default.
+
+    `organization_id=LEGACY_ORGANIZATION_ID` — the well-known organization
+    every migration run backfills into (`migrations/0014_...sql`), which
+    exists on a freshly migrated test database with no extra seeding. Tests
+    that need to prove cross-organization isolation build their own second
+    organization and reassign `api_client.app.dependency_overrides
+    [get_auth_context]` mid-test — see
+    `tests/integration/test_tenancy_isolation_integration.py`.
+    """
+    return AuthContext(user_id=uuid.uuid4(), organization_id=LEGACY_ORGANIZATION_ID, role="owner")
+
+
+@pytest.fixture
+def api_client(app_state: AppState, test_auth_context: AuthContext) -> Iterator[TestClient]:
     """A client over an app wired to the test pool, with the lifespan bypassed.
 
     Passing `state` to ``create_app`` skips the real lifespan entirely, so the
@@ -343,8 +378,18 @@ def api_client(app_state: AppState) -> Iterator[TestClient]:
     ``raise_server_exceptions=False`` so a handler that raises produces a 500
     response to assert on, which is what the rollback tests need — the default
     re-raises into the test and the response is never formed.
+
+    `get_auth_context` is overridden rather than every call site sending a
+    real signed JWT and an `X-Organization-Id` header: this suite tests
+    business logic, not token verification (`tests/unit/test_auth.py` already
+    covers that in isolation), and FastAPI's dependency-override mechanism is
+    the standard way to substitute a fixed identity for it. The override lives
+    on `app.dependency_overrides`, which is per-`FastAPI-app`-instance and
+    this fixture builds a fresh app per test, so it never leaks between tests.
     """
-    with TestClient(create_app(state=app_state), raise_server_exceptions=False) as client:
+    app = create_app(state=app_state)
+    app.dependency_overrides[get_auth_context] = lambda: test_auth_context
+    with TestClient(app, raise_server_exceptions=False) as client:
         yield client
 
 
@@ -417,12 +462,20 @@ def cleanup_ingest(db_conn: psycopg.Connection) -> Iterator[IngestCleanup]:
 def make_lead(
     db_conn: psycopg.Connection, cleanup_leads: list[UUID]
 ) -> Callable[[], tuple[UUID, int]]:
-    """Factory for a minimal lead row. Returns (lead_id, version); registers for cleanup."""
+    """Factory for a minimal lead row. Returns (lead_id, version); registers for cleanup.
 
-    def _make(*, source: str = "test") -> tuple[UUID, int]:
+    Defaults to `LEGACY_ORGANIZATION_ID` — pass `organization_id` for a test
+    that needs the lead to belong to a different (test-created) organization.
+    """
+
+    def _make(
+        *, source: str = "test", organization_id: UUID = LEGACY_ORGANIZATION_ID
+    ) -> tuple[UUID, int]:
         with db_conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO leads (source) VALUES (%s) RETURNING lead_id, version", (source,)
+                "INSERT INTO leads (source, organization_id) VALUES (%s, %s) "
+                "RETURNING lead_id, version",
+                (source, organization_id),
             )
             row = cur.fetchone()
             assert row is not None

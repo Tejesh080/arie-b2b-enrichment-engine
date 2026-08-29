@@ -280,6 +280,7 @@ def record_extraction_cost(
     ledger: PostgresCostLedger,
     outcome: ExtractionOutcome,
     *,
+    organization_id: UUID,
     lead_id: UUID | None = None,
     idempotency_key_base: str | None = None,
 ) -> tuple[LedgerWrite, ...]:
@@ -309,6 +310,7 @@ def record_extraction_cost(
                 purpose=PURPOSE,
                 prompt_tokens=attempt.prompt_tokens,
                 completion_tokens=attempt.completion_tokens,
+                organization_id=organization_id,
                 lead_id=lead_id,
                 latency_ms=attempt.latency_ms,
                 idempotency_key=key,

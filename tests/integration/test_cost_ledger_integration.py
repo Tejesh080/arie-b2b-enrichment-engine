@@ -13,6 +13,12 @@ being at the mercy of whatever else is in there. Each view test instead measures
 the metric, makes one known change, measures again, and asserts on the
 *difference* — which is both pollution-proof and a sharper statement of the
 property under test.
+
+Every lead/ledger row below is created under `ORG` (`LEGACY_ORGANIZATION_ID`)
+— a single fixed organization is enough here since these tests only ever
+compare against the shared, day-scoped views, which are read without any
+organization filter (the same as before Productization M1); cross-tenant
+behavior has its own suite (`test_tenancy_isolation_integration.py`).
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ from arie.core.types import LeadStatus, ProviderStatus
 from arie.ledger.pricing import UnknownModelError
 from arie.ledger.store import PostgresCostLedger
 from arie.statemachine.transitions import QUALIFIED
+from arie.tenancy import LEGACY_ORGANIZATION_ID as ORG
 
 pytestmark = pytest.mark.integration
 
@@ -40,8 +47,9 @@ def _make_lead(
 ) -> uuid.UUID:
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO leads (source, status) VALUES (%s, %s) RETURNING lead_id",
-            ("ledger-test", str(status)),
+            "INSERT INTO leads (source, status, organization_id) VALUES (%s, %s, %s) "
+            "RETURNING lead_id",
+            ("ledger-test", str(status), ORG),
         )
         row = cur.fetchone()
     assert row is not None
@@ -100,6 +108,7 @@ def test_provider_call_rolls_up_into_v_lead_cost(
         status=ProviderStatus.SUCCESS,
         cost_usd=0.090,
         latency_ms=612,
+        organization_id=ORG,
         lead_id=lead_id,
     )
 
@@ -135,6 +144,7 @@ def test_replaying_a_call_does_not_charge_for_it_twice(
         "status": ProviderStatus.SUCCESS,
         "cost_usd": 0.600,
         "latency_ms": 4200,
+        "organization_id": ORG,
         "lead_id": lead_id,
     }
 
@@ -175,6 +185,7 @@ def test_cache_hit_is_recorded_at_zero_cost_but_still_counted(
         status=ProviderStatus.SUCCESS,
         cost_usd=0.090,
         latency_ms=600,
+        organization_id=ORG,
         lead_id=lead_id,
     )
     hit = cost_ledger.record_provider_call(
@@ -185,6 +196,7 @@ def test_cache_hit_is_recorded_at_zero_cost_but_still_counted(
         status=ProviderStatus.SUCCESS,
         cost_usd=0.090,  # what it would have cost; deliberately not billed
         latency_ms=600,
+        organization_id=ORG,
         lead_id=lead_id,
         cache_hit=True,
     )
@@ -216,6 +228,7 @@ def test_v_provider_health_ignores_cache_hits(
         status=ProviderStatus.SUCCESS,
         cost_usd=0.25,
         latency_ms=1100,
+        organization_id=ORG,
         lead_id=lead_id,
     )
     cost_ledger.record_provider_call(
@@ -226,6 +239,7 @@ def test_v_provider_health_ignores_cache_hits(
         status=ProviderStatus.SUCCESS,
         cost_usd=0.25,
         latency_ms=1100,
+        organization_id=ORG,
         lead_id=lead_id,
         cache_hit=True,
     )
@@ -258,6 +272,7 @@ def test_model_call_is_priced_from_token_counts(
         purpose="buying_signal_extraction",
         prompt_tokens=1_000,
         completion_tokens=100,
+        organization_id=ORG,
         lead_id=lead_id,
         latency_ms=430,
         idempotency_key=_key(cleanup_ingest, "model"),
@@ -288,6 +303,7 @@ def test_total_cost_is_provider_plus_model(
         status=ProviderStatus.SUCCESS,
         cost_usd=0.250,
         latency_ms=1100,
+        organization_id=ORG,
         lead_id=lead_id,
     )
     cost_ledger.record_model_call(
@@ -295,6 +311,7 @@ def test_total_cost_is_provider_plus_model(
         purpose="buying_signal_extraction",
         prompt_tokens=2_000,
         completion_tokens=1_000,
+        organization_id=ORG,
         lead_id=lead_id,
         idempotency_key=_key(cleanup_ingest, "model"),
     )
@@ -321,6 +338,7 @@ def test_model_tier_is_taken_from_the_price_table_not_the_caller(
         purpose="probe",
         prompt_tokens=10,
         completion_tokens=10,
+        organization_id=ORG,
         lead_id=lead_id,
         escalated_from="deepseek-chat",
         idempotency_key=key,
@@ -343,6 +361,7 @@ def test_replaying_a_model_call_does_not_charge_for_it_twice(
         "purpose": "buying_signal_extraction",
         "prompt_tokens": 1_000,
         "completion_tokens": 100,
+        "organization_id": ORG,
         "lead_id": lead_id,
         "idempotency_key": key,
     }
@@ -376,6 +395,7 @@ def test_unkeyed_model_calls_are_never_deduplicated(
             purpose="buying_signal_extraction",
             prompt_tokens=1_000,
             completion_tokens=100,
+            organization_id=ORG,
             lead_id=lead_id,
         )
 
@@ -402,6 +422,7 @@ def test_an_unpriced_model_is_rejected_before_a_row_is_written(
             purpose="probe",
             prompt_tokens=10,
             completion_tokens=10,
+            organization_id=ORG,
             lead_id=lead_id,
         )
 
@@ -434,6 +455,7 @@ def test_v_pipeline_metrics_does_not_count_rejected_leads_as_qualified(
         status=ProviderStatus.SUCCESS,
         cost_usd=1.00,
         latency_ms=100,
+        organization_id=ORG,
         lead_id=qualified,
     )
 
@@ -449,6 +471,7 @@ def test_v_pipeline_metrics_does_not_count_rejected_leads_as_qualified(
         status=ProviderStatus.SUCCESS,
         cost_usd=99.00,  # large enough that including it could not go unnoticed
         latency_ms=100,
+        organization_id=ORG,
         lead_id=rejected,
     )
 
@@ -487,6 +510,7 @@ def test_v_pipeline_metrics_counts_manual_reviewed_leads_as_qualified(
         status=ProviderStatus.SUCCESS,
         cost_usd=Decimal("12.50"),
         latency_ms=100,
+        organization_id=ORG,
         lead_id=manual_review,
     )
 
@@ -520,9 +544,9 @@ def test_v_escalation_rate_counts_a_twice_reviewed_lead_once(
     with db_conn.cursor() as cur:
         for reviewer in ("first@example.test", "second@example.test"):
             cur.execute(
-                "INSERT INTO human_reviews (lead_id, reviewer, original_decision, final_decision, "
-                "responded_at) VALUES (%s, %s, 'auto_route', 'reject', now())",
-                (lead_id, reviewer),
+                "INSERT INTO human_reviews (lead_id, organization_id, reviewer, original_decision, "
+                "final_decision, responded_at) VALUES (%s, %s, %s, 'auto_route', 'reject', now())",
+                (lead_id, ORG, reviewer),
             )
     db_conn.commit()
 
@@ -549,9 +573,9 @@ def test_two_reviews_of_one_lead_are_two_overrides(
     with db_conn.cursor() as cur:
         for reviewer in ("a@example.test", "b@example.test"):
             cur.execute(
-                "INSERT INTO human_reviews (lead_id, reviewer, original_decision, final_decision, "
-                "responded_at) VALUES (%s, %s, 'auto_route', 'reject', now())",
-                (lead_id, reviewer),
+                "INSERT INTO human_reviews (lead_id, organization_id, reviewer, original_decision, "
+                "final_decision, responded_at) VALUES (%s, %s, %s, 'auto_route', 'reject', now())",
+                (lead_id, ORG, reviewer),
             )
     db_conn.commit()
 

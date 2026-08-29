@@ -25,6 +25,7 @@ from tests.integration.conftest import IngestCleanup
 from arie.approval.workflow import get_review, request_review
 from arie.core.types import LeadStatus
 from arie.statemachine.apply import OptimisticConcurrencyError
+from arie.tenancy import LEGACY_ORGANIZATION_ID as ORG
 
 pytestmark = pytest.mark.integration
 
@@ -41,11 +42,16 @@ def _make_awaiting_human_lead(
     Returns (lead_id, review_id, lead_version) — `lead_version` is read back
     after the escalation, i.e. the version a client would see from `GET
     /reviews/{review_id}` and would submit back as `expected_lead_version`.
+
+    Built under `ORG` (`LEGACY_ORGANIZATION_ID`) — the organization
+    `api_client` authenticates as by default, so the HTTP-level assertions in
+    this file that fetch/decide the review through the API actually find it.
     """
     with db_conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO leads (source, status) VALUES (%s, %s) RETURNING lead_id, version",
-            ("review-test", str(LeadStatus.DECISION)),
+            "INSERT INTO leads (source, status, organization_id) VALUES (%s, %s, %s) "
+            "RETURNING lead_id, version",
+            ("review-test", str(LeadStatus.DECISION), ORG),
         )
         row = cur.fetchone()
     assert row is not None
@@ -56,6 +62,7 @@ def _make_awaiting_human_lead(
     pending = request_review(
         db_conn,
         lead_id=lead_id,
+        organization_id=ORG,
         expected_version=version,
         original_decision=original_decision,
         reviewer=reviewer,
@@ -438,8 +445,9 @@ def test_a_second_escalation_with_a_stale_version_fails_safely(
     """
     with db_conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO leads (source, status) VALUES (%s, %s) RETURNING lead_id, version",
-            ("review-test", str(LeadStatus.DECISION)),
+            "INSERT INTO leads (source, status, organization_id) VALUES (%s, %s, %s) "
+            "RETURNING lead_id, version",
+            ("review-test", str(LeadStatus.DECISION), ORG),
         )
         row = cur.fetchone()
     assert row is not None
@@ -448,7 +456,11 @@ def test_a_second_escalation_with_a_stale_version_fails_safely(
     cleanup_ingest.lead_ids.append(lead_id)
 
     first = request_review(
-        db_conn, lead_id=lead_id, expected_version=version, original_decision="auto_route"
+        db_conn,
+        lead_id=lead_id,
+        organization_id=ORG,
+        expected_version=version,
+        original_decision="auto_route",
     )
     db_conn.commit()
 
@@ -456,6 +468,7 @@ def test_a_second_escalation_with_a_stale_version_fails_safely(
         request_review(
             db_conn,
             lead_id=lead_id,
+            organization_id=ORG,
             expected_version=version,  # stale: the call above already advanced it once
             original_decision="auto_route",
         )
@@ -479,7 +492,7 @@ def test_get_review_reflects_current_lead_state_not_a_snapshot(
         )
     db_conn.commit()
 
-    record = get_review(db_conn, review_id)
+    record = get_review(db_conn, review_id, organization_id=ORG)
 
     assert record is not None
     assert record.lead_version == version + 1
@@ -490,4 +503,4 @@ def test_get_review_returns_none_for_unknown_id(db_conn: psycopg.Connection) -> 
     """`get_review` itself returns `None` for a miss -- `ReviewNotFoundError`
     (see the 404 tests above) is `submit_decision`'s vocabulary, raised only
     when a decision is submitted against an id that doesn't resolve."""
-    assert get_review(db_conn, uuid.uuid4()) is None
+    assert get_review(db_conn, uuid.uuid4(), organization_id=ORG) is None

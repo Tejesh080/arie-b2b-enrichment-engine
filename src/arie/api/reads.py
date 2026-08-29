@@ -23,7 +23,7 @@ _SELECT_LEAD = """
     SELECT lead_id, status, version, source, external_ref,
            company_id, person_id, budget_usd_cap, is_shadow, created_at, updated_at
     FROM leads
-    WHERE lead_id = %(lead_id)s
+    WHERE lead_id = %(lead_id)s AND organization_id = %(organization_id)s
 """
 
 
@@ -45,9 +45,19 @@ class LeadRecord:
     updated_at: datetime
 
 
-def fetch_lead(conn: psycopg.Connection, lead_id: UUID) -> LeadRecord | None:
+def fetch_lead(
+    conn: psycopg.Connection, lead_id: UUID, *, organization_id: UUID
+) -> LeadRecord | None:
+    """Fetch one lead, scoped to its owning organization.
+
+    `organization_id` doubles as the ownership check: a lead that exists but
+    belongs to a different organization reads back as ``None`` — the same
+    "not found" a genuinely nonexistent `lead_id` produces, so a caller (and
+    an attacker probing IDs) cannot distinguish "wrong organization" from
+    "doesn't exist."
+    """
     with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(_SELECT_LEAD, {"lead_id": lead_id})
+        cur.execute(_SELECT_LEAD, {"lead_id": lead_id, "organization_id": organization_id})
         row = cur.fetchone()
     if row is None:
         return None

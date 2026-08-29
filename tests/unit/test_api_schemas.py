@@ -9,6 +9,7 @@ nothing can be accepted at the edge that resolution would later reject.
 from __future__ import annotations
 
 from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -148,8 +149,10 @@ def test_to_command_carries_every_field_through() -> None:
         budget_usd_cap=Decimal("2.50"),
         mode="shadow",
     )
-    command = request.to_command()
+    organization_id = uuid4()
+    command = request.to_command(organization_id=organization_id)
 
+    assert command.organization_id == organization_id
     assert command.source == "n8n"
     assert command.email == "ada@acme.com"
     assert command.external_ref == "crm-7"
@@ -164,7 +167,7 @@ def test_to_command_carries_every_field_through() -> None:
 def test_mode_defaults_to_normal_and_is_not_shadow() -> None:
     request = IngestLeadRequest(**_minimal())  # type: ignore[arg-type]
     assert request.mode == "normal"
-    assert request.to_command().is_shadow is False
+    assert request.to_command(organization_id=uuid4()).is_shadow is False
 
 
 def test_unrecognised_mode_is_rejected() -> None:

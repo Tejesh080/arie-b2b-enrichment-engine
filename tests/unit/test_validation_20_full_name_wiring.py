@@ -58,6 +58,7 @@ def _identity(*, full_name: str | None) -> _LeadIdentity:
     return _LeadIdentity(
         company_id=uuid.uuid4(),
         person_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
         canonical_email="patrick@stripe.com",
         canonical_domain="stripe.com",
         is_shadow=False,

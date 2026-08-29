@@ -120,6 +120,7 @@ def _identity(*, domain: str | None) -> object:
     return _LeadIdentity(
         company_id=uuid.uuid4(),
         person_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
         canonical_email="dana@northwind-analytics.test",
         canonical_domain=domain,
         is_shadow=False,

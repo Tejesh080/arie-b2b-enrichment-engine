@@ -94,6 +94,7 @@ from arie.providers.hunter_contract import HUNTER_PROVIDER_NAME
 from arie.providers.live_abstract import PROVIDER_NAME as ABSTRACT_PROVIDER_NAME
 from arie.providers.live_abstract import AbstractCompanyEnrichmentProvider
 from arie.providers.live_hunter import HunterEnrichmentProvider
+from arie.tenancy import LEGACY_ORGANIZATION_ID
 
 LOCAL_DB_URL = "postgresql://arie:arie_local_dev@localhost:5432/arie"
 """The shared local Compose database — what the original five identities run
@@ -253,6 +254,9 @@ def _ingest_command(
     return LeadIngestCommand(
         source=source,
         email=identity["email"],
+        # Internal experiment tooling, not a real tenant — see
+        # arie.tenancy.LEGACY_ORGANIZATION_ID for what this constant is.
+        organization_id=LEGACY_ORGANIZATION_ID,
         external_ref=external_ref,
         company_domain=identity["domain"],
         company_name=identity["company_name"],
@@ -736,7 +740,9 @@ def main() -> int:
             }
             with state.pool.connection() as conn:
                 for identity, lead_id in zip(identities, lead_ids, strict=True):
-                    receipt = build_receipt(conn, state.ledger, lead_id)
+                    receipt = build_receipt(
+                        conn, state.ledger, lead_id, organization_id=LEGACY_ORGANIZATION_ID
+                    )
                     with conn.cursor() as cur:
                         cur.execute(
                             "SELECT evidence_snapshot FROM decision_receipts WHERE lead_id = %(lead_id)s",
@@ -760,7 +766,11 @@ def main() -> int:
                     )
 
                 cache_receipt = (
-                    build_receipt(conn, state.ledger, cache_lead_id) if cache_lead_id else None
+                    build_receipt(
+                        conn, state.ledger, cache_lead_id, organization_id=LEGACY_ORGANIZATION_ID
+                    )
+                    if cache_lead_id
+                    else None
                 )
                 report["cache_test"] = {
                     "identity": cache_identity,

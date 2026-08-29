@@ -157,6 +157,26 @@ class IntegrationDatabaseConfig:
 
 
 @dataclass(frozen=True)
+class SupabaseAuthConfig:
+    """Verification config for Supabase-issued user session tokens.
+
+    Productization M1's auth model (`arie.auth`): a Supabase JWT bearer token
+    plus an `X-Organization-Id` header, checked against `organization_members`.
+    `jwt_secret` is Supabase's legacy/shared HS256 signing secret — the
+    simplest verification path for a backend with no Supabase SDK dependency;
+    there is no API-key mechanism yet (`organization_api_keys` is explicitly
+    out of scope for this milestone), so every caller, human or machine,
+    authenticates this same way.
+    """
+
+    jwt_secret: str = field(default_factory=lambda: os.getenv("SUPABASE_JWT_SECRET", ""))
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.jwt_secret)
+
+
+@dataclass(frozen=True)
 class ObservabilityConfig:
     """Tracing configuration. Absent an endpoint, tracing is off — see
     ``arie.observability.tracing``.
@@ -619,6 +639,7 @@ class RuntimeConfig:
 # (e.g. `PolicyConfig()`) when a test needs to observe patched environment values.
 POLICY = PolicyConfig()
 DATABASE = DatabaseConfig()
+SUPABASE_AUTH = SupabaseAuthConfig()
 RUNTIME = RuntimeConfig()
 OBSERVABILITY = ObservabilityConfig()
 LLM = LLMConfig()

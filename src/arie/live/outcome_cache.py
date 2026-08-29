@@ -69,7 +69,8 @@ its declared fields, still fresh — see migration 0011."""
 _SELECT_LAST_MISS = """
     SELECT max(completed_at) AS last_miss
     FROM provider_calls
-    WHERE provider = %(provider)s
+    WHERE organization_id = %(organization_id)s
+      AND provider = %(provider)s
       AND entity_type = %(entity_type)s
       AND entity_id = %(entity_id)s
       AND status = %(miss_status)s
@@ -104,10 +105,24 @@ class ProviderOutcomeGuard:
         return self._config.miss_ttl_seconds
 
     def recent_miss(
-        self, provider_name: str, entity_type: EntityType, entity_id: UUID
+        self,
+        provider_name: str,
+        entity_type: EntityType,
+        entity_id: UUID,
+        *,
+        organization_id: UUID,
     ) -> RecentMiss | None:
         """``None`` if this provider is askable now — including the very
         first ask, and the first ask after a suppression window has expired.
+
+        `organization_id` is required — Productization M1 made `provider_calls`
+        tenant-owned and made `evidence`/provider-outcome reuse non-shared even
+        for `company`-entity rows (see
+        `migrations/0012_organizations_and_members.sql`'s tenancy-boundary
+        note). Without this filter, one organization's MISS for a shared
+        `company_id` would silently suppress a different organization's
+        legitimate, unrelated request for the same company — exactly the
+        automatic cross-tenant cache reuse the boundary correction forbids.
         """
         window = self._config.miss_ttl_seconds
         if window <= 0:
@@ -116,6 +131,7 @@ class ProviderOutcomeGuard:
             cur.execute(
                 _SELECT_LAST_MISS,
                 {
+                    "organization_id": organization_id,
                     "provider": provider_name,
                     "entity_type": entity_type,
                     "entity_id": entity_id,

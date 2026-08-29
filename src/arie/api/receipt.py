@@ -377,10 +377,19 @@ def _evidence_items(snapshot: dict[str, Any]) -> tuple[ReceiptEvidenceItem, ...]
 
 
 def build_receipt(
-    conn: psycopg.Connection, ledger: PostgresCostLedger, lead_id: UUID
+    conn: psycopg.Connection, ledger: PostgresCostLedger, lead_id: UUID, *, organization_id: UUID
 ) -> DecisionReceipt | None:
-    """Compose one lead's receipt. Returns `None` only for an unknown lead (404)."""
-    lead = fetch_lead(conn, lead_id)
+    """Compose one lead's receipt. Returns `None` for an unknown lead, or one
+    belonging to a different organization (both read as 404 — see
+    `fetch_lead`'s docstring for why that's deliberate).
+
+    Every query below this point stays keyed by `lead_id` alone, without its
+    own `organization_id` filter: `fetch_lead` already proved this lead
+    belongs to the caller's organization, and `lead_id` is a UUID primary key
+    that cannot be forged into matching a different organization's row, so
+    re-checking on every sub-query would be redundant, not safer.
+    """
+    lead = fetch_lead(conn, lead_id, organization_id=organization_id)
     if lead is None:
         return None
 

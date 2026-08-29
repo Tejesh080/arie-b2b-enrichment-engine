@@ -15,6 +15,7 @@ import pytest
 from scripts.migrate import checksum_of, migrate, migration_files
 
 from arie.migrations import MigrationsDirectoryError, pending_migrations
+from arie.tenancy import LEGACY_ORGANIZATION_ID
 
 pytestmark = pytest.mark.integration
 
@@ -75,11 +76,12 @@ def test_evidence_expires_at_is_generated_from_fetched_at_and_ttl(
         cur.execute(
             """
             INSERT INTO evidence (
-                entity_type, entity_id, field_name, value, source, confidence, ttl_seconds
-            ) VALUES ('company', %s, 'industry', '"fintech"', 'test', 0.9, 3600)
+                organization_id, entity_type, entity_id, field_name, value, source, confidence,
+                ttl_seconds
+            ) VALUES (%s, 'company', %s, 'industry', '"fintech"', 'test', 0.9, 3600)
             RETURNING fetched_at, expires_at
             """,
-            (entity_id,),
+            (str(LEGACY_ORGANIZATION_ID), entity_id),
         )
         row = cur.fetchone()
         assert row is not None

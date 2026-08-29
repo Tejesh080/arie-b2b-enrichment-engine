@@ -75,10 +75,14 @@ class IngestLeadRequest(BaseModel):
             normalize_domain(value)
         return value
 
-    def to_command(self) -> LeadIngestCommand:
+    def to_command(self, *, organization_id: UUID) -> LeadIngestCommand:
+        """`organization_id` comes from the caller's `AuthContext`, never from
+        the request body — a client cannot ingest a lead into an organization
+        it wasn't authenticated against."""
         return LeadIngestCommand(
             source=self.source,
             email=self.email,
+            organization_id=organization_id,
             external_ref=self.external_ref,
             company_domain=self.company_domain,
             company_name=self.company_name,

@@ -269,6 +269,7 @@ def build_runtime(
 class _LeadIdentity:
     company_id: UUID
     person_id: UUID
+    organization_id: UUID
     canonical_email: str
     canonical_domain: str | None
     is_shadow: bool
@@ -283,8 +284,8 @@ class _LeadIdentity:
 
 
 _SELECT_LEAD_IDENTITY = """
-    SELECT l.company_id, l.person_id, l.is_shadow, c.canonical_domain, p.canonical_email,
-           p.full_name, c.name AS company_name
+    SELECT l.company_id, l.person_id, l.organization_id, l.is_shadow, c.canonical_domain,
+           p.canonical_email, p.full_name, c.name AS company_name
     FROM leads l
     LEFT JOIN companies c ON c.company_id = l.company_id
     LEFT JOIN persons  p ON p.person_id  = l.person_id
@@ -292,18 +293,20 @@ _SELECT_LEAD_IDENTITY = """
 """
 
 _INSERT_SCORE = """
-    INSERT INTO scores (lead_id, total_score, decision_confidence, component_breakdown, model_version)
-    VALUES (%(lead_id)s, %(total_score)s, %(decision_confidence)s, %(component_breakdown)s,
-            %(model_version)s)
+    INSERT INTO scores (
+        organization_id, lead_id, total_score, decision_confidence, component_breakdown, model_version
+    )
+    VALUES (%(organization_id)s, %(lead_id)s, %(total_score)s, %(decision_confidence)s,
+            %(component_breakdown)s, %(model_version)s)
 """
 
 _INSERT_DECISION_RECEIPT = """
     INSERT INTO decision_receipts (
-        lead_id, decision, autonomous, confidence, tau,
+        organization_id, lead_id, decision, autonomous, confidence, tau,
         score_value, score_lower, score_upper, stop_reason,
         policy_name, scorer_version, confidence_calibration, evidence_snapshot
     ) VALUES (
-        %(lead_id)s, %(decision)s, %(autonomous)s, %(confidence)s, %(tau)s,
+        %(organization_id)s, %(lead_id)s, %(decision)s, %(autonomous)s, %(confidence)s, %(tau)s,
         %(score_value)s, %(score_lower)s, %(score_upper)s, %(stop_reason)s,
         %(policy_name)s, %(scorer_version)s, %(confidence_calibration)s, %(evidence_snapshot)s
     )
@@ -351,6 +354,7 @@ def _load_identity(conn: psycopg.Connection, lead_id: UUID) -> _LeadIdentity:
     return _LeadIdentity(
         company_id=row["company_id"],
         person_id=row["person_id"],
+        organization_id=row["organization_id"],
         canonical_email=row["canonical_email"],
         canonical_domain=row["canonical_domain"],
         is_shadow=row["is_shadow"],
@@ -375,10 +379,17 @@ class _DurableEvidenceCache(EvidenceCache):
     on missing providers, never as different evidence.
     """
 
-    def __init__(self, store: PostgresEvidenceStore, entities: dict[str, tuple[EntityType, UUID]]):
+    def __init__(
+        self,
+        store: PostgresEvidenceStore,
+        entities: dict[str, tuple[EntityType, UUID]],
+        *,
+        organization_id: UUID,
+    ):
         super().__init__()
         self._store = store
         self._entities = entities
+        self._organization_id = organization_id
 
     def get(self, provider: str, canonical_key: str) -> ProviderResult | None:
         hit = super().get(provider, canonical_key)
@@ -391,7 +402,9 @@ class _DurableEvidenceCache(EvidenceCache):
         spec = BY_NAME[provider]
 
         freshest: dict[str, Evidence] = {}
-        for row in self._store.get_all_fresh(entity_type, entity_id):
+        for row in self._store.get_all_fresh(
+            entity_type, entity_id, organization_id=self._organization_id
+        ):
             if row.source == provider and row.field_name not in freshest:
                 freshest[row.field_name] = row
         if not set(spec.provides_fields) <= freshest.keys():
@@ -416,17 +429,20 @@ class _DurableEvidenceCache(EvidenceCache):
         entity_type, entity_id = mapped
         now = datetime.now(UTC)
         self._store.put_many(
-            Evidence(
-                entity_type=entity_type,
-                entity_id=entity_id,
-                field_name=name,
-                value=value,
-                source=provider,
-                confidence=result.confidence,
-                ttl_seconds=ttl_for_field(name),
-                fetched_at=now,
-            )
-            for name, value in result.fields.items()
+            (
+                Evidence(
+                    entity_type=entity_type,
+                    entity_id=entity_id,
+                    field_name=name,
+                    value=value,
+                    source=provider,
+                    confidence=result.confidence,
+                    ttl_seconds=ttl_for_field(name),
+                    fetched_at=now,
+                )
+                for name, value in result.fields.items()
+            ),
+            organization_id=self._organization_id,
         )
 
 
@@ -448,12 +464,14 @@ class _DurableCallLedger(CallLedger):
         *,
         lead_id: UUID,
         job_id: UUID,
+        organization_id: UUID,
         entities: dict[str, tuple[EntityType, UUID]],
     ) -> None:
         super().__init__()
         self._pg = pg_ledger
         self._lead_id = lead_id
         self._job_id = job_id
+        self._organization_id = organization_id
         self._entities = entities
 
     def record(
@@ -477,6 +495,7 @@ class _DurableCallLedger(CallLedger):
             status=result.status,
             cost_usd=result.cost_usd,
             latency_ms=result.latency_ms,
+            organization_id=self._organization_id,
             lead_id=self._lead_id,
             cache_hit=cache_hit,
         )
@@ -505,6 +524,7 @@ def _finalize_decision(
     conn: psycopg.Connection,
     *,
     lead_id: UUID,
+    organization_id: UUID,
     version: int,
     decision: Decision,
     autonomous: bool,
@@ -565,6 +585,7 @@ def _finalize_decision(
         request_review(
             conn,
             lead_id=lead_id,
+            organization_id=organization_id,
             expected_version=version,
             original_decision=str(decision),
             reason=None if autonomy_allowed else LIVE_GUARD_REASON,
@@ -731,9 +752,15 @@ def _build_simulated_handlers(
             run_ctx = RunContext(
                 registry=registry,
                 ledger=_DurableCallLedger(
-                    cost_ledger, lead_id=job.lead_id, job_id=job.job_id, entities=entities
+                    cost_ledger,
+                    lead_id=job.lead_id,
+                    job_id=job.job_id,
+                    organization_id=identity.organization_id,
+                    entities=entities,
                 ),
-                cache=_DurableEvidenceCache(evidence_store, entities),
+                cache=_DurableEvidenceCache(
+                    evidence_store, entities, organization_id=identity.organization_id
+                ),
             )
             outcome = resolved_runtime.policy.run(corpus_lead, run_ctx)
             tau = resolved_runtime.policy.model.tau
@@ -760,6 +787,7 @@ def _build_simulated_handlers(
                 cur.execute(
                     _INSERT_SCORE,
                     {
+                        "organization_id": identity.organization_id,
                         "lead_id": job.lead_id,
                         "total_score": outcome.scoring.breakdown.total_score,
                         "decision_confidence": outcome.confidence,
@@ -770,6 +798,7 @@ def _build_simulated_handlers(
                 cur.execute(
                     _INSERT_DECISION_RECEIPT,
                     {
+                        "organization_id": identity.organization_id,
                         "lead_id": job.lead_id,
                         "decision": str(outcome.decision),
                         "autonomous": outcome.autonomous,
@@ -789,6 +818,7 @@ def _build_simulated_handlers(
             final = _finalize_decision(
                 ctx.conn,
                 lead_id=job.lead_id,
+                organization_id=identity.organization_id,
                 version=version,
                 decision=outcome.decision,
                 autonomous=outcome.autonomous,
@@ -1102,6 +1132,7 @@ def _acquire_live_evidence(
     identity: _LeadIdentity,
     lead_id: UUID,
     job_id: UUID,
+    organization_id: UUID,
     evidence_store: PostgresEvidenceStore,
     cost_ledger: PostgresCostLedger,
     spend_guard: LiveSpendGuard,
@@ -1164,7 +1195,7 @@ def _acquire_live_evidence(
     module docstring), so a later rollback cannot un-spend money.
     """
     refs = _live_entity_refs(identity)
-    evidence = _fresh_live_evidence(evidence_store, refs, now)
+    evidence = _fresh_live_evidence(evidence_store, refs, now, organization_id=organization_id)
     scoring = score_evidence(_all_evidence(evidence), now)
 
     called: list[str] = []
@@ -1226,6 +1257,7 @@ def _acquire_live_evidence(
                     status=ProviderStatus.SUCCESS,
                     cost_usd=0.0,
                     latency_ms=0.0,
+                    organization_id=organization_id,
                     lead_id=lead_id,
                     cache_hit=True,
                     suppressed_reason=None if fully_covered else RECENT_PARTIAL,
@@ -1242,7 +1274,9 @@ def _acquire_live_evidence(
         # produce new data" waste this guard exists to stop. Checked before
         # cooldown/budget — a suppressed call should not also consume a
         # budget-allowance read.
-        recent_miss = outcome_guard.recent_miss(provider.name, ref.entity_type, ref.entity_id)
+        recent_miss = outcome_guard.recent_miss(
+            provider.name, ref.entity_type, ref.entity_id, organization_id=organization_id
+        )
         if recent_miss is not None:
             cost_ledger.record_provider_call(
                 idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
@@ -1252,6 +1286,7 @@ def _acquire_live_evidence(
                 status=ProviderStatus.MISS,
                 cost_usd=0.0,
                 latency_ms=0.0,
+                organization_id=organization_id,
                 lead_id=lead_id,
                 cache_hit=True,
                 suppressed_reason=RECENT_MISS,
@@ -1295,6 +1330,7 @@ def _acquire_live_evidence(
             cost_ledger,
             job_id=job_id,
             lead_id=lead_id,
+            organization_id=organization_id,
             provider_name=provider.name,
             ref=ref,
             result=result,
@@ -1305,19 +1341,24 @@ def _acquire_live_evidence(
 
         if result.status is ProviderStatus.SUCCESS and result.fields:
             evidence_store.put_many(
-                Evidence(
-                    entity_type=ref.entity_type,
-                    entity_id=ref.entity_id,
-                    field_name=field_name,
-                    value=value,
-                    source=provider.name,
-                    confidence=result.confidence,
-                    ttl_seconds=ttl_for_field(field_name),
-                    fetched_at=now,
-                )
-                for field_name, value in result.fields.items()
+                (
+                    Evidence(
+                        entity_type=ref.entity_type,
+                        entity_id=ref.entity_id,
+                        field_name=field_name,
+                        value=value,
+                        source=provider.name,
+                        confidence=result.confidence,
+                        ttl_seconds=ttl_for_field(field_name),
+                        fetched_at=now,
+                    )
+                    for field_name, value in result.fields.items()
+                ),
+                organization_id=organization_id,
             )
-            evidence = _fresh_live_evidence(evidence_store, refs, now)
+            evidence = _fresh_live_evidence(
+                evidence_store, refs, now, organization_id=organization_id
+            )
             scoring = score_evidence(_all_evidence(evidence), now)
 
     if stop_reason is None:
@@ -1397,6 +1438,8 @@ def _fresh_live_evidence(
     evidence_store: PostgresEvidenceStore,
     refs: dict[EntityType, _LiveEntityRef],
     now: datetime,
+    *,
+    organization_id: UUID,
 ) -> dict[EntityType, tuple[Evidence, ...]]:
     """Unexpired evidence for each entity this lead resolved, kept apart by type.
 
@@ -1413,7 +1456,11 @@ def _fresh_live_evidence(
     types and a lead's score is a fact about the pair.
     """
     return {
-        entity_type: tuple(evidence_store.get_all_fresh(entity_type, ref.entity_id, now=now))
+        entity_type: tuple(
+            evidence_store.get_all_fresh(
+                entity_type, ref.entity_id, organization_id=organization_id, now=now
+            )
+        )
         for entity_type, ref in refs.items()
     }
 
@@ -1442,6 +1489,7 @@ def _ledger_live_call(
     *,
     job_id: UUID,
     lead_id: UUID,
+    organization_id: UUID,
     provider_name: str,
     ref: _LiveEntityRef,
     result: ProviderResult,
@@ -1468,6 +1516,7 @@ def _ledger_live_call(
         status=result.status,
         cost_usd=result.cost_usd,
         latency_ms=result.latency_ms,
+        organization_id=organization_id,
         lead_id=lead_id,
         cache_hit=False,
         error_kind=error_kind if isinstance(error_kind, str) else None,
@@ -1492,6 +1541,7 @@ def _acquire_evaluation_parallel(
     identity: _LeadIdentity,
     lead_id: UUID,
     job_id: UUID,
+    organization_id: UUID,
     evidence_store: PostgresEvidenceStore,
     cost_ledger: PostgresCostLedger,
     spend_guard: LiveSpendGuard,
@@ -1544,7 +1594,7 @@ def _acquire_evaluation_parallel(
     matched name the receipt already carries.
     """
     refs = _live_entity_refs(identity)
-    evidence = _fresh_live_evidence(evidence_store, refs, now)
+    evidence = _fresh_live_evidence(evidence_store, refs, now, organization_id=organization_id)
 
     called: list[str] = []
     cache_hits: list[str] = []
@@ -1580,13 +1630,16 @@ def _acquire_evaluation_parallel(
                     status=ProviderStatus.SUCCESS,
                     cost_usd=0.0,
                     latency_ms=0.0,
+                    organization_id=organization_id,
                     lead_id=lead_id,
                     cache_hit=True,
                     suppressed_reason=None if fully_covered else RECENT_PARTIAL,
                 )
                 cache_hits.append(provider.name)
             continue
-        recent_miss = outcome_guard.recent_miss(provider.name, ref.entity_type, ref.entity_id)
+        recent_miss = outcome_guard.recent_miss(
+            provider.name, ref.entity_type, ref.entity_id, organization_id=organization_id
+        )
         if recent_miss is not None:
             cost_ledger.record_provider_call(
                 idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
@@ -1596,6 +1649,7 @@ def _acquire_evaluation_parallel(
                 status=ProviderStatus.MISS,
                 cost_usd=0.0,
                 latency_ms=0.0,
+                organization_id=organization_id,
                 lead_id=lead_id,
                 cache_hit=True,
                 suppressed_reason=RECENT_MISS,
@@ -1619,6 +1673,7 @@ def _acquire_evaluation_parallel(
             cost_ledger,
             job_id=job_id,
             lead_id=lead_id,
+            organization_id=organization_id,
             provider_name=provider.name,
             ref=ref,
             result=result,
@@ -1627,19 +1682,24 @@ def _acquire_evaluation_parallel(
             failed.append(provider.name)
         if result.status is ProviderStatus.SUCCESS and result.fields:
             evidence_store.put_many(
-                Evidence(
-                    entity_type=ref.entity_type,
-                    entity_id=ref.entity_id,
-                    field_name=field_name,
-                    value=value,
-                    source=provider.name,
-                    confidence=result.confidence,
-                    ttl_seconds=ttl_for_field(field_name),
-                    fetched_at=now,
-                )
-                for field_name, value in result.fields.items()
+                (
+                    Evidence(
+                        entity_type=ref.entity_type,
+                        entity_id=ref.entity_id,
+                        field_name=field_name,
+                        value=value,
+                        source=provider.name,
+                        confidence=result.confidence,
+                        ttl_seconds=ttl_for_field(field_name),
+                        fetched_at=now,
+                    )
+                    for field_name, value in result.fields.items()
+                ),
+                organization_id=organization_id,
             )
-            evidence = _fresh_live_evidence(evidence_store, refs, now)
+            evidence = _fresh_live_evidence(
+                evidence_store, refs, now, organization_id=organization_id
+            )
 
     # ------------------------------------------------- person phase, concurrent
     pending_estimate = 0.0
@@ -1670,6 +1730,7 @@ def _acquire_evaluation_parallel(
                 status=ProviderStatus.SUCCESS,
                 cost_usd=0.0,
                 latency_ms=0.0,
+                organization_id=organization_id,
                 lead_id=lead_id,
                 cache_hit=True,
                 suppressed_reason=None if fully_covered else RECENT_PARTIAL,
@@ -1684,7 +1745,9 @@ def _acquire_evaluation_parallel(
                 "cost_usd": 0.0,
             }
             continue
-        recent_miss = outcome_guard.recent_miss(provider.name, ref.entity_type, ref.entity_id)
+        recent_miss = outcome_guard.recent_miss(
+            provider.name, ref.entity_type, ref.entity_id, organization_id=organization_id
+        )
         if recent_miss is not None:
             cost_ledger.record_provider_call(
                 idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
@@ -1694,6 +1757,7 @@ def _acquire_evaluation_parallel(
                 status=ProviderStatus.MISS,
                 cost_usd=0.0,
                 latency_ms=0.0,
+                organization_id=organization_id,
                 lead_id=lead_id,
                 cache_hit=True,
                 suppressed_reason=RECENT_MISS,
@@ -1769,6 +1833,7 @@ def _acquire_evaluation_parallel(
             cost_ledger,
             job_id=job_id,
             lead_id=lead_id,
+            organization_id=organization_id,
             provider_name=provider.name,
             ref=ref,
             result=result,
@@ -1777,17 +1842,20 @@ def _acquire_evaluation_parallel(
             failed.append(provider.name)
         if result.status is ProviderStatus.SUCCESS and result.fields:
             evidence_store.put_many(
-                Evidence(
-                    entity_type=ref.entity_type,
-                    entity_id=ref.entity_id,
-                    field_name=field_name,
-                    value=value,
-                    source=provider.name,
-                    confidence=result.confidence,
-                    ttl_seconds=ttl_for_field(field_name),
-                    fetched_at=now,
-                )
-                for field_name, value in result.fields.items()
+                (
+                    Evidence(
+                        entity_type=ref.entity_type,
+                        entity_id=ref.entity_id,
+                        field_name=field_name,
+                        value=value,
+                        source=provider.name,
+                        confidence=result.confidence,
+                        ttl_seconds=ttl_for_field(field_name),
+                        fetched_at=now,
+                    )
+                    for field_name, value in result.fields.items()
+                ),
+                organization_id=organization_id,
             )
         person_fields[provider.name] = dict(result.fields)
         matched = result.raw.get("matched_identity")
@@ -1824,7 +1892,7 @@ def _acquire_evaluation_parallel(
         # may a genuine caller bug fail the job into the ordinary retry path.
         raise bug
 
-    evidence = _fresh_live_evidence(evidence_store, refs, now)
+    evidence = _fresh_live_evidence(evidence_store, refs, now, organization_id=organization_id)
     scoring = score_evidence(_all_evidence(evidence), now)
 
     compared = {
@@ -2029,6 +2097,7 @@ def _build_live_handlers(
                     identity=identity,
                     lead_id=job.lead_id,
                     job_id=job.job_id,
+                    organization_id=identity.organization_id,
                     evidence_store=evidence_store,
                     cost_ledger=cost_ledger,
                     spend_guard=spend_guard,
@@ -2042,6 +2111,7 @@ def _build_live_handlers(
                     identity=identity,
                     lead_id=job.lead_id,
                     job_id=job.job_id,
+                    organization_id=identity.organization_id,
                     evidence_store=evidence_store,
                     cost_ledger=cost_ledger,
                     spend_guard=spend_guard,
@@ -2066,6 +2136,7 @@ def _build_live_handlers(
                 cur.execute(
                     _INSERT_SCORE,
                     {
+                        "organization_id": identity.organization_id,
                         "lead_id": job.lead_id,
                         "total_score": scoring.breakdown.total_score,
                         "decision_confidence": confidence,
@@ -2076,6 +2147,7 @@ def _build_live_handlers(
                 cur.execute(
                     _INSERT_DECISION_RECEIPT,
                     {
+                        "organization_id": identity.organization_id,
                         "lead_id": job.lead_id,
                         "decision": str(scoring.decision),
                         "autonomous": autonomous,
@@ -2119,6 +2191,7 @@ def _build_live_handlers(
                 _finalize_decision(
                     ctx.conn,
                     lead_id=job.lead_id,
+                    organization_id=identity.organization_id,
                     version=version,
                     decision=scoring.decision,
                     autonomous=model_autonomous,

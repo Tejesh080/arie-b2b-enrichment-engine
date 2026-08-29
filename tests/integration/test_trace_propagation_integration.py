@@ -23,7 +23,7 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind, StatusCode
 from psycopg_pool import ConnectionPool
-from tests.integration.conftest import IngestCleanup, source_for
+from tests.integration.conftest import IngestCleanup, authorize_app, source_for
 
 from arie.api.main import AppState, create_app
 from arie.config import ObservabilityConfig
@@ -203,6 +203,7 @@ def test_http_server_span_and_worker_span_share_one_trace(
     )
     domain, email = _identity(cleanup_ingest)
     app = create_app(state=app_state)
+    authorize_app(app)
 
     try:
         with TestClient(app) as client:
