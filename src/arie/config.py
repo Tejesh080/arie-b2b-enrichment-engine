@@ -248,6 +248,17 @@ class LiveProviderConfig:
     an exact, provider-reported cost the way ``arie.ledger.store`` treats a
     vendor's own billed figure."""
 
+    min_request_interval_seconds: float = field(
+        default_factory=lambda: _env_float("ABSTRACT_COMPANY_MIN_REQUEST_INTERVAL_SECONDS", 1.0)
+    )
+    """Client-side pacing between successive calls from one adapter instance
+    — see ``arie.live.rate_limit.MinIntervalPacer``. **Not** a figure taken
+    from Abstract's documentation: Abstract publishes a monthly volume cap
+    (100 requests/month, free tier) and no requests-per-second number at all,
+    so this default is a conservative estimate chosen after the 2026-08-29
+    abstract-hunter-live-1 experiment hit a real ``rate_limited`` on the fifth
+    of five unpaced sequential calls. ``0`` disables pacing entirely."""
+
     @property
     def configured(self) -> bool:
         return bool(self.api_key)
@@ -458,6 +469,33 @@ class LiveStrategyConfig:
 
 
 @dataclass(frozen=True)
+class LiveOutcomeCacheConfig:
+    """How long a *settled* provider outcome — a miss, or a success that left
+    some declared field genuinely unmapped — is trusted without asking again.
+
+    Distinct from ``ttl_for_field`` (``arie.evidence.ttl_policy``), which
+    governs how long an actual *value* stays fresh once a provider supplies
+    one. This governs the case that policy cannot: a provider that answered
+    and had *nothing new to add* for one or more declared fields leaves no
+    evidence row to expire, so without this a moment-later identical request
+    re-buys the same answer forever. See ``arie.live.outcome_cache`` for the
+    guard that reads this.
+    """
+
+    miss_ttl_seconds: float = field(
+        default_factory=lambda: _env_float("PROVIDER_MISS_CACHE_TTL_SECONDS", 30.0)
+    )
+    """A provider that found nothing for this entity is not re-asked for this
+    long. Conservative and short by design (30s default): a miss is far more
+    likely to reflect a real, durable "this vendor doesn't have this record"
+    than a quota wall (which has its own, much longer,
+    ``LiveStrategyConfig.quota_cooldown_seconds`` cooldown) — but it is still
+    a *belief*, not a fact, and a short window bounds how long ARIE can be
+    wrong about a vendor that just started indexing a new record. ``0``
+    disables miss suppression entirely (every request re-asks)."""
+
+
+@dataclass(frozen=True)
 class LiveBudgetConfig:
     """Hard spend ceilings for ``PROVIDER_MODE=live`` (Live V1 Foundation, Phase 6).
 
@@ -588,4 +626,5 @@ LIVE_PROVIDER = LiveProviderConfig()
 APOLLO_PERSON = ApolloPersonConfig()
 HUNTER = HunterConfig()
 LIVE_STRATEGY = LiveStrategyConfig()
+LIVE_OUTCOME_CACHE = LiveOutcomeCacheConfig()
 LIVE_BUDGET = LiveBudgetConfig()

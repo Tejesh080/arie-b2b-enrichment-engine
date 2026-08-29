@@ -285,6 +285,7 @@ class ReceiptProviderCallResponse(BaseModel):
     cost_usd: Decimal
     latency_ms: int | None
     cache_hit: bool
+    suppressed_reason: str | None = None
 
 
 class ReceiptProvidersResponse(BaseModel):

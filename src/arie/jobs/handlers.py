@@ -77,7 +77,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -101,10 +101,18 @@ from arie.core.types import (
 from arie.evidence.store import PostgresEvidenceStore
 from arie.evidence.ttl_policy import ttl_for_field
 from arie.identity.normalize import domain_from_email, normalize_domain, normalize_email
+from arie.identity.validation import (
+    MISMATCH,
+    IdentityValidation,
+    RequestedIdentity,
+    ReturnedIdentity,
+    validate_identity,
+)
 from arie.ledger.store import PostgresCostLedger
 from arie.live.budget import LiveSpendGuard
 from arie.live.cooldown import PROVIDER_UNAVAILABLE, ProviderCooldownGuard
 from arie.live.evaluation import classify_agreement, overall_agreement
+from arie.live.outcome_cache import RECENT_MISS, RECENT_PARTIAL, ProviderOutcomeGuard
 from arie.live.providers import acquisition_order
 from arie.live.safety import (
     LIVE_GUARD_REASON,
@@ -935,6 +943,12 @@ class _LiveAcquisitionOutcome:
     ``provider_unavailable`` stop reason."""
     failed: tuple[str, ...] = ()
     cost_usd: float = 0.0
+    identity_findings: tuple[dict[str, Any], ...] = ()
+    """One entry per person-provider call whose match was checked against the
+    requested identity — ``{"provider", "verdict", "reasons"}``. Present
+    regardless of verdict (VERIFIED and PROBABLE findings are worth an audit
+    trail too, not just MISMATCH), so the receipt can always answer "was this
+    person checked, and against what". See ``_validate_person_match``."""
 
     def audit(self) -> dict[str, Any]:
         """Span/event-safe summary — names and one number, no payloads."""
@@ -948,7 +962,61 @@ class _LiveAcquisitionOutcome:
             "failed": list(self.failed),
             "cost_usd": self.cost_usd,
             "stop_reason": self.stop_reason,
+            "identity_findings": list(self.identity_findings),
         }
+
+
+def _requested_identity(identity: _LeadIdentity) -> RequestedIdentity:
+    return RequestedIdentity(
+        email=identity.canonical_email,
+        company_domain=identity.canonical_domain,
+        full_name=identity.full_name,
+    )
+
+
+def _validate_person_match(
+    identity: _LeadIdentity, provider: EnrichmentProvider, result: ProviderResult
+) -> tuple[ProviderResult, IdentityValidation | None]:
+    """Check a successful person-provider result against the requested
+    identity, and redact its fields if the match is a ``MISMATCH``.
+
+    Called on every person-provider result immediately after ``fetch``, in
+    both acquisition loops, before evidence is ever persisted — this is the
+    one place that decides whether ``title_seniority``/``title_function``
+    are allowed to influence a score. A company provider, a non-success
+    result, or a success carrying no ``matched_identity`` audit (nothing to
+    compare) passes through unchanged with no finding: this function only
+    ever *removes* fields, never invents or upgrades a verdict from
+    incomplete data.
+
+    The call itself is always billed and ledgered normally — a MISMATCH means
+    "do not score this," not "this call didn't happen" — and the raw
+    ``matched_identity``/``normalization`` audit already carried on
+    ``result.raw`` is untouched, so a reviewer can still see exactly who the
+    provider matched.
+    """
+    if provider.entity_type != "person" or result.status is not ProviderStatus.SUCCESS:
+        return result, None
+    matched = result.raw.get("matched_identity")
+    if not isinstance(matched, dict):
+        return result, None
+
+    validation = validate_identity(
+        _requested_identity(identity),
+        ReturnedIdentity(
+            full_name=matched.get("full_name"),
+            email=matched.get("email"),
+            employer_domain=matched.get("employer_domain"),
+            employer_name=matched.get("employer_name"),
+        ),
+    )
+    if validation.verdict != MISMATCH:
+        return result, validation
+    # Contested, not discarded: raw/matched_identity/cost/status all survive
+    # on the (otherwise unchanged) result for ledgering and audit — only the
+    # scoreable fields are cleared, per the module's "keep the record,
+    # reject the score" rule.
+    return replace(result, fields={}), validation
 
 
 def _acquire_live_evidence(
@@ -961,6 +1029,7 @@ def _acquire_live_evidence(
     cost_ledger: PostgresCostLedger,
     spend_guard: LiveSpendGuard,
     cooldown_guard: ProviderCooldownGuard,
+    outcome_guard: ProviderOutcomeGuard,
     model: ConfidenceModel,
     now: datetime,
 ) -> _LiveAcquisitionOutcome:
@@ -1020,6 +1089,7 @@ def _acquire_live_evidence(
     failed: list[str] = []
     cost_usd = 0.0
     stop_reason: str | None = None
+    identity_findings: list[dict[str, Any]] = []
 
     for index, provider in enumerate(providers):
         stop_reason = _enough_evidence(
@@ -1036,22 +1106,33 @@ def _acquire_live_evidence(
 
         held_rows = evidence.get(ref.entity_type, ())
         held = {item.field_name for item in held_rows}
-        if set(provider.provides_fields) <= held:
-            # Everything this provider sells is already known. HOW it is
-            # already known decides what gets recorded, and the distinction
-            # only exists now that two person providers sell the same fields:
+        own_rows = [item for item in held_rows if item.source == provider.name]
+        if set(provider.provides_fields) <= held or own_rows:
+            # Everything this provider sells is already known, OR this
+            # provider itself already answered with *some* of its declared
+            # fields (a partial success — Hunter's `title_function` left
+            # UNKNOWN is still a real, paid-for answer, not "unasked"). HOW
+            # it is already known decides what gets recorded:
             #
             # * Some held row came from THIS provider — a true cache hit
             #   (this lead, or an earlier one, already paid this vendor for
-            #   this fact). Recorded as the zero-cost cache-hit ledger row
-            #   the handoff requires: cache hits are recorded, never skipped.
-            # * Every held row came from OTHER sources — the provider is
-            #   simply redundant for coverage. No ledger row: no call was
-            #   made and nothing of this vendor cache was served, so a
-            #   "cache_hit" row here would attribute another vendor evidence
-            #   to this one. It lands in the audit trail instead.
-            own_sources = {item.source for item in held_rows}
-            if provider.name in own_sources:
+            #   this fact), full or partial. Recorded as a zero-cost ledger
+            #   row rather than silently skipped — handoff item #5 — so a
+            #   receipt can show ARIE declining to re-buy a fact. A partial
+            #   reuse is marked `suppressed_reason=recent_partial` so the
+            #   ledger stays honest about *why* nothing was billed: it is
+            #   not the same claim as "every field this provider sells was
+            #   already held."
+            # * Every held row came from OTHER sources and this provider has
+            #   none of its own — it is simply redundant for coverage. No
+            #   ledger row: no call was made and nothing of this vendor's
+            #   own cache was served, so a ledger row here would attribute
+            #   another vendor's evidence to this one. It lands in the audit
+            #   trail instead.
+            if own_rows:
+                fully_covered = set(provider.provides_fields) <= {
+                    item.field_name for item in own_rows
+                }
                 cost_ledger.record_provider_call(
                     idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
                     provider=provider.name,
@@ -1062,18 +1143,44 @@ def _acquire_live_evidence(
                     latency_ms=0.0,
                     lead_id=lead_id,
                     cache_hit=True,
+                    suppressed_reason=None if fully_covered else RECENT_PARTIAL,
                 )
                 cache_hits.append(provider.name)
             else:
                 redundant.append(provider.name)
             continue
 
+        # A recent, still-fresh MISS for this exact provider+entity: nothing
+        # is held (own_rows is empty, above) because a miss leaves no
+        # evidence row to hold, but re-asking a moment later is exactly the
+        # "UNKNOWN is not evidence that another identical request will
+        # produce new data" waste this guard exists to stop. Checked before
+        # cooldown/budget — a suppressed call should not also consume a
+        # budget-allowance read.
+        recent_miss = outcome_guard.recent_miss(provider.name, ref.entity_type, ref.entity_id)
+        if recent_miss is not None:
+            cost_ledger.record_provider_call(
+                idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
+                provider=provider.name,
+                entity_type=ref.entity_type,
+                entity_id=ref.entity_id,
+                status=ProviderStatus.MISS,
+                cost_usd=0.0,
+                latency_ms=0.0,
+                lead_id=lead_id,
+                cache_hit=True,
+                suppressed_reason=RECENT_MISS,
+            )
+            cache_hits.append(provider.name)
+            continue
+
         # Cooldown before budget: a provider whose quota is spent should not
         # consume a budget-allowance ledger read per lead, and the two skips
         # mean different things — "the account cannot afford it" versus "the
-        # vendor cannot sell it right now". Cache/redundant checks stay above
-        # this line on purpose: serving already-held evidence during a
-        # cooldown is free and correct.
+        # vendor cannot sell it right now". Cache/redundant/suppression
+        # checks stay above this line on purpose: serving already-held
+        # evidence, or recognising a still-fresh miss, during a cooldown is
+        # free and correct.
         if cooldown_guard.cooling_down_until(provider.name) is not None:
             unavailable.append(provider.name)
             continue
@@ -1088,6 +1195,15 @@ def _acquire_live_evidence(
             break
 
         result = provider.fetch(ref.as_entity())
+        result, validation = _validate_person_match(identity, provider, result)
+        if validation is not None:
+            identity_findings.append(
+                {
+                    "provider": provider.name,
+                    "verdict": validation.verdict,
+                    "reasons": list(validation.reasons),
+                }
+            )
         called.append(provider.name)
         cost_usd += result.cost_usd
         _ledger_live_call(
@@ -1142,6 +1258,7 @@ def _acquire_live_evidence(
         unavailable=tuple(unavailable),
         failed=tuple(failed),
         cost_usd=cost_usd,
+        identity_findings=tuple(identity_findings),
     )
 
 
@@ -1294,6 +1411,7 @@ def _acquire_evaluation_parallel(
     cost_ledger: PostgresCostLedger,
     spend_guard: LiveSpendGuard,
     cooldown_guard: ProviderCooldownGuard,
+    outcome_guard: ProviderOutcomeGuard,
     now: datetime,
 ) -> tuple[_LiveAcquisitionOutcome, dict[str, Any]]:
     """The ``evaluation_parallel`` strategy: measure the person providers
@@ -1363,8 +1481,12 @@ def _acquire_evaluation_parallel(
             unreachable.append(provider.name)
             continue
         held_rows = evidence.get(ref.entity_type, ())
-        if set(provider.provides_fields) <= {item.field_name for item in held_rows}:
-            if provider.name in {item.source for item in held_rows}:
+        own_rows = [item for item in held_rows if item.source == provider.name]
+        if set(provider.provides_fields) <= {item.field_name for item in held_rows} or own_rows:
+            if own_rows:
+                fully_covered = set(provider.provides_fields) <= {
+                    item.field_name for item in own_rows
+                }
                 cost_ledger.record_provider_call(
                     idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
                     provider=provider.name,
@@ -1375,8 +1497,25 @@ def _acquire_evaluation_parallel(
                     latency_ms=0.0,
                     lead_id=lead_id,
                     cache_hit=True,
+                    suppressed_reason=None if fully_covered else RECENT_PARTIAL,
                 )
                 cache_hits.append(provider.name)
+            continue
+        recent_miss = outcome_guard.recent_miss(provider.name, ref.entity_type, ref.entity_id)
+        if recent_miss is not None:
+            cost_ledger.record_provider_call(
+                idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
+                provider=provider.name,
+                entity_type=ref.entity_type,
+                entity_id=ref.entity_id,
+                status=ProviderStatus.MISS,
+                cost_usd=0.0,
+                latency_ms=0.0,
+                lead_id=lead_id,
+                cache_hit=True,
+                suppressed_reason=RECENT_MISS,
+            )
+            cache_hits.append(provider.name)
             continue
         if cooldown_guard.cooling_down_until(provider.name) is not None:
             unavailable.append(provider.name)
@@ -1427,11 +1566,17 @@ def _acquire_evaluation_parallel(
             continue
         held_rows = evidence.get(ref.entity_type, ())
         own_rows = [item for item in held_rows if item.source == provider.name]
-        if set(provider.provides_fields) <= {item.field_name for item in own_rows}:
-            # This provider's own prior answer is still fresh — Phase 12's
-            # "never call twice for the same unchanged identity". Served from
-            # cache and it still participates in the comparison: a cached
-            # answer is that provider's answer.
+        if own_rows:
+            # This provider's own prior answer is still fresh — full or
+            # partial. A partial answer (some declared fields genuinely
+            # unmapped, e.g. Hunter's `title_function` left UNKNOWN) is still
+            # this provider's real, paid-for answer; requiring every declared
+            # field before treating it as "already answered" is exactly the
+            # bug the 2026-08-29 Jason Fried cache test found — it re-bought
+            # the same partial answer a moment later. Served from cache
+            # either way and it still participates in the comparison: a
+            # cached answer is that provider's answer.
+            fully_covered = set(provider.provides_fields) <= {item.field_name for item in own_rows}
             cost_ledger.record_provider_call(
                 idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
                 provider=provider.name,
@@ -1442,6 +1587,7 @@ def _acquire_evaluation_parallel(
                 latency_ms=0.0,
                 lead_id=lead_id,
                 cache_hit=True,
+                suppressed_reason=None if fully_covered else RECENT_PARTIAL,
             )
             cache_hits.append(provider.name)
             cached_fields = {item.field_name: item.value for item in own_rows}
@@ -1450,6 +1596,28 @@ def _acquire_evaluation_parallel(
                 "served_from": "cache",
                 "status": str(ProviderStatus.SUCCESS),
                 "fields": cached_fields,
+                "cost_usd": 0.0,
+            }
+            continue
+        recent_miss = outcome_guard.recent_miss(provider.name, ref.entity_type, ref.entity_id)
+        if recent_miss is not None:
+            cost_ledger.record_provider_call(
+                idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
+                provider=provider.name,
+                entity_type=ref.entity_type,
+                entity_id=ref.entity_id,
+                status=ProviderStatus.MISS,
+                cost_usd=0.0,
+                latency_ms=0.0,
+                lead_id=lead_id,
+                cache_hit=True,
+                suppressed_reason=RECENT_MISS,
+            )
+            cache_hits.append(provider.name)
+            person_records[provider.name] = {
+                "served_from": "suppressed_recent_miss",
+                "status": str(ProviderStatus.MISS),
+                "fields": {},
                 "cost_usd": 0.0,
             }
             continue
@@ -1496,11 +1664,20 @@ def _acquire_evaluation_parallel(
     collected.sort(key=lambda item: position[item[0].name])
 
     bug: BaseException | None = None
+    identity_findings: list[dict[str, Any]] = []
     for provider, ref, fetched, raised in collected:
         if raised is not None or fetched is None:
             bug = bug if bug is not None else raised
             continue
-        result = fetched
+        result, validation = _validate_person_match(identity, provider, fetched)
+        if validation is not None:
+            identity_findings.append(
+                {
+                    "provider": provider.name,
+                    "verdict": validation.verdict,
+                    "reasons": list(validation.reasons),
+                }
+            )
         called.append(provider.name)
         cost_usd += result.cost_usd
         _ledger_live_call(
@@ -1545,6 +1722,16 @@ def _acquire_evaluation_parallel(
         normalization = result.raw.get("normalization")
         if isinstance(normalization, dict) and normalization.get("unmapped"):
             record["unmapped"] = normalization["unmapped"]
+        if validation is not None:
+            # Present for VERIFIED/PROBABLE too, not only MISMATCH — the
+            # receipt should always be able to answer "was this person
+            # checked, and against what," not just flag the bad case.
+            record["identity_validation"] = {
+                "verdict": validation.verdict,
+                "reasons": list(validation.reasons),
+            }
+            if validation.verdict == MISMATCH:
+                record["person_evidence_usable_for_scoring"] = False
         person_records[provider.name] = record
 
     if bug is not None:
@@ -1584,6 +1771,7 @@ def _acquire_evaluation_parallel(
         unavailable=tuple(unavailable),
         failed=tuple(failed),
         cost_usd=cost_usd,
+        identity_findings=tuple(identity_findings),
     )
     evaluation = {
         "strategy": EVALUATION_PARALLEL,
@@ -1724,6 +1912,7 @@ def _build_live_handlers(
         pool, LIVE_BUDGET.for_evaluation() if strategy == EVALUATION_PARALLEL else None
     )
     cooldown_guard = ProviderCooldownGuard(pool)
+    outcome_guard = ProviderOutcomeGuard(pool)
     model = resolved_runtime.policy.model
     autonomy_allowed = autonomy_allowed_for("live")
     policy_name = (
@@ -1758,6 +1947,7 @@ def _build_live_handlers(
                     cost_ledger=cost_ledger,
                     spend_guard=spend_guard,
                     cooldown_guard=cooldown_guard,
+                    outcome_guard=outcome_guard,
                     now=datetime.now(UTC),
                 )
             else:
@@ -1770,6 +1960,7 @@ def _build_live_handlers(
                     cost_ledger=cost_ledger,
                     spend_guard=spend_guard,
                     cooldown_guard=cooldown_guard,
+                    outcome_guard=outcome_guard,
                     model=model,
                     now=datetime.now(UTC),
                 )
@@ -1811,14 +2002,28 @@ def _build_live_handlers(
                         "scorer_version": scoring.breakdown.model_version,
                         "confidence_calibration": model.method,
                         "evidence_snapshot": Jsonb(
-                            _evidence_snapshot(scoring)
-                            if evaluation is None
-                            # The evaluation record is frozen into the snapshot
-                            # (additively — readers index known keys) so an
-                            # evaluation receipt carries its own comparison:
-                            # per-provider results and the agreement verdicts,
-                            # identified by policy_name above.
-                            else {**_evidence_snapshot(scoring), "evaluation": evaluation}
+                            {
+                                **_evidence_snapshot(scoring),
+                                # Present for both strategies whenever a
+                                # person provider's match was checked — the
+                                # evaluation record (below) additionally
+                                # carries it per-provider for
+                                # evaluation_parallel, but a receipt reader
+                                # should not have to know which strategy ran
+                                # to find "was this person verified."
+                                **(
+                                    {"identity_findings": list(acquisition.identity_findings)}
+                                    if acquisition.identity_findings
+                                    else {}
+                                ),
+                                # The evaluation record is frozen into the
+                                # snapshot (additively — readers index known
+                                # keys) so an evaluation receipt carries its
+                                # own comparison: per-provider results and the
+                                # agreement verdicts, identified by
+                                # policy_name above.
+                                **({"evaluation": evaluation} if evaluation is not None else {}),
+                            }
                         ),
                     },
                 )

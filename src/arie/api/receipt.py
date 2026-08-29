@@ -197,6 +197,13 @@ class ReceiptProviderCall:
     cost_usd: Decimal
     latency_ms: int | None
     cache_hit: bool
+    suppressed_reason: str | None = None
+    """``None`` for a real call and for an ordinary evidence-cache hit (an
+    actual field value, reused). ``'recent_miss'``/``'recent_partial'``
+    (migration 0011) when this zero-cost row instead means "a recent settled
+    outcome already answered this, so nothing was asked" — the distinction
+    ``arie.live.outcome_cache`` exists to keep truthful: a suppressed call
+    reused a *fact that nothing new was found*, not a value."""
 
 
 @dataclass(frozen=True)
@@ -271,7 +278,7 @@ _SELECT_DECISION_RECEIPT = """
 """
 
 _SELECT_PROVIDER_CALLS = """
-    SELECT provider, status, cost_usd, latency_ms, cache_hit
+    SELECT provider, status, cost_usd, latency_ms, cache_hit, suppressed_reason
     FROM provider_calls
     WHERE lead_id = %(lead_id)s
     ORDER BY requested_at
@@ -305,6 +312,7 @@ def _provider_calls(conn: psycopg.Connection, lead_id: UUID) -> tuple[ReceiptPro
             cost_usd=row["cost_usd"] if row["cost_usd"] is not None else Decimal(0),
             latency_ms=row["latency_ms"],
             cache_hit=row["cache_hit"],
+            suppressed_reason=row["suppressed_reason"],
         )
         for row in rows
     )

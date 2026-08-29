@@ -54,11 +54,12 @@ _RECORD_PROVIDER_CALL = """
     INSERT INTO provider_calls (
         lead_id, provider, entity_type, entity_id, idempotency_key,
         completed_at, latency_ms, cost_usd, status, cache_hit, raw_response_ref,
-        error_kind, credits_used, cost_basis
+        error_kind, credits_used, cost_basis, suppressed_reason
     ) VALUES (
         %(lead_id)s, %(provider)s, %(entity_type)s, %(entity_id)s, %(idempotency_key)s,
         %(completed_at)s, %(latency_ms)s, %(cost_usd)s, %(status)s, %(cache_hit)s,
-        %(raw_response_ref)s, %(error_kind)s, %(credits_used)s, %(cost_basis)s
+        %(raw_response_ref)s, %(error_kind)s, %(credits_used)s, %(cost_basis)s,
+        %(suppressed_reason)s
     )
     ON CONFLICT (idempotency_key) DO UPDATE
         SET idempotency_key = provider_calls.idempotency_key
@@ -168,6 +169,7 @@ class PostgresCostLedger:
         error_kind: str | None = None,
         credits_used: float | Decimal | None = None,
         cost_basis: str | None = None,
+        suppressed_reason: str | None = None,
     ) -> LedgerWrite:
         """Record one provider call. Idempotent on `idempotency_key`.
 
@@ -187,6 +189,13 @@ class PostgresCostLedger:
         hit zeroes `credits_used` the same way it zeroes cost: nothing was
         consumed, and recording the would-have-been figure would double-count
         the original call's.
+
+        `suppressed_reason` (0011) distinguishes a call skipped because a
+        *recent settled outcome* (a miss, or a partial success) already
+        answered the question from an ordinary evidence-cache hit (an actual
+        field value, reused) — both are zero-cost, but only one of them
+        reused a value. ``None`` for every real call and for a plain
+        evidence-cache hit; see ``arie.live.outcome_cache``.
         """
         billed_cost = Decimal(0) if cache_hit else usd(cost_usd)
         billed_latency = 0 if cache_hit else int(latency_ms)
@@ -221,6 +230,7 @@ class PostgresCostLedger:
                         if cache_hit or credits_used is None
                         else Decimal(str(credits_used)),
                         "cost_basis": None if cache_hit else cost_basis,
+                        "suppressed_reason": suppressed_reason,
                     },
                 )
                 row = cur.fetchone()
