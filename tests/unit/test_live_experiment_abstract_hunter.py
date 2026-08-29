@@ -16,6 +16,7 @@ from pathlib import Path
 from scripts.live_experiment_abstract_hunter import (
     SHARED_DB_NAME,
     _db_identity,
+    _ingest_command,
     _load_identities_from_file,
     _run_preflight,
 )
@@ -104,6 +105,50 @@ def test_load_identities_from_file_excludes_low_quality_automatically(
     assert len(identities) == 1
     assert identities[0]["email"] == "ada@example.com"
     assert all(row["email"] != "ahsan@marakor.com" for row in identities)
+
+
+def test_ingest_command_carries_full_name_through() -> None:
+    """The validation-20 fix: an identity loaded from --identities-file has a
+    full_name, and it must reach LeadIngestCommand — that's the only way
+    arie.identity.validation gets anything to compare Hunter's
+    matched_identity against."""
+    identity = {
+        "email": "patrick@stripe.com",
+        "domain": "stripe.com",
+        "company_name": "Stripe",
+        "expected_title": "Co-founder & CEO",
+        "full_name": "Patrick Collison",
+        "validation_id": "v02",
+        "ground_truth_quality": "MEDIUM",
+    }
+
+    command = _ingest_command(
+        identity, source="live-experiment-abstract-hunter", external_ref="r:0"
+    )
+
+    assert command.full_name == "Patrick Collison"
+    assert command.email == "patrick@stripe.com"
+    assert command.company_domain == "stripe.com"
+    assert command.company_name == "Stripe"
+    assert command.source == "live-experiment-abstract-hunter"
+    assert command.external_ref == "r:0"
+    assert command.is_shadow is False
+
+
+def test_ingest_command_normalizes_a_missing_full_name_to_none() -> None:
+    """The original hardcoded five-identity list has no full_name key at all
+    — .get(...) returns None, and an empty-string default from a dataset row
+    must normalize to None too, not pass a falsy-but-not-None value through."""
+    no_key = {
+        "email": "jason@37signals.com",
+        "domain": "37signals.com",
+        "company_name": "37signals",
+    }
+    empty_string = {**no_key, "full_name": ""}
+
+    for identity in (no_key, empty_string):
+        command = _ingest_command(identity, source="s", external_ref="r")
+        assert command.full_name is None
 
 
 def test_db_identity_parses_host_port_dbname() -> None:

@@ -215,6 +215,35 @@ def _result_to_dict(result: ProviderResult | None) -> dict[str, Any] | None:
     }
 
 
+def _ingest_command(
+    identity: dict[str, str], *, source: str, external_ref: str
+) -> LeadIngestCommand:
+    """Builds the ``LeadIngestCommand`` for one identity, carrying its
+    ``full_name`` through when the identity dict has one.
+
+    This is the fix for the gap the validation-20 real run exposed: without a
+    requested ``full_name``, ``arie.identity.validation.validate_identity``
+    (already correct — see ``tests/unit/test_identity_validation.py``) has
+    nothing to compare a person-provider's ``matched_identity`` against, so a
+    same-domain wrong-person match (Patrick Bosmans, not Patrick Collison, at
+    ``patrick@stripe.com``) reads no worse than PROBABLE and its fields stay
+    scoreable. ``identity.get("full_name")`` is ``""``/absent for the
+    hardcoded five-identity ``IDENTITIES`` list (unchanged, no name on file
+    there) and the real name for anything loaded via ``--identities-file`` —
+    ``or None`` normalizes an empty string to ``None`` rather than passing a
+    falsy-but-not-``None`` value through to identity resolution.
+    """
+    return LeadIngestCommand(
+        source=source,
+        email=identity["email"],
+        external_ref=external_ref,
+        company_domain=identity["domain"],
+        company_name=identity["company_name"],
+        full_name=identity.get("full_name") or None,
+        is_shadow=False,
+    )
+
+
 def _load_identities_from_file(path: Path) -> tuple[list[dict[str, str]], int]:
     """Loads HIGH/MEDIUM identities from a Phase-1 validation dataset JSON.
 
@@ -562,13 +591,10 @@ def main() -> int:
             lead_ids: list[UUID] = []
             for index, identity in enumerate(identities):
                 with state.pool.connection() as conn:
-                    command = LeadIngestCommand(
+                    command = _ingest_command(
+                        identity,
                         source="live-experiment-abstract-hunter",
-                        email=identity["email"],
                         external_ref=f"{run_id}:{index}",
-                        company_domain=identity["domain"],
-                        company_name=identity["company_name"],
-                        is_shadow=False,
                     )
                     result = ingest_lead(
                         conn, resolver=state.resolver, queue=state.queue, command=command
@@ -596,13 +622,10 @@ def main() -> int:
             abstract_calls_before = abstract.call_count(cache_identity["domain"])
             hunter_calls_before = hunter.call_count(cache_identity["email"])
             with state.pool.connection() as conn:
-                command = LeadIngestCommand(
+                command = _ingest_command(
+                    cache_identity,
                     source="live-experiment-abstract-hunter",
-                    email=cache_identity["email"],
                     external_ref=f"{run_id}:cache-test",
-                    company_domain=cache_identity["domain"],
-                    company_name=cache_identity["company_name"],
-                    is_shadow=False,
                 )
                 cache_result = ingest_lead(
                     conn, resolver=state.resolver, queue=state.queue, command=command
