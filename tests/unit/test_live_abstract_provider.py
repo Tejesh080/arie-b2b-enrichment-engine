@@ -263,6 +263,79 @@ def test_rate_limit_is_free_and_not_a_miss() -> None:
     assert result.raw["error_kind"] == "rate_limited"
 
 
+# ------------------------------------------------------------ client-side pacing --
+
+
+def test_fetch_waits_on_its_pacer_before_every_call() -> None:
+    """The wiring, not the pacer's own arithmetic (see test_rate_limit.py):
+    every fetch must consult its pacer, and it must do so before the request,
+    not after."""
+    waited = []
+
+    class _RecordingPacer:
+        def wait(self) -> None:
+            waited.append(True)
+
+        def note_retry_after(self, seconds: float) -> None:  # pragma: no cover - unused here
+            pass
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: _json_response(200, {})(request))
+    )
+    provider = AbstractCompanyEnrichmentProvider(
+        config=_config(),
+        client=client,
+        pacer=_RecordingPacer(),  # type: ignore[arg-type]
+    )
+    provider.fetch(_entity())
+    provider.fetch(_entity())
+    assert waited == [True, True]
+
+
+def test_a_429_with_retry_after_feeds_the_pacer() -> None:
+    calls: list[float] = []
+
+    class _RecordingPacer:
+        def wait(self) -> None:
+            pass
+
+        def note_retry_after(self, seconds: float) -> None:
+            calls.append(seconds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": "slow down"}, headers={"Retry-After": "7"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    provider = AbstractCompanyEnrichmentProvider(
+        config=_config(),
+        client=client,
+        pacer=_RecordingPacer(),  # type: ignore[arg-type]
+    )
+    provider.fetch(_entity())
+    assert calls == [7.0]
+
+
+def test_a_429_with_no_retry_after_header_does_not_touch_the_pacers_hint() -> None:
+    calls: list[float] = []
+
+    class _RecordingPacer:
+        def wait(self) -> None:
+            pass
+
+        def note_retry_after(self, seconds: float) -> None:
+            calls.append(seconds)
+
+    provider = AbstractCompanyEnrichmentProvider(
+        config=_config(),
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda r: httpx.Response(429, json={"error": "x"}))
+        ),
+        pacer=_RecordingPacer(),  # type: ignore[arg-type]
+    )
+    provider.fetch(_entity())
+    assert calls == []
+
+
 def test_insufficient_credits_is_free_and_not_a_miss() -> None:
     provider = _provider_with(_json_response(422, {"error": "insufficient credits"}))
     result = provider.fetch(_entity())

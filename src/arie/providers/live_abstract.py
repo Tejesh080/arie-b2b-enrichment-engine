@@ -49,13 +49,14 @@ message.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
 from arie.config import LIVE_PROVIDER, LiveProviderConfig
 from arie.core.types import Entity, EntityType, ProviderResult, ProviderStatus
+from arie.live.rate_limit import MinIntervalPacer
 from arie.normalization.contract import NormalizationReport, normalize_provider_fields
 
 PROVIDER_NAME = "abstract_company_enrichment"
@@ -119,10 +120,19 @@ class AbstractCompanyEnrichmentProvider:
 
     config: LiveProviderConfig
     client: httpx.Client
+    pacer: MinIntervalPacer = field(
+        default_factory=lambda: MinIntervalPacer(min_interval_seconds=0.0)
+    )
+    """Unpaced by default for a bare/direct construction (existing tests
+    construct this dataclass without a pacer and must keep running at their
+    own pace) — ``.build()`` always supplies one from config explicitly."""
 
     @staticmethod
     def build(
-        *, config: LiveProviderConfig | None = None, client: httpx.Client | None = None
+        *,
+        config: LiveProviderConfig | None = None,
+        client: httpx.Client | None = None,
+        pacer: MinIntervalPacer | None = None,
     ) -> AbstractCompanyEnrichmentProvider:
         resolved_config = config or LIVE_PROVIDER
         if client is None and not resolved_config.configured:
@@ -138,7 +148,15 @@ class AbstractCompanyEnrichmentProvider:
         resolved_client = client or httpx.Client(
             timeout=resolved_config.timeout_seconds, follow_redirects=True
         )
-        return AbstractCompanyEnrichmentProvider(config=resolved_config, client=resolved_client)
+        # One pacer per adapter instance, paired 1:1 with the client it
+        # paces — see the module docstring and arie.live.rate_limit for why
+        # this is never shared globally or across providers.
+        resolved_pacer = pacer or MinIntervalPacer(
+            min_interval_seconds=resolved_config.min_request_interval_seconds
+        )
+        return AbstractCompanyEnrichmentProvider(
+            config=resolved_config, client=resolved_client, pacer=resolved_pacer
+        )
 
     @property
     def name(self) -> str:
@@ -179,6 +197,7 @@ class AbstractCompanyEnrichmentProvider:
         if entity.entity_type != "company":
             raise ValueError(f"{self.name} serves company entities, got {entity.entity_type}")
 
+        self.pacer.wait()
         started = time.monotonic()
         try:
             response = self.client.get(
@@ -218,6 +237,9 @@ class AbstractCompanyEnrichmentProvider:
                 error_kind="authentication_failed",
             )
         if response.status_code == 429:
+            retry_after = _parse_retry_after_seconds(response.headers.get("Retry-After"))
+            if retry_after is not None:
+                self.pacer.note_retry_after(retry_after)
             return self._result(
                 status=ProviderStatus.ERROR,
                 fields={},
@@ -339,6 +361,26 @@ class AbstractCompanyEnrichmentProvider:
             status=status,
             raw=raw,
         )
+
+
+def _parse_retry_after_seconds(header_value: str | None) -> float | None:
+    """The numeric-seconds form of ``Retry-After`` only.
+
+    HTTP also permits an HTTP-date form; Abstract's own documentation doesn't
+    say which (or whether it sends this header at all — it wasn't observed
+    during the 2026-08-29 live experiment). Parsing only the simpler,
+    unambiguous form and returning ``None`` for anything else is the
+    conservative reading: an unparsed hint falls back to the ordinary pace
+    rather than risking a wrong, possibly much longer, wait from a
+    misinterpreted date.
+    """
+    if header_value is None:
+        return None
+    try:
+        seconds = float(header_value.strip())
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
 
 
 def _normalize_fields(body: dict[str, Any]) -> NormalizationReport:
