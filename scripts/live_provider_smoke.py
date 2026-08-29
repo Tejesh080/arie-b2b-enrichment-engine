@@ -40,10 +40,11 @@ from typing import Any
 
 import httpx
 
-from arie.config import APOLLO_PERSON, LIVE_PROVIDER
+from arie.config import APOLLO_PERSON, HUNTER, LIVE_PROVIDER
 from arie.core.types import Entity
 from arie.providers.live_abstract import AbstractCompanyEnrichmentProvider
 from arie.providers.live_apollo import ApolloPersonEnrichmentProvider
+from arie.providers.live_hunter import HunterEnrichmentProvider
 
 
 def _print_json(label: str, payload: dict[str, Any]) -> None:
@@ -112,6 +113,42 @@ def _call_person_adapter_once(email: str) -> dict[str, Any]:
     }
 
 
+def _call_hunter_adapter_once(email: str) -> dict[str, Any]:
+    """One real Hunter Combined Enrichment call, for one email.
+
+    Bill-on-match like Apollo: a miss consumes no credits, so an email chosen
+    to guarantee a miss (see ``--hunter-smoke-only``) is a free plumbing check
+    — auth header accepted, status parsing, normalization pass-through on an
+    empty result — before a single credit is spent on a real identity.
+
+    Prints canonical fields and the raw->canonical mapping audit plus who
+    Hunter matched, never the full payload — same discipline as
+    ``_call_person_adapter_once``.
+    """
+    provider = HunterEnrichmentProvider.build()
+    try:
+        entity = Entity(entity_type="person", entity_id=uuid.uuid4(), canonical_key=email)
+        result = provider.fetch(entity)
+    finally:
+        provider.close()
+
+    return {
+        "provider": provider.name,
+        "email": email,
+        "status": str(result.status),
+        "fields": result.fields,
+        "confidence": result.confidence,
+        "cost_usd": result.cost_usd,
+        "cost_basis": result.raw.get("cost_basis"),
+        "credits_consumed": result.raw.get("credits_consumed", 0),
+        "matched_identity": result.raw.get("matched_identity"),
+        "company_preview": result.raw.get("company_preview"),
+        "normalization": result.raw.get("normalization"),
+        "error_kind": result.raw.get("error_kind"),
+        "latency_ms": round(result.latency_ms, 1),
+    }
+
+
 def _run_through_api(
     *, base_url: str, domain: str, shadow: bool, timeout_s: float
 ) -> dict[str, Any]:
@@ -164,6 +201,21 @@ def main() -> int:
         "APOLLO_API_KEY. Use a public business identity, not a private individual.",
     )
     parser.add_argument(
+        "--hunter-email",
+        default=None,
+        help="If set, ALSO make one real Hunter Combined Enrichment call for this email "
+        "(bill-on-match: a miss costs 0 credits, a match consumes 0.2). Requires "
+        "HUNTER_API_KEY. Use a public business identity, not a private individual.",
+    )
+    parser.add_argument(
+        "--hunter-smoke-only",
+        default=None,
+        metavar="DOMAIN",
+        help="Convenience: call Hunter with a random local-part @ DOMAIN, guaranteed to miss "
+        "(0 credits) — proves the adapter/auth/status-parsing plumbing without spending a "
+        "credit on a real identity. Mutually exclusive with --hunter-email.",
+    )
+    parser.add_argument(
         "--api-base-url",
         default=None,
         help="If set, also POST a lead through this running ARIE API (PROVIDER_MODE=live) "
@@ -202,6 +254,19 @@ def main() -> int:
         )
         return 1
 
+    if args.hunter_email and args.hunter_smoke_only:
+        print("Pass at most one of --hunter-email / --hunter-smoke-only.", file=sys.stderr)
+        return 1
+
+    if (args.hunter_email or args.hunter_smoke_only) and not HUNTER.configured:
+        print(
+            "HUNTER_API_KEY is not set — see .env.example. The Hunter adapter and its whole "
+            "fixture suite are complete and green; only this one real call is blocked. "
+            "Set HUNTER_API_KEY in .env and re-run to make it.",
+            file=sys.stderr,
+        )
+        return 1
+
     if not args.confirm_live_spend:
         print(
             "Refusing to run without --confirm-live-spend: this makes a real call against "
@@ -219,6 +284,22 @@ def main() -> int:
         print()
         print(f"Calling the real Apollo adapter once for email={args.person_email!r}...")
         _print_json("Direct person adapter call", _call_person_adapter_once(args.person_email))
+
+    if args.hunter_smoke_only:
+        hunter_email = f"arie-smoke-{uuid.uuid4().hex[:10]}@{args.hunter_smoke_only}"
+        print()
+        print(
+            f"Calling the real Hunter adapter once for a synthetic email guaranteed to miss "
+            f"(email={hunter_email!r})..."
+        )
+        _print_json(
+            "Direct Hunter adapter call (smoke-only, 0 credits expected)",
+            _call_hunter_adapter_once(hunter_email),
+        )
+    elif args.hunter_email:
+        print()
+        print(f"Calling the real Hunter adapter once for email={args.hunter_email!r}...")
+        _print_json("Direct Hunter adapter call", _call_hunter_adapter_once(args.hunter_email))
 
     if args.api_base_url:
         print(
