@@ -64,6 +64,14 @@ import httpx
 from arie.config import APOLLO_PERSON, HUNTER, LIVE_PROVIDER
 from arie.core.types import Entity
 from arie.identity.normalize import domain_from_email, normalize_email
+from arie.identity.validation import (
+    MISMATCH,
+    PROBABLE,
+    VERIFIED,
+    RequestedIdentity,
+    ReturnedIdentity,
+    validate_identity,
+)
 from arie.live.evaluation import (
     CONFLICT,
     classify_agreement,
@@ -94,6 +102,14 @@ class BakeoffIdentity:
     persona: str | None = None
     """Mock-mode script: which canned vendor behaviour this identity gets.
     Ignored entirely in real mode."""
+    expected_full_name: str | None = None
+    """The operator's own ground truth for *who this email should belong to*
+    — optional, and usually absent (most real leads carry no expected name
+    at all; see ``arie.identity.validation``'s module docstring). When
+    present, ``_record_from_result`` runs it through ``validate_identity``
+    against each person provider's match, which is what turns a same-company
+    wrong-person answer (the Stripe/Patrick Bosmans case) into a measured
+    ``identity_verdict`` instead of an uncounted false success."""
 
 
 def load_identities(path: Path) -> list[BakeoffIdentity]:
@@ -109,6 +125,7 @@ def load_identities(path: Path) -> list[BakeoffIdentity]:
                     full_name=(row.get("full_name") or "").strip() or None,
                     company_name=(row.get("company_name") or "").strip() or None,
                     persona=(row.get("persona") or "").strip() or None,
+                    expected_full_name=(row.get("expected_full_name") or "").strip() or None,
                 )
             )
     return identities
@@ -143,6 +160,15 @@ class BakeoffRecord:
     cost_basis: str | None
     error_kind: str | None
     called_at: str
+    identity_verdict: str | None = None
+    """``arie.identity.validation`` verdict for a person-provider success,
+    when the identity CSV supplied an ``expected_full_name`` to check against
+    — ``None`` for a company-provider record, a miss/error, or an identity
+    with no expected name on file (nothing to compare)."""
+    person_evidence_usable: bool | None = None
+    """Whether this record's person fields would be allowed to score — false
+    only for a confirmed ``MISMATCH``; ``None`` alongside ``identity_verdict
+    is None`` (no check was possible, not the same claim as "usable")."""
 
     def cache_key(self) -> str:
         return _cache_key(self.provider, self.email)
@@ -171,6 +197,31 @@ def _record_from_result(
                 company_industry = item["canonical"]
             if item["field"] == "employee_count":
                 company_employees = item["canonical"]
+
+    identity_verdict: str | None = None
+    person_evidence_usable: bool | None = None
+    if (
+        provider.entity_type == "person"
+        and str(result.status) == "success"
+        and identity.expected_full_name
+        and isinstance(matched, Mapping)
+    ):
+        validation = validate_identity(
+            RequestedIdentity(
+                email=identity.email,
+                company_domain=identity.domain,
+                full_name=identity.expected_full_name,
+            ),
+            ReturnedIdentity(
+                full_name=matched.get("full_name"),
+                email=matched.get("email"),
+                employer_domain=matched.get("employer_domain"),
+                employer_name=matched.get("employer_name"),
+            ),
+        )
+        identity_verdict = validation.verdict
+        person_evidence_usable = validation.verdict != MISMATCH
+
     return BakeoffRecord(
         provider=provider.name,
         email=identity.email,
@@ -190,6 +241,8 @@ def _record_from_result(
         cost_basis=raw.get("cost_basis"),
         error_kind=raw.get("error_kind"),
         called_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        identity_verdict=identity_verdict,
+        person_evidence_usable=person_evidence_usable,
     )
 
 
@@ -338,13 +391,25 @@ def build_mock_providers(identities: Sequence[BakeoffIdentity]) -> list[Enrichme
 
 
 def build_real_providers() -> list[EnrichmentProvider]:
+    """Abstract and Hunter are required; Apollo is optional.
+
+    Abstract (company) and Hunter (the cheaper person provider) are the
+    minimum needed for *any* comparison — missing either would under-count a
+    vendor the run claims to have measured, so both still refuse loudly.
+    Apollo is the third, most expensive person provider: a bake-off run that
+    deliberately excludes it (e.g. a two-provider experiment) is a legitimate,
+    smaller comparison, not a broken one, so an absent ``APOLLO_API_KEY``
+    degrades the provider list rather than refusing the whole run. It is never
+    silent — the caller sees Apollo missing from the returned list and every
+    downstream summary/report already renders an unmeasured provider's rates
+    as ``None`` rather than zero (see ``summarize_provider``), so "not
+    configured" cannot be misread as "measured and found lacking."
+    """
     missing = []
     if not LIVE_PROVIDER.configured:
         missing.append("ABSTRACT_COMPANY_API_KEY")
     if not HUNTER.configured:
         missing.append("HUNTER_API_KEY")
-    if not APOLLO_PERSON.configured:
-        missing.append("APOLLO_API_KEY")
     if missing:
         raise SystemExit(
             "Refusing to run a live bake-off with provider keys missing: "
@@ -352,11 +417,19 @@ def build_real_providers() -> list[EnrichmentProvider]:
             + ". A partial comparison would under-count whichever vendor lacked a key. "
             "Set the variables in .env (see .env.example) or run with --mock."
         )
-    return [
+    providers: list[EnrichmentProvider] = [
         AbstractCompanyEnrichmentProvider.build(),
         HunterEnrichmentProvider.build(),
-        ApolloPersonEnrichmentProvider.build(),
     ]
+    if APOLLO_PERSON.configured:
+        providers.append(ApolloPersonEnrichmentProvider.build())
+    else:
+        print(
+            "APOLLO_API_KEY not set — running without Apollo (not_configured). "
+            "Abstract and Hunter still run.",
+            file=sys.stderr,
+        )
+    return providers
 
 
 # --------------------------------------------------------------------- runner --
@@ -436,6 +509,24 @@ def summarize_provider(records: Sequence[BakeoffRecord], provider: str) -> dict[
     credits = sum(r.credits_consumed or 0.0 for r in live)
     cost = sum(r.cost_usd for r in live)
     n = len(attempted)
+
+    # Identity-fidelity metrics (Live V1 stabilization, 2026-08-30): a
+    # PROVIDER match ("someone answered") is not a VERIFIED match ("the
+    # intended person answered") — see arie.identity.validation. Only
+    # meaningful for person providers whose identity CSV supplied an
+    # `expected_full_name`; `identity_checked` is the denominator note that
+    # makes the rest of these rates honest when it did not.
+    identity_checked = [r for r in attempted if r.identity_verdict is not None]
+    verified = [r for r in identity_checked if r.identity_verdict == VERIFIED]
+    probable = [r for r in identity_checked if r.identity_verdict == PROBABLE]
+    mismatched = [r for r in identity_checked if r.identity_verdict == MISMATCH]
+    # "Usable" = not a *confirmed* mismatch — a success with no expected name
+    # to check (person_evidence_usable is None) is unproven, not unusable;
+    # excluding it from the numerator would misreport it as bad evidence,
+    # which is precisely the UNKNOWN-is-not-negative-evidence rule this
+    # package exists to keep.
+    usable_person = [r for r in matches if r.person_evidence_usable is not False]
+
     return {
         "provider": provider,
         "identities_attempted": n,
@@ -455,6 +546,13 @@ def summarize_provider(records: Sequence[BakeoffRecord], provider: str) -> dict[
         "modelled_cost_usd": round(cost, 5),
         "cost_per_match_usd": _cost_per(cost, len(matches)),
         "cost_per_usable_field_usd": _cost_per(cost, sum(len(r.usable_fields) for r in matches)),
+        "identity_checked_count": len(identity_checked),
+        "verified_person_rate": _rate(len(verified), n),
+        "probable_person_rate": _rate(len(probable), n),
+        "identity_mismatch_rate": _rate(len(mismatched), n),
+        "usable_person_evidence_rate": _rate(len(usable_person), n),
+        "cost_per_verified_person_result_usd": _cost_per(cost, len(verified)),
+        "cost_per_usable_person_result_usd": _cost_per(cost, len(usable_person)),
     }
 
 
@@ -685,6 +783,13 @@ def render_report(summary: Mapping[str, Any]) -> str:
         "modelled_cost_usd",
         "cost_per_match_usd",
         "cost_per_usable_field_usd",
+        "identity_checked_count",
+        "verified_person_rate",
+        "probable_person_rate",
+        "identity_mismatch_rate",
+        "usable_person_evidence_rate",
+        "cost_per_verified_person_result_usd",
+        "cost_per_usable_person_result_usd",
     ]
     blocks = {block["provider"]: block for block in summary["providers"]}
     for key in metric_keys:

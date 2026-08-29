@@ -11,14 +11,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
+import scripts.provider_bakeoff as provider_bakeoff
 from scripts.provider_bakeoff import (
     BakeoffIdentity,
     BakeoffRecord,
     _cache_key,
     _percentile,
+    _record_from_result,
     agreement_summary,
     build_mock_providers,
+    build_real_providers,
     build_summary,
     load_identities,
     overlap_summary,
@@ -27,9 +31,13 @@ from scripts.provider_bakeoff import (
     summarize_provider,
 )
 
+from arie.config import ApolloPersonConfig, HunterConfig, LiveProviderConfig
+from arie.core.types import ProviderResult, ProviderStatus
+from arie.providers import live_abstract, live_apollo, live_hunter
 from arie.providers.apollo_contract import APOLLO_PROVIDER_NAME
 from arie.providers.hunter_contract import HUNTER_PROVIDER_NAME
 from arie.providers.live_abstract import PROVIDER_NAME as ABSTRACT_PROVIDER_NAME
+from arie.providers.live_hunter import HunterEnrichmentProvider
 
 _EXAMPLE_CSV = (
     Path(__file__).parent.parent.parent / "data" / "evaluation" / "identities.example.csv"
@@ -50,6 +58,8 @@ def _record(
     latency: float = 100.0,
     cost: float = 0.01,
     credits: float | None = 1.0,
+    identity_verdict: str | None = None,
+    person_evidence_usable: bool | None = None,
 ) -> BakeoffRecord:
     usable = tuple(
         name
@@ -75,6 +85,8 @@ def _record(
         cost_basis="modelled_credit_equivalent" if status == "success" else None,
         error_kind="server_error" if status == "error" else None,
         called_at="2026-08-27T00:00:00",
+        identity_verdict=identity_verdict,
+        person_evidence_usable=person_evidence_usable,
     )
 
 
@@ -295,3 +307,146 @@ def test_a_free_mail_identity_skips_the_company_provider_only(tmp_path: Path) ->
     assert by_provider[ABSTRACT_PROVIDER_NAME].served_from == "skipped_no_domain"
     assert by_provider[HUNTER_PROVIDER_NAME].served_from == "live_call"
     assert by_provider[APOLLO_PROVIDER_NAME].served_from == "live_call"
+
+
+def _patch_provider_configs(
+    monkeypatch: pytest.MonkeyPatch, *, abstract_key: str, hunter_key: str, apollo_key: str
+) -> None:
+    """Patch every place a key is read from: the bake-off module's gate check
+    *and* each adapter module's own singleton, which is what a bare
+    ``.build()`` call (no explicit ``config=``) actually reads."""
+    abstract_config = LiveProviderConfig(api_key=abstract_key)
+    hunter_config = HunterConfig(api_key=hunter_key)
+    apollo_config = ApolloPersonConfig(api_key=apollo_key)
+    for module in (provider_bakeoff, live_abstract):
+        monkeypatch.setattr(module, "LIVE_PROVIDER", abstract_config)
+    for module in (provider_bakeoff, live_hunter):
+        monkeypatch.setattr(module, "HUNTER", hunter_config)
+    for module in (provider_bakeoff, live_apollo):
+        monkeypatch.setattr(module, "APOLLO_PERSON", apollo_config)
+
+
+def test_identity_metrics_distinguish_verified_from_merely_matched() -> None:
+    """The Stripe case, as a summary metric: 4 provider matches, but only one
+    identity was checked and it was a MISMATCH — match_rate must stay high
+    while verified_person_rate reports the opposite story."""
+    records = [
+        _record(
+            HUNTER_PROVIDER_NAME,
+            "patrick@stripe.test",
+            seniority="ic",
+            function="engineering",
+            identity_verdict="MISMATCH",
+            person_evidence_usable=False,
+        ),
+        _record(HUNTER_PROVIDER_NAME, "b@x.test", seniority="vp", function="sales"),
+        _record(HUNTER_PROVIDER_NAME, "c@x.test", seniority="c_level"),
+        _record(HUNTER_PROVIDER_NAME, "d@x.test", status="miss", credits=None),
+    ]
+    summary = summarize_provider(records, HUNTER_PROVIDER_NAME)
+
+    assert summary["identities_attempted"] == 4
+    assert summary["match_rate"] == pytest.approx(0.75)
+    assert summary["identity_checked_count"] == 1
+    assert summary["verified_person_rate"] == pytest.approx(0.0)
+    assert summary["identity_mismatch_rate"] == pytest.approx(0.25)
+    # 2 of 3 matches are usable (the mismatch is excluded; the two unchecked
+    # successes are NOT excluded — no name to check is not proof of a bad
+    # match, see summarize_provider's docstring).
+    assert summary["usable_person_evidence_rate"] == pytest.approx(0.5)
+
+
+def test_an_unchecked_success_counts_as_usable_not_excluded() -> None:
+    """No expected_full_name on file (the ordinary real-world case) must not
+    quietly read as "unusable" — that would be exactly the UNKNOWN-becomes-
+    negative-evidence bug this package exists to avoid."""
+    records = [_record(HUNTER_PROVIDER_NAME, "a@x.test", seniority="vp", function="sales")]
+    summary = summarize_provider(records, HUNTER_PROVIDER_NAME)
+    assert summary["identity_checked_count"] == 0
+    assert summary["usable_person_evidence_rate"] == pytest.approx(1.0)
+
+
+def _fake_hunter() -> HunterEnrichmentProvider:
+    return HunterEnrichmentProvider(config=HunterConfig(api_key="test-key"), client=httpx.Client())
+
+
+def test_record_from_result_runs_identity_validation_for_person_success_with_expected_name() -> (
+    None
+):
+    identity = BakeoffIdentity(
+        email="patrick@stripe.test",
+        domain="stripe.test",
+        expected_full_name="Patrick Collison",
+    )
+    result = ProviderResult(
+        fields={"title_seniority": "ic", "title_function": "engineering"},
+        confidence=0.75,
+        cost_usd=0.0049,
+        latency_ms=500.0,
+        status=ProviderStatus.SUCCESS,
+        raw={
+            "matched_identity": {
+                "full_name": "Patrick Bosmans",
+                "email": "patrick@stripe.test",
+                "employer_domain": "stripe.test",
+                "title": "IT Administrator",
+            }
+        },
+    )
+
+    record = _record_from_result(_fake_hunter(), identity, result, served_from="live_call")
+    assert record.identity_verdict == "MISMATCH"
+    assert record.person_evidence_usable is False
+
+
+def test_record_from_result_skips_identity_check_with_no_expected_name() -> None:
+    identity = BakeoffIdentity(email="a@x.test", domain="x.test")
+    result = ProviderResult(
+        fields={"title_seniority": "vp"},
+        confidence=0.75,
+        cost_usd=0.0049,
+        latency_ms=500.0,
+        status=ProviderStatus.SUCCESS,
+        raw={"matched_identity": {"full_name": "Someone", "employer_domain": "x.test"}},
+    )
+
+    record = _record_from_result(_fake_hunter(), identity, result, served_from="live_call")
+    assert record.identity_verdict is None
+    assert record.person_evidence_usable is None
+
+
+def test_build_real_providers_omits_apollo_when_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Abstract + Hunter configured, Apollo not: a two-provider run, not a refusal."""
+    _patch_provider_configs(monkeypatch, abstract_key="fake", hunter_key="fake", apollo_key="")
+
+    providers = build_real_providers()
+    names = {provider.name for provider in providers}
+    assert names == {ABSTRACT_PROVIDER_NAME, HUNTER_PROVIDER_NAME}
+
+
+def test_build_real_providers_includes_apollo_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_provider_configs(monkeypatch, abstract_key="fake", hunter_key="fake", apollo_key="fake")
+
+    providers = build_real_providers()
+    names = {provider.name for provider in providers}
+    assert names == {ABSTRACT_PROVIDER_NAME, HUNTER_PROVIDER_NAME, APOLLO_PROVIDER_NAME}
+
+
+@pytest.mark.parametrize(
+    ("abstract_key", "hunter_key"),
+    [("", "fake"), ("fake", "")],
+)
+def test_build_real_providers_still_refuses_missing_abstract_or_hunter(
+    monkeypatch: pytest.MonkeyPatch, abstract_key: str, hunter_key: str
+) -> None:
+    """Apollo is optional; the company provider and the cheaper person provider are not."""
+    _patch_provider_configs(
+        monkeypatch, abstract_key=abstract_key, hunter_key=hunter_key, apollo_key="fake"
+    )
+
+    with pytest.raises(SystemExit):
+        build_real_providers()
