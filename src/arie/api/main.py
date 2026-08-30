@@ -58,6 +58,7 @@ from arie.api.schemas import (
     LeadCostResponse,
     LeadResponse,
     MemberResponse,
+    OnboardingStatusResponse,
     OrganizationResponse,
     ProviderStatusResponse,
     ReceiptResponse,
@@ -68,6 +69,7 @@ from arie.api.schemas import (
     SetProviderEnabledRequest,
     UpdateMemberRoleRequest,
     UpdateOrganizationRequest,
+    UsageAgainstLimitsResponse,
     UsageSummaryResponse,
 )
 from arie.apikeys import create_api_key, list_api_keys, looks_like_api_key, revoke_api_key
@@ -98,6 +100,7 @@ from arie.batches import (
     get_batch,
     list_batch_rows,
     list_batches,
+    parse_csv,
 )
 from arie.config import DATABASE, OBSERVABILITY
 from arie.credential_resolver import resolve_provider_credential
@@ -123,6 +126,12 @@ from arie.invitations import (
 )
 from arie.jobs.queue import PostgresJobQueue
 from arie.ledger.store import PostgresCostLedger
+from arie.limits import (
+    LimitExceededError,
+    enforce_csv_row_quota,
+    enforce_lead_quota,
+    get_usage_against_limits,
+)
 from arie.members import (
     CannotActOnSelfError,
     InvalidMemberRoleError,
@@ -133,6 +142,7 @@ from arie.members import (
 )
 from arie.migrations import MigrationsDirectoryError, pending_migrations
 from arie.observability.tracing import configure_tracing, shutdown_tracing
+from arie.onboarding import get_onboarding_status
 from arie.organizations import (
     InvalidOrganizationSettingsError,
     get_organization,
@@ -518,6 +528,14 @@ def register_routes(app: FastAPI) -> None:
     ) -> IngestLeadResponse:
         _require_scope(auth, "leads:write")
         with _transaction(state.pool) as conn:
+            try:
+                enforce_lead_quota(
+                    conn, organization_id=auth.organization_id, now=datetime.now(UTC)
+                )
+            except LimitExceededError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)
+                ) from exc
             result = ingest_lead(
                 conn,
                 resolver=state.resolver,
@@ -1020,6 +1038,32 @@ def register_routes(app: FastAPI) -> None:
             )
         return ProviderStatusResponse.model_validate(ProviderStatus.from_record(record))
 
+    # ----------------------------------------------------------- onboarding --
+    #
+    # Productization M4 Part 8. Read-only, any active member.
+
+    @app.get("/organization/onboarding", response_model=OnboardingStatusResponse)
+    def get_onboarding_status_endpoint(state: StateDep, auth: AuthDep) -> OnboardingStatusResponse:
+        _require_jwt_session(auth)
+        with _transaction(state.pool) as conn:
+            result = get_onboarding_status(conn, organization_id=auth.organization_id)
+        return OnboardingStatusResponse.model_validate(result)
+
+    # --------------------------------------------------------------- limits --
+    #
+    # Productization M4 Part 9. Read-only, any active member — see the
+    # schemas module's own banner comment for why there is no write
+    # endpoint yet.
+
+    @app.get("/organization/limits", response_model=UsageAgainstLimitsResponse)
+    def get_limits_endpoint(state: StateDep, auth: AuthDep) -> UsageAgainstLimitsResponse:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            result = get_usage_against_limits(
+                conn, organization_id=auth.organization_id, now=datetime.now(UTC)
+            )
+        return UsageAgainstLimitsResponse.model_validate(result)
+
     # ------------------------------------------------------- icp profiles --
     #
     # Productization M3. Config-write requires an owner/admin *JWT* session
@@ -1114,6 +1158,33 @@ def register_routes(app: FastAPI) -> None:
         content = (
             file.file.read()
         )  # sync read of the underlying spooled file — see module docstring
+
+        # Parsed once here purely to count rows for the quota check below,
+        # and again inside `create_batch` — a second parse of a file already
+        # capped at MAX_FILE_SIZE_BYTES/MAX_ROWS is cheap, and keeps this
+        # quota logic fully outside `arie.batches`' own, already-tested
+        # parse/create/enqueue flow rather than threading a new concern
+        # through it.
+        try:
+            preview = parse_csv(content, organization_id=auth.organization_id)
+        except MalformedCsvError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+
+        with state.pool.connection() as conn:
+            try:
+                enforce_csv_row_quota(
+                    conn, organization_id=auth.organization_id, row_count=len(preview)
+                )
+                enforce_lead_quota(
+                    conn, organization_id=auth.organization_id, now=datetime.now(UTC)
+                )
+            except LimitExceededError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)
+                ) from exc
+
         try:
             with _transaction(state.pool) as conn:
                 record = create_batch(

@@ -677,6 +677,53 @@ class SetProviderEnabledRequest(BaseModel):
     enabled: bool
 
 
+# ------------------------------------------------------------------- onboarding --
+#
+# Productization M4 Part 8. Read-gated identically to ICP configuration and
+# batches (`_require_jwt_session`) — any active member may see setup
+# progress.
+
+
+class OnboardingStatusResponse(BaseModel):
+    """Mirrors `arie.onboarding.OnboardingStatus` field for field."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    account_created: bool
+    organization_configured: bool
+    icp_configured: bool
+    provider_configured: bool
+    first_upload_completed: bool
+    first_batch_processed: bool
+    completed: bool
+    completed_at: datetime | None
+
+
+# ----------------------------------------------------------------------- limits --
+#
+# Productization M4 Part 9. Read-gated identically to onboarding/ICP —
+# `_require_jwt_session`. No write endpoint yet: the M4 brief asks for
+# visibility and server-side enforcement, not a self-service limit-editing
+# UI (limits are a sensible-default ceiling, not a per-org config choice a
+# member has any use for changing themselves in this milestone).
+
+
+class UsageAgainstLimitsResponse(BaseModel):
+    """Mirrors `arie.limits.UsageAgainstLimits` field for field."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    leads_used: int
+    leads_limit: int
+    leads_remaining: int
+    modeled_spend_used_usd: float
+    modeled_spend_limit_usd: float
+    modeled_spend_remaining_usd: float
+    max_csv_rows_per_upload: int
+    period_start: datetime
+    period_end: datetime
+
+
 # --------------------------------------------------------------- CSV batches --
 #
 # Productization M3. `arie.batches.BatchProgress` is always computed fresh
