@@ -8,6 +8,7 @@ DATABASE_URL / DATABASE_DIRECT_URL; skipped otherwise (see conftest.py).
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import psycopg
@@ -130,6 +131,119 @@ def test_pending_migrations_fails_closed_on_a_bad_migrations_dir(
     see the directory describing what "fully migrated" means."""
     with pytest.raises(MigrationsDirectoryError):
         pending_migrations(db_conn, migrations_dir=tmp_path / "does-not-exist")
+
+
+def _schema_migrations_snapshot(conn: psycopg.Connection) -> set[tuple[str, str]]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT filename, checksum FROM schema_migrations")
+        return {(row[0], row[1]) for row in cur.fetchall()}
+
+
+def test_dry_run_lists_pending_without_writing(
+    migrated_database_direct: str, db_conn: psycopg.Connection
+) -> None:
+    """The regression test for the M3-rollout bug: a dry run must report what
+    is pending, exactly like a real run would, but leave `schema_migrations`
+    byte-for-byte unchanged — same mutate-then-restore shape as
+    `test_pending_migrations_reports_an_unrecorded_migration`."""
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM schema_migrations WHERE filename = %s", ("0002_metrics_views.sql",)
+        )
+    db_conn.commit()
+
+    before = _schema_migrations_snapshot(db_conn)
+    try:
+        applied = migrate(migrated_database_direct, dry_run=True)
+        assert applied == ["0002_metrics_views.sql"]
+
+        after = _schema_migrations_snapshot(db_conn)
+        assert after == before, "dry run must not write to schema_migrations"
+    finally:
+        real = next(f for f in migration_files() if f.name == "0002_metrics_views.sql")
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO schema_migrations (filename, checksum) VALUES (%s, %s)",
+                ("0002_metrics_views.sql", checksum_of(real.read_text(encoding="utf-8"))),
+            )
+        db_conn.commit()
+
+
+def test_dry_run_matches_pending_migrations(
+    migrated_database: str, migrated_database_direct: str, db_conn: psycopg.Connection
+) -> None:
+    """A dry run and `arie.migrations.pending_migrations` (the function
+    `/healthz` itself calls) must never disagree — both describe the same
+    "what hasn't run yet" fact from the same on-disk migration list."""
+    assert migrate(migrated_database_direct, dry_run=True) == pending_migrations(db_conn)
+
+
+def test_dry_run_raises_on_checksum_mismatch_without_writing(
+    migrated_database_direct: str, db_conn: psycopg.Connection
+) -> None:
+    """A dry run must catch a corrupted/edited migration exactly like a real
+    run does — checksum verification is read-only, so there's no reason a
+    dry run should be blind to it. Same mutate-then-restore shape as
+    `test_reapplying_a_changed_migration_raises`."""
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE schema_migrations SET checksum = 'deliberately-wrong' WHERE filename = %s",
+            ("0001_init.sql",),
+        )
+    db_conn.commit()
+
+    before = _schema_migrations_snapshot(db_conn)
+    try:
+        with pytest.raises(RuntimeError, match="checksum"):
+            migrate(migrated_database_direct, dry_run=True)
+
+        after = _schema_migrations_snapshot(db_conn)
+        assert after == before, "a raising dry run must still write nothing"
+    finally:
+        real = next(f for f in migration_files() if f.name == "0001_init.sql")
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "UPDATE schema_migrations SET checksum = %s WHERE filename = %s",
+                (checksum_of(real.read_text(encoding="utf-8")), "0001_init.sql"),
+            )
+        db_conn.commit()
+
+
+def test_dry_run_against_a_schema_with_no_schema_migrations_table_creates_nothing(
+    migrated_database_direct: str, db_conn: psycopg.Connection, integration_run_id: str
+) -> None:
+    """The strongest form of the "zero writes" contract: run a dry run
+    against a Postgres search_path that has never seen a migration at all,
+    and confirm it neither creates the bootstrap `schema_migrations` table
+    nor anything else — only ever a `SELECT` that 42P01s and rolls back.
+
+    A fresh *schema* on the same already-migrated test database, rather than
+    a second real database, keeps this cheap and self-contained while still
+    exercising a real "table doesn't exist yet" `UndefinedTable` path against
+    a real server (not a mock).
+    """
+    schema = f"it_freshschema_{integration_run_id.replace('-', '')}"
+    with db_conn.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA {schema}")
+    db_conn.commit()
+
+    try:
+        conninfo = f"{migrated_database_direct}?options={quote(f'-c search_path={schema}')}"
+
+        applied = migrate(conninfo, dry_run=True)
+
+        assert applied == [f.name for f in migration_files()]
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = %s AND table_name = 'schema_migrations'",
+                (schema,),
+            )
+            assert cur.fetchone() is None, "dry run must not create the bootstrap table"
+    finally:
+        with db_conn.cursor() as cur:
+            cur.execute(f"DROP SCHEMA {schema} CASCADE")
+        db_conn.commit()
 
 
 def test_reapplying_a_changed_migration_raises(
