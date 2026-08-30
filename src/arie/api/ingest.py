@@ -57,12 +57,21 @@ _TRACER = get_tracer("arie.api.ingest")
 # same "first write wins" rule every other optional ingestion field here
 # already follows. RETURNING it lets the caller report the *actual* persisted
 # value rather than assuming the request's own.
+#
+# `batch_id` (Productization M3) follows the identical rule: set only on
+# INSERT. A CSV row that happens to match a lead created by an earlier batch
+# (or by the ordinary New Lead form, where it's always NULL) must not steal
+# that lead's attribution — the row is still honestly counted as "accepted"
+# in *this* upload's own row-level audit trail (`lead_batch_rows`), but the
+# lead's batch-progress aggregation continues to belong to whichever batch
+# actually created it.
 _INSERT_LEAD = """
     INSERT INTO leads (
-        organization_id, person_id, company_id, source, external_ref, budget_usd_cap, is_shadow
+        organization_id, person_id, company_id, source, external_ref, budget_usd_cap, is_shadow,
+        batch_id
     )
     VALUES (%(organization_id)s, %(person_id)s, %(company_id)s, %(source)s, %(external_ref)s,
-            %(budget_usd_cap)s, %(is_shadow)s)
+            %(budget_usd_cap)s, %(is_shadow)s, %(batch_id)s)
     ON CONFLICT (organization_id, source, external_ref) WHERE external_ref IS NOT NULL
         DO UPDATE SET updated_at = now()
     RETURNING lead_id, status, version, is_shadow, (xmax = 0) AS created
@@ -91,6 +100,11 @@ class LeadIngestCommand:
     budget_usd_cap: Decimal | None = None
     is_shadow: bool = False
     """Post-M1 P5. See ``arie.api.schemas.IngestLeadRequest.mode``."""
+    batch_id: UUID | None = None
+    """Productization M3. Set only by ``arie.batches`` for a CSV-uploaded
+    row; ``None`` for every ordinary ``POST /leads`` call. See
+    ``_INSERT_LEAD``'s comment for why this is never overwritten on a
+    conflict."""
 
 
 @dataclass(frozen=True)
@@ -171,6 +185,7 @@ def ingest_lead(
                     "external_ref": command.external_ref,
                     "budget_usd_cap": budget_cap,
                     "is_shadow": command.is_shadow,
+                    "batch_id": command.batch_id,
                 },
             )
             lead_row = cur.fetchone()

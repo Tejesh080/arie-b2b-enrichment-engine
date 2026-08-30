@@ -27,11 +27,12 @@ import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, UploadFile, status
 from psycopg_pool import ConnectionPool
 
 from arie.api.ingest import ingest_lead
@@ -40,6 +41,10 @@ from arie.api.receipt import build_receipt
 from arie.api.schemas import (
     ApiKeyCreatedResponse,
     ApiKeyResponse,
+    BatchProgressResponse,
+    BatchResponse,
+    BatchRowResponse,
+    BatchRowsPageResponse,
     CreateApiKeyRequest,
     CreateICPProfileRequest,
     HealthResponse,
@@ -52,6 +57,7 @@ from arie.api.schemas import (
     ReviewDecisionRequest,
     ReviewDecisionResponse,
     ReviewResponse,
+    UsageSummaryResponse,
 )
 from arie.apikeys import create_api_key, list_api_keys, looks_like_api_key, revoke_api_key
 from arie.approval.workflow import (
@@ -69,6 +75,17 @@ from arie.auth import (
     resolve_api_key_context,
     resolve_auth_context,
 )
+from arie.batches import (
+    MAX_FILE_SIZE_BYTES,
+    BatchProgress,
+    BatchRecord,
+    MalformedCsvError,
+    batch_progress,
+    create_batch,
+    get_batch,
+    list_batch_rows,
+    list_batches,
+)
 from arie.config import DATABASE, OBSERVABILITY
 from arie.icp_profiles import (
     create_profile as create_icp_profile_row,
@@ -84,6 +101,7 @@ from arie.ledger.store import PostgresCostLedger
 from arie.migrations import MigrationsDirectoryError, pending_migrations
 from arie.observability.tracing import configure_tracing, shutdown_tracing
 from arie.statemachine.apply import OptimisticConcurrencyError
+from arie.usage import get_usage_summary
 
 _LOGGER = logging.getLogger("arie.api")
 
@@ -315,17 +333,43 @@ def _require_org_admin(auth: AuthContext) -> None:
 
 
 def _require_jwt_session(auth: AuthContext) -> None:
-    """Gate an action (reading ICP configuration today) on any authenticated
-    *human* session — owner, admin, or analyst_reviewer alike; unlike
-    `_require_org_admin` this is not owner/admin-only. Refuses an API key
-    outright rather than adding a new scope: no existing machine caller
-    (n8n, the demo script) needs organization configuration, and Productization
-    M3's brief asks not to add one without a concrete use case."""
+    """Gate an action (reading ICP configuration, or any CSV batch endpoint)
+    on any authenticated *human* session — owner, admin, or analyst_reviewer
+    alike; unlike `_require_org_admin` this is not owner/admin-only. Refuses
+    an API key outright rather than adding a new scope: no existing machine
+    caller (n8n, the demo script) needs organization configuration or batch
+    upload, and Productization M3's brief asks not to add a scope without a
+    concrete use case."""
     if auth.auth_method != "jwt":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="requires a user session (API keys cannot read organization configuration)",
         )
+
+
+MAX_UPLOAD_CONTENT_LENGTH = MAX_FILE_SIZE_BYTES + 10_000
+"""`arie.batches.MAX_FILE_SIZE_BYTES` plus headroom for multipart boundary
+overhead — see `upload_batch`'s own comment for why this is only a coarse,
+early rejection, not the authoritative limit."""
+
+
+def _to_batch_response(record: BatchRecord, progress: BatchProgress) -> BatchResponse:
+    """Combine a `BatchRecord` and a separately computed `BatchProgress` into
+    one response — the same composite-response shape `create_api_key_endpoint`
+    already uses for `ApiKeyCreatedResponse`, needed here because the two
+    inputs are genuinely two different service calls, not one object
+    `model_validate` could read straight off."""
+    return BatchResponse(
+        batch_id=record.batch_id,
+        organization_id=record.organization_id,
+        filename=record.filename,
+        total_rows=record.total_rows,
+        accepted_rows=record.accepted_rows,
+        rejected_rows=record.rejected_rows,
+        created_by_user_id=record.created_by_user_id,
+        created_at=record.created_at,
+        progress=BatchProgressResponse.model_validate(progress),
+    )
 
 
 def register_routes(app: FastAPI) -> None:
@@ -602,6 +646,141 @@ def register_routes(app: FastAPI) -> None:
                 config=payload.config.model_dump(mode="json"),
             )
         return ICPProfileResponse.model_validate(record)
+
+    # ------------------------------------------------------------ batches --
+    #
+    # Productization M3, Part 4-6: CSV bulk lead upload. Gated on any
+    # authenticated human session (`_require_jwt_session`) — the same
+    # permission tier as `POST /leads` itself (any JWT role can already
+    # create leads one at a time; uploading many at once needs no more
+    # authority than that) — never an API key, since no machine caller needs
+    # this in this milestone.
+    #
+    # `MAX_UPLOAD_CONTENT_LENGTH` is a coarse, spoofable `Content-Length`
+    # pre-check purely to avoid reading an obviously oversized body into
+    # memory at all; `arie.batches.parse_csv`'s own post-read size check is
+    # the real, authoritative limit.
+
+    @app.post("/batches", response_model=BatchResponse, status_code=status.HTTP_201_CREATED)
+    def upload_batch(
+        request: Request, state: StateDep, auth: AuthDep, file: UploadFile
+    ) -> BatchResponse:
+        _require_jwt_session(auth)
+        assert auth.user_id is not None  # guaranteed by auth_method == "jwt"
+        content_length = request.headers.get("content-length")
+        if content_length is not None and int(content_length) > MAX_UPLOAD_CONTENT_LENGTH:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"upload exceeds the {MAX_UPLOAD_CONTENT_LENGTH}-byte limit",
+            )
+        content = (
+            file.file.read()
+        )  # sync read of the underlying spooled file — see module docstring
+        try:
+            with _transaction(state.pool) as conn:
+                record = create_batch(
+                    conn,
+                    resolver=state.resolver,
+                    queue=state.queue,
+                    organization_id=auth.organization_id,
+                    created_by_user_id=auth.user_id,
+                    filename=file.filename or "upload.csv",
+                    content=content,
+                )
+                progress = batch_progress(conn, organization_id=auth.organization_id, batch=record)
+        except MalformedCsvError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+        return _to_batch_response(record, progress)
+
+    @app.get("/batches", response_model=list[BatchResponse])
+    def list_batches_endpoint(
+        state: StateDep,
+        auth: AuthDep,
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> list[BatchResponse]:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            records = list_batches(
+                conn, organization_id=auth.organization_id, limit=limit, offset=offset
+            )
+            return [
+                _to_batch_response(
+                    record, batch_progress(conn, organization_id=auth.organization_id, batch=record)
+                )
+                for record in records
+            ]
+
+    @app.get("/batches/{batch_id}", response_model=BatchResponse)
+    def get_batch_endpoint(batch_id: UUID, state: StateDep, auth: AuthDep) -> BatchResponse:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            record = get_batch(conn, organization_id=auth.organization_id, batch_id=batch_id)
+            if record is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail=f"no batch {batch_id}"
+                )
+            progress = batch_progress(conn, organization_id=auth.organization_id, batch=record)
+        return _to_batch_response(record, progress)
+
+    @app.get("/batches/{batch_id}/leads", response_model=BatchRowsPageResponse)
+    def list_batch_rows_endpoint(
+        batch_id: UUID,
+        state: StateDep,
+        auth: AuthDep,
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> BatchRowsPageResponse:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            batch = get_batch(conn, organization_id=auth.organization_id, batch_id=batch_id)
+            if batch is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail=f"no batch {batch_id}"
+                )
+            rows = list_batch_rows(
+                conn,
+                organization_id=auth.organization_id,
+                batch_id=batch_id,
+                limit=limit,
+                offset=offset,
+            )
+        return BatchRowsPageResponse(
+            items=[BatchRowResponse.model_validate(row) for row in rows],
+            limit=limit,
+            offset=offset,
+            total=batch.total_rows,
+        )
+
+    # -------------------------------------------------------------- usage --
+    #
+    # Productization M3, Part 7. Read-gated identically to ICP configuration
+    # and batches (`_require_jwt_session`) — any active member, no API key.
+    # `from_`/`to` default to the trailing 30 days ending now when omitted,
+    # so the endpoint is usable with no query parameters at all.
+
+    @app.get("/usage", response_model=UsageSummaryResponse)
+    def get_usage(
+        state: StateDep,
+        auth: AuthDep,
+        from_: Annotated[datetime | None, Query(alias="from")] = None,
+        to: datetime | None = None,
+    ) -> UsageSummaryResponse:
+        _require_jwt_session(auth)
+        to_at = to if to is not None else datetime.now(UTC)
+        from_at = from_ if from_ is not None else to_at - timedelta(days=30)
+        if from_at >= to_at:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="'from' must be strictly before 'to'",
+            )
+        with state.pool.connection() as conn:
+            summary = get_usage_summary(
+                conn, organization_id=auth.organization_id, from_at=from_at, to_at=to_at
+            )
+        return UsageSummaryResponse.model_validate(summary)
 
     # ---------------------------------------------------------- api keys --
     #

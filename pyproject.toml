@@ -29,6 +29,7 @@ service = [
     "opentelemetry-exporter-otlp>=1.25",
     "opentelemetry-instrumentation-fastapi>=0.46b0",
     "pyjwt[crypto]>=2.8",  # [crypto] pulls in `cryptography`, required for ES256 (Supabase's current signing-key algorithm)
+    "python-multipart>=0.0.9",  # required by FastAPI for UploadFile/form parsing (POST /batches)
 ]
 dev = [
     "pytest>=8.2",

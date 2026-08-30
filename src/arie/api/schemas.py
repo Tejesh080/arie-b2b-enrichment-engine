@@ -477,3 +477,98 @@ class ICPProfileResponse(BaseModel):
     created_at: datetime
     activated_at: datetime
     retired_at: datetime | None
+
+
+# --------------------------------------------------------------- CSV batches --
+#
+# Productization M3. `arie.batches.BatchProgress` is always computed fresh
+# from `leads`/`provider_calls`/`model_calls` — never a stored counter — so
+# there is no risk of this response shape reporting stale progress; see that
+# module's docstring. `provider_cost_usd`/`model_cost_usd`/`total_cost_usd`
+# are unlabelled numbers here exactly like `LeadCostResponse` above — the
+# "modelled cost, not billed spend" caveat is UI copy the frontend already
+# owns (`providerMode.ts`'s `costCaveat()`), not a second copy restated here.
+
+
+class BatchProgressResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    total_rows: int
+    accepted_rows: int
+    rejected_rows: int
+    processing_count: int
+    qualified_count: int
+    rejected_lead_count: int
+    review_count: int
+    failed_count: int
+    provider_cost_usd: float
+    model_cost_usd: float
+    total_cost_usd: float
+    is_complete: bool
+
+
+class BatchResponse(BaseModel):
+    """One CSV upload. Mirrors `arie.batches.BatchRecord` plus a nested,
+    live-computed `progress` — see `arie.api.main._to_batch_response`, which
+    builds this from two separate service calls (the same composite-response
+    shape `ApiKeyCreatedResponse` already uses for the same reason)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    batch_id: UUID
+    organization_id: UUID
+    filename: str
+    total_rows: int
+    accepted_rows: int
+    rejected_rows: int
+    created_by_user_id: UUID
+    created_at: datetime
+    progress: BatchProgressResponse
+
+
+class BatchRowResponse(BaseModel):
+    """One uploaded CSV row. Mirrors `arie.batches.BatchRowRecord`."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    batch_id: UUID
+    row_number: int
+    raw_row: dict[str, Any]
+    validation_status: str
+    validation_error: str | None
+    lead_id: UUID | None
+    lead_status: str | None
+
+
+class BatchRowsPageResponse(BaseModel):
+    """`GET /batches/{batch_id}/leads` — the first paginated listing endpoint
+    in this API (see that route's own comment for why offset/limit, not a
+    cursor)."""
+
+    items: list[BatchRowResponse]
+    limit: int
+    offset: int
+    total: int
+
+
+class UsageSummaryResponse(BaseModel):
+    """`GET /usage` — mirrors `arie.usage.UsageSummary` field for field. Cost
+    fields are unlabelled numbers, exactly like `LeadCostResponse` and
+    `BatchProgressResponse` above; see `arie.usage`'s own module docstring
+    for why no "modelled cost" caption is added here."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    from_at: datetime
+    to_at: datetime
+    leads_processed: int
+    qualified_count: int
+    rejected_count: int
+    review_count: int
+    pending_count: int
+    failed_count: int
+    provider_calls: int
+    cache_hits: int
+    provider_cost_usd: float
+    model_cost_usd: float
+    total_cost_usd: float
