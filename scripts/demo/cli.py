@@ -8,6 +8,7 @@ and a static HTML/JSON report. Every step is bounded; nothing hangs.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import uuid
 from datetime import UTC, datetime
@@ -50,7 +51,17 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    client = ArieClient(base_url=args.base_url)
+    api_key = os.environ.get("ARIE_DEMO_API_KEY")
+    if not api_key:
+        print(
+            "ARIE_DEMO_API_KEY is not set. Mint one with "
+            "`python -m scripts.mint_api_key --label 'local demo' "
+            "--scopes leads:write,leads:read,reviews:read,reviews:write` "
+            "and put it in your local .env (never commit it).",
+            file=sys.stderr,
+        )
+        return 1
+    client = ArieClient(base_url=args.base_url, api_key=api_key)
 
     try:
         if args.fresh:

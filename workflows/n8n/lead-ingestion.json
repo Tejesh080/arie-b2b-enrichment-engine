@@ -127,7 +127,8 @@
       "parameters": {
         "method": "POST",
         "url": "http://api:8000/leads",
-        "authentication": "none",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
         "sendBody": true,
         "contentType": "json",
         "specifyBody": "json",
@@ -139,6 +140,12 @@
               "neverError": true
             }
           }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "PLACEHOLDER",
+          "name": "ARIE Lead Ingestion API Key"
         }
       }
     },
@@ -161,9 +168,9 @@
       "typeVersion": 1,
       "position": [220, -40],
       "parameters": {
-        "content": "## Transport only\nThis workflow does field presence checks and JSON reshaping — nothing else. Email format, domain resolvability, budget rules, identity resolution, and idempotency (`source`+`external_ref`) are all decided by ARIE's `POST /leads` and returned verbatim by the last node. Both snake_case and camelCase input keys are accepted since senders vary; that's mapping, not business logic.",
-        "height": 200,
-        "width": 460
+        "content": "## Transport only\nThis workflow does field presence checks and JSON reshaping — nothing else. Email format, domain resolvability, budget rules, identity resolution, and idempotency (`source`+`external_ref`) are all decided by ARIE's `POST /leads` and returned verbatim by the last node. Both snake_case and camelCase input keys are accepted since senders vary; that's mapping, not business logic.\n\n**Auth (Productization M2B):** \"POST /leads\" authenticates with an ARIE organization API key via n8n's built-in \"Header Auth\" credential (name `Authorization`, value `Bearer <key>`) — never a hardcoded value in this JSON. Mint a `leads:write`-scoped key with `python -m scripts.mint_api_key --label 'n8n lead ingestion' --scopes leads:write`, create/select the credential named \"ARIE Lead Ingestion API Key\" on the \"POST /leads\" node, and paste the key in there. Do not set X-Organization-Id — API-key auth ignores it and derives the organization from the key itself.",
+        "height": 260,
+        "width": 480
       }
     }
   ],

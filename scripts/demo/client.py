@@ -53,6 +53,12 @@ class DemoApiClient(Protocol):
 class ArieClient:
     base_url: str = DEFAULT_BASE_URL
     request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
+    api_key: str | None = None
+    """An ARIE organization API key (Productization M2A/M2B) — sent as
+    `Authorization: Bearer <api_key>`. `organization_id` comes from the key
+    itself, so this client never sends `X-Organization-Id`; see
+    `arie.api.main.get_auth_context`'s own docstring for why that header is
+    never even read on the API-key path."""
     transport: httpx.BaseTransport | None = None
     """Normally `None` (real networking). `tests/unit/test_demo_client.py`
     injects `httpx.MockTransport` to fake ARIE's API deterministically without
@@ -62,12 +68,15 @@ class ArieClient:
     smoke test that needs a genuinely live app runs a real uvicorn server on
     an ephemeral port instead.)"""
 
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+
     def _get(self, path: str) -> dict[str, Any]:
         try:
             with httpx.Client(
                 base_url=self.base_url, timeout=self.request_timeout_s, transport=self.transport
             ) as client:
-                response = client.get(path)
+                response = client.get(path, headers=self._headers())
         except httpx.HTTPError as exc:
             raise DemoApiError(f"GET {path} failed: {exc}") from exc
         return self._parse(path, response)
@@ -77,7 +86,7 @@ class ArieClient:
             with httpx.Client(
                 base_url=self.base_url, timeout=self.request_timeout_s, transport=self.transport
             ) as client:
-                response = client.post(path, json=payload)
+                response = client.post(path, json=payload, headers=self._headers())
         except httpx.HTTPError as exc:
             raise DemoApiError(f"POST {path} failed: {exc}") from exc
         return self._parse(path, response)

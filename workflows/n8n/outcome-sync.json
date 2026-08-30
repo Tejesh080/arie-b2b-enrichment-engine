@@ -24,7 +24,8 @@
       "parameters": {
         "method": "GET",
         "url": "={{ 'http://api:8000/leads/' + $json.body.lead_id }}",
-        "authentication": "none",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
         "options": {
           "response": {
             "response": {
@@ -32,6 +33,12 @@
               "neverError": true
             }
           }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "PLACEHOLDER",
+          "name": "ARIE Outcome Sync API Key"
         }
       }
     },
@@ -303,8 +310,8 @@
       "typeVersion": 1,
       "position": [220, -260],
       "parameters": {
-        "content": "## Receive, not poll — deliberately\nARIE has no \"list leads by status\" endpoint today, and implementing a client-side discovery/retry loop here would duplicate backend concerns this task explicitly says n8n must not own. Call this webhook with `{\"lead_id\": \"...\"}` once you already know a decision finalized. If ARIE later adds e.g. `GET /leads?status=...`, swap the Webhook trigger for a Schedule Trigger against that endpoint — the rest of the chain (fetch -> filter finalized -> transform -> sink) is unchanged.",
-        "height": 220,
+        "content": "## Receive, not poll — deliberately\nARIE has no \"list leads by status\" endpoint today, and implementing a client-side discovery/retry loop here would duplicate backend concerns this task explicitly says n8n must not own. Call this webhook with `{\"lead_id\": \"...\"}` once you already know a decision finalized. If ARIE later adds e.g. `GET /leads?status=...`, swap the Webhook trigger for a Schedule Trigger against that endpoint — the rest of the chain (fetch -> filter finalized -> transform -> sink) is unchanged.\n\n**Auth (Productization M2B):** \"GET /leads/{id}\" authenticates with an ARIE organization API key via n8n's built-in \"Header Auth\" credential (name `Authorization`, value `Bearer <key>`). Mint a `leads:read`-scoped key with `python -m scripts.mint_api_key --label 'n8n outcome sync' --scopes leads:read`, create/select the credential named \"ARIE Outcome Sync API Key\" on that node, and paste the key in there. No X-Organization-Id header — API-key auth derives the organization from the key. \"POST Mock CRM Sink\" is unaffected: it targets n8n's own local webhook, not ARIE's API.",
+        "height": 280,
         "width": 480
       }
     },

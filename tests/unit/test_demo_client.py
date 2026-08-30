@@ -81,6 +81,36 @@ def test_transport_error_raises_demo_api_error_not_a_bare_httpx_error() -> None:
 # -------------------------------------------------------------------- writes --
 
 
+# ------------------------------------------------------------------- auth --
+
+
+def test_no_authorization_header_is_sent_without_an_api_key() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = request.headers
+        return _json_response(200, {"status": "ok"})
+
+    ArieClient(transport=httpx.MockTransport(handler), request_timeout_s=2.0).health()
+
+    assert "authorization" not in captured["headers"]
+
+
+def test_api_key_is_sent_as_a_bearer_token_and_no_organization_header_is_sent() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = request.headers
+        return _json_response(200, {"status": "ok"})
+
+    ArieClient(
+        transport=httpx.MockTransport(handler), request_timeout_s=2.0, api_key="arie_test123"
+    ).health()
+
+    assert captured["headers"]["authorization"] == "Bearer arie_test123"
+    assert "x-organization-id" not in captured["headers"]
+
+
 def test_post_lead_sends_the_payload_and_returns_the_body() -> None:
     captured: dict[str, Any] = {}
 
