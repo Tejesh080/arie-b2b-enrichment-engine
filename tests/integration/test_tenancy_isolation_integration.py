@@ -16,7 +16,7 @@ from the corrected tenancy boundary (`migrations/0012_organizations_and_members.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -25,11 +25,10 @@ import jwt
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
-from tests.integration.conftest import IngestCleanup, authorize_app
+from tests.integration.conftest import IngestCleanup
 
 from arie.api.main import AppState, create_app
 from arie.approval.workflow import request_review
-from arie.auth import AuthContext
 from arie.config import SupabaseAuthConfig
 from arie.core.types import Evidence, LeadStatus, ProviderStatus
 from arie.evidence.store import PostgresEvidenceStore
@@ -54,29 +53,6 @@ def _sign(*, sub: str) -> str:
         _JWT_SECRET,
         algorithm="HS256",
     )
-
-
-@pytest.fixture
-def other_org(db_conn: psycopg.Connection) -> UUID:
-    """A second, real organization — "Organization B" for every test below."""
-    org_id = uuid4()
-    with db_conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO organizations (organization_id, name, slug, status) "
-            "VALUES (%s, %s, %s, 'active')",
-            (org_id, "Tenancy Isolation Test Org B", f"tenancy-test-{org_id.hex[:10]}"),
-        )
-    db_conn.commit()
-    return org_id
-
-
-@pytest.fixture
-def api_client_org_b(app_state: AppState, other_org: UUID) -> Iterator[TestClient]:
-    """The same app/database as `api_client`, authenticated as `other_org` instead."""
-    app = create_app(state=app_state)
-    authorize_app(app, AuthContext(user_id=uuid4(), organization_id=other_org, role="owner"))
-    with TestClient(app, raise_server_exceptions=False) as client:
-        yield client
 
 
 def _make_pending_review(

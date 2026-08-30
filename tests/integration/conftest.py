@@ -346,7 +346,10 @@ def authorize_app(app: FastAPI, auth_context: AuthContext | None = None) -> Auth
     the default.
     """
     context = auth_context or AuthContext(
-        user_id=uuid.uuid4(), organization_id=LEGACY_ORGANIZATION_ID, role="owner"
+        organization_id=LEGACY_ORGANIZATION_ID,
+        auth_method="jwt",
+        user_id=uuid.uuid4(),
+        role="owner",
     )
     app.dependency_overrides[get_auth_context] = lambda: context
     return context
@@ -364,7 +367,12 @@ def test_auth_context() -> AuthContext:
     [get_auth_context]` mid-test — see
     `tests/integration/test_tenancy_isolation_integration.py`.
     """
-    return AuthContext(user_id=uuid.uuid4(), organization_id=LEGACY_ORGANIZATION_ID, role="owner")
+    return AuthContext(
+        organization_id=LEGACY_ORGANIZATION_ID,
+        auth_method="jwt",
+        user_id=uuid.uuid4(),
+        role="owner",
+    )
 
 
 @pytest.fixture
@@ -391,6 +399,51 @@ def api_client(app_state: AppState, test_auth_context: AuthContext) -> Iterator[
     app.dependency_overrides[get_auth_context] = lambda: test_auth_context
     with TestClient(app, raise_server_exceptions=False) as client:
         yield client
+
+
+@pytest.fixture
+def other_org(db_conn: psycopg.Connection) -> UUID:
+    """A second, real organization — "Organization B" for every cross-tenant
+    test that needs one alongside `LEGACY_ORGANIZATION_ID` ("Organization A",
+    what `api_client` authenticates as by default)."""
+    org_id = uuid.uuid4()
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO organizations (organization_id, name, slug, status) "
+            "VALUES (%s, %s, %s, 'active')",
+            (org_id, "Tenancy Isolation Test Org B", f"tenancy-test-{org_id.hex[:10]}"),
+        )
+    db_conn.commit()
+    return org_id
+
+
+@pytest.fixture
+def api_client_org_b(app_state: AppState, other_org: UUID) -> Iterator[TestClient]:
+    """The same app/database as `api_client`, authenticated as `other_org` instead."""
+    app = create_app(state=app_state)
+    authorize_app(
+        app,
+        AuthContext(
+            organization_id=other_org, auth_method="jwt", user_id=uuid.uuid4(), role="owner"
+        ),
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        yield client
+
+
+@pytest.fixture
+def cleanup_api_keys(db_conn: psycopg.Connection) -> Iterator[list[UUID]]:
+    """Deletes `organization_api_keys` rows by id — the same
+    register-then-delete-by-primary-key shape as `cleanup_leads`/
+    `cleanup_evidence`, so Productization M2A's tests don't accumulate keys
+    against `LEGACY_ORGANIZATION_ID` across runs the way an unfiltered
+    `GET /api-keys` listing would eventually make visible."""
+    key_ids: list[UUID] = []
+    yield key_ids
+    if key_ids:
+        with db_conn.cursor() as cur:
+            cur.execute("DELETE FROM organization_api_keys WHERE key_id = ANY(%s)", (key_ids,))
+        db_conn.commit()
 
 
 @pytest.fixture

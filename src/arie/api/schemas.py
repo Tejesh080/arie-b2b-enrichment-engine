@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from arie.api.ingest import LeadIngestCommand
 from arie.api.receipt import DecisionReceipt
+from arie.apikeys import SCOPES
 from arie.approval.workflow import ReviewAction
 from arie.core.types import LeadStatus
 from arie.identity.normalize import normalize_domain, normalize_email
@@ -347,3 +348,59 @@ class ReceiptResponse(BaseModel):
     @classmethod
     def from_receipt(cls, receipt: DecisionReceipt) -> ReceiptResponse:
         return cls.model_validate(receipt)
+
+
+# ------------------------------------------------------------------ api keys --
+#
+# Productization M2A. `arie.apikeys.SCOPES` stays the single source of truth
+# for the allowed scope vocabulary (also enforced by the database's own CHECK
+# constraint, migrations/0017_organization_api_keys.sql) — validated here so a
+# typo'd scope is rejected as 422 rather than surfacing as a 500 from the
+# database constraint.
+
+
+class CreateApiKeyRequest(BaseModel):
+    """`POST /api-keys` — mint a new machine credential for this organization.
+
+    Requires an owner/admin JWT session (`AuthContext.is_org_admin`); an
+    API-key-authenticated request is refused regardless of its own scopes —
+    no scope grants organization management, on purpose.
+    """
+
+    label: Annotated[str, Field(min_length=1, max_length=200)]
+    scopes: list[str] = Field(default_factory=list)
+    """Empty is valid and deliberately not the default a caller should want —
+    a key with no scopes authenticates but can perform no data-plane action,
+    which is a safe (if useless) starting point, never an error."""
+
+    @field_validator("scopes")
+    @classmethod
+    def _scopes_are_known(cls, value: list[str]) -> list[str]:
+        unknown = sorted(set(value) - set(SCOPES))
+        if unknown:
+            raise ValueError(f"unknown scope(s) {unknown} — must be one of {list(SCOPES)}")
+        return value
+
+
+class ApiKeyResponse(BaseModel):
+    """One API key's metadata. Never the raw key, never its hash — see
+    `arie.apikeys.ApiKeyRecord`, which this mirrors field for field."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    key_id: UUID
+    label: str
+    key_prefix: str
+    scopes: list[str]
+    created_by_user_id: UUID
+    created_at: datetime
+    last_used_at: datetime | None
+    revoked_at: datetime | None
+
+
+class ApiKeyCreatedResponse(ApiKeyResponse):
+    """`POST /api-keys`'s response — the one and only place the raw key is
+    ever shown. Not retrievable afterward by any endpoint; losing it means
+    revoking the key and creating a new one."""
+
+    raw_key: str

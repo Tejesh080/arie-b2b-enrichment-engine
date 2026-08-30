@@ -1,8 +1,21 @@
-"""Authentication and tenant-scoping for the runtime API — Productization M1.
+"""Authentication and tenant-scoping for the runtime API.
 
-Verifies a Supabase-issued user session JWT and resolves the caller's active
-membership in the organization named by the request's `X-Organization-Id`
-header, producing an `AuthContext` every endpoint scopes its queries by.
+Two independent ways to reach an `AuthContext`, both producing the same
+type so every endpoint scopes its queries identically regardless of which one
+authenticated the request:
+
+* **Supabase user JWT + `X-Organization-Id` header** (`resolve_auth_context`,
+  Productization M1) — a human, or a machine holding a real user's session
+  token. `organization_id` comes from the header, checked against
+  `organization_members`.
+* **ARIE organization API key** (Productization M2A —
+  `arie.apikeys.verify_api_key`, wrapped here as `resolve_api_key_context`) —
+  a machine credential for n8n, scripts, and CRM/webhook integrations that
+  should never need a human's session token. `organization_id` comes from the
+  *key itself*, never from any header — seeing `X-Organization-Id` on an
+  API-key-authenticated request does not make it trusted, it is simply
+  ignored (`arie.api.main.get_auth_context` never even parses it on this
+  path).
 
 **This is the primary tenant-isolation control, not a secondary one.** The
 FastAPI backend connects to Postgres with a service-role/superuser connection
@@ -11,33 +24,30 @@ entirely — see `migrations/0016_row_level_security.sql`'s own docstring. Every
 `organization_id` filter added elsewhere in this codebase is only as safe as
 this module correctly identifying who is calling and which organization they
 belong to.
-
-**No machine-credential mechanism exists yet.** `organization_api_keys` is
-explicitly out of scope for this milestone, so every caller — a human in a
-browser, or a machine integration like an n8n workflow — authenticates with
-the same Supabase user JWT. A production n8n workflow will need a real user's
-session token until API keys land in a later phase; that is a stated,
-deliberate limitation of this milestone, not an oversight.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import jwt
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+from arie.apikeys import InvalidApiKeyError, RevokedApiKeyError, verify_api_key
 from arie.config import SUPABASE_AUTH
 
 __all__ = [
     "ROLES",
     "AuthContext",
     "AuthenticationError",
+    "InvalidApiKeyError",
     "NotAMemberError",
+    "RevokedApiKeyError",
     "decode_supabase_jwt",
+    "resolve_api_key_context",
     "resolve_auth_context",
 ]
 
@@ -85,12 +95,50 @@ class AuthContext:
     `AuthContext` per request depending on which `X-Organization-Id` they
     sent — there is no session-wide "current organization," and no
     organization-switcher UI to pick one exists yet (explicitly out of scope
-    for this milestone; the frontend repo is untouched).
+    for Productization M1/M2A; the frontend repo is untouched).
+
+    `auth_method` decides which of the two field groups below is populated:
+    `user_id`/`role` for `"jwt"`, `api_key_id`/`scopes` for `"api_key"`. They
+    are not merged into one shape because they answer different questions —
+    a human's authority comes from their *role* in the organization, a
+    machine credential's from the *scopes* an admin explicitly granted it —
+    and collapsing them would let one silently stand in for the other.
     """
 
-    user_id: UUID
     organization_id: UUID
-    role: str
+    auth_method: Literal["jwt", "api_key"]
+    user_id: UUID | None = None
+    role: str | None = None
+    api_key_id: UUID | None = None
+    scopes: frozenset[str] | None = None
+
+    def has_scope(self, scope: str) -> bool:
+        """Whether this caller may perform an action gated by `scope`.
+
+        A JWT session is never scope-limited — role (owner/admin/
+        analyst_reviewer) already gates the boundaries that matter for a
+        human, and every role can perform every data-plane action in this
+        API today (see `arie.api.main`'s endpoint list). Scopes exist
+        specifically to let an *API key* be granted less than full access —
+        `leads:read` without `leads:write`, say — which a human session has
+        no equivalent restriction for yet.
+        """
+        if self.auth_method == "jwt":
+            return True
+        return scope in (self.scopes or frozenset())
+
+    def is_org_admin(self) -> bool:
+        """Whether this caller may manage the organization itself (API keys
+        today; members/settings/billing in later phases).
+
+        Deliberately `False` for every API-key-authenticated request,
+        regardless of its scopes — none of `arie.apikeys.SCOPES` grants
+        organization management, and there is no scope that could, on
+        purpose: a machine credential must never be able to mint, list, or
+        revoke API keys, including the very one authenticating the request
+        that asks.
+        """
+        return self.auth_method == "jwt" and self.role in ("owner", "admin")
 
 
 def decode_supabase_jwt(token: str) -> dict[str, Any]:
@@ -141,4 +189,28 @@ def resolve_auth_context(pool: ConnectionPool, *, token: str, organization_id: U
     if row is None:
         raise NotAMemberError(organization_id)
 
-    return AuthContext(user_id=user_id, organization_id=organization_id, role=row["role"])
+    return AuthContext(
+        organization_id=organization_id, auth_method="jwt", user_id=user_id, role=row["role"]
+    )
+
+
+def resolve_api_key_context(pool: ConnectionPool, *, raw_key: str) -> AuthContext:
+    """Verify an ARIE organization API key and build its `AuthContext`.
+
+    A thin wrapper around `arie.apikeys.verify_api_key` — this module is
+    where every request-time authentication path lives, so `arie.api.main`
+    only ever imports from here, never reaching into `arie.apikeys` directly
+    for the verification step (it still imports `arie.apikeys.looks_like_api_key`
+    to decide which of the two paths to take at all).
+
+    Propagates `InvalidApiKeyError`/`RevokedApiKeyError` unchanged — both are
+    re-exported from this module so `arie.api.main` has one place to import
+    every auth exception from.
+    """
+    verified = verify_api_key(pool, raw_key=raw_key)
+    return AuthContext(
+        organization_id=verified.organization_id,
+        auth_method="api_key",
+        api_key_id=verified.key_id,
+        scopes=verified.scopes,
+    )

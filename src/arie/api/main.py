@@ -38,6 +38,9 @@ from arie.api.ingest import ingest_lead
 from arie.api.reads import fetch_lead
 from arie.api.receipt import build_receipt
 from arie.api.schemas import (
+    ApiKeyCreatedResponse,
+    ApiKeyResponse,
+    CreateApiKeyRequest,
     HealthResponse,
     IngestLeadRequest,
     IngestLeadResponse,
@@ -48,13 +51,22 @@ from arie.api.schemas import (
     ReviewDecisionResponse,
     ReviewResponse,
 )
+from arie.apikeys import create_api_key, list_api_keys, looks_like_api_key, revoke_api_key
 from arie.approval.workflow import (
     ReviewConflictError,
     ReviewNotFoundError,
     get_review,
     submit_decision,
 )
-from arie.auth import AuthContext, AuthenticationError, NotAMemberError, resolve_auth_context
+from arie.auth import (
+    AuthContext,
+    AuthenticationError,
+    InvalidApiKeyError,
+    NotAMemberError,
+    RevokedApiKeyError,
+    resolve_api_key_context,
+    resolve_auth_context,
+)
 from arie.config import DATABASE, OBSERVABILITY
 from arie.identity.resolver import IdentityResolver
 from arie.jobs.queue import PostgresJobQueue
@@ -207,14 +219,23 @@ StateDep = Annotated[AppState, Depends(get_state)]
 
 
 def get_auth_context(request: Request, state: StateDep) -> AuthContext:
-    """Productization M1's auth boundary: a Supabase bearer token plus an
-    `X-Organization-Id` header, resolved to an `AuthContext`.
+    """The auth boundary every customer-facing endpoint below depends on —
+    which is what makes "forgetting the organization_id filter" impossible to
+    do *silently*: a handler with no `AuthDep` parameter simply has no
+    organization_id to scope with in the first place. `/healthz` is the one
+    deliberate exception: an infra liveness probe has no caller identity to
+    check.
 
-    Every customer-facing endpoint below depends on this, which is what makes
-    "forgetting the organization_id filter" impossible to do *silently* — a
-    handler with no `AuthDep` parameter simply has no organization_id to scope
-    with in the first place. `/healthz` is the one deliberate exception: an
-    infra liveness probe has no caller identity to check.
+    Two authentication paths share one bearer-token header, told apart by
+    `arie.apikeys.looks_like_api_key`'s prefix check on the token itself —
+    never by a second header or a client-declared type:
+
+    * An ARIE organization API key (Productization M2A) — `organization_id`
+      comes from the key alone; `X-Organization-Id` is never even read on
+      this path, so it cannot be trusted (or mistrusted) for anything.
+    * A Supabase user JWT (Productization M1) — `organization_id` comes from
+      the required `X-Organization-Id` header, checked against the token's
+      membership.
     """
     authorization = request.headers.get("authorization", "")
     if not authorization.lower().startswith("bearer "):
@@ -224,6 +245,16 @@ def get_auth_context(request: Request, state: StateDep) -> AuthContext:
             headers={"WWW-Authenticate": "Bearer"},
         )
     token = authorization[len("Bearer ") :].strip()
+
+    if looks_like_api_key(token):
+        try:
+            return resolve_api_key_context(state.pool, raw_key=token)
+        except (InvalidApiKeyError, RevokedApiKeyError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=str(exc) if isinstance(exc, RevokedApiKeyError) else "invalid API key",
+                headers={"WWW-Authenticate": "Bearer"},
+            ) from exc
 
     org_header = request.headers.get("x-organization-id")
     if not org_header:
@@ -251,6 +282,26 @@ def get_auth_context(request: Request, state: StateDep) -> AuthContext:
 
 
 AuthDep = Annotated[AuthContext, Depends(get_auth_context)]
+
+
+def _require_scope(auth: AuthContext, scope: str) -> None:
+    """Gate a data-plane action on `scope`. A no-op for a JWT session (see
+    `AuthContext.has_scope`); refuses an API key that wasn't granted it."""
+    if not auth.has_scope(scope):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=f"missing required scope: {scope}"
+        )
+
+
+def _require_org_admin(auth: AuthContext) -> None:
+    """Gate an organization-management action (API key create/list/revoke
+    today) on an owner/admin *JWT* session — never satisfiable by an API key,
+    however it's scoped; see `AuthContext.is_org_admin`."""
+    if not auth.is_org_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="requires an owner or admin session (API keys cannot manage API keys)",
+        )
 
 
 def register_routes(app: FastAPI) -> None:
@@ -313,6 +364,7 @@ def register_routes(app: FastAPI) -> None:
         state: StateDep,
         auth: AuthDep,
     ) -> IngestLeadResponse:
+        _require_scope(auth, "leads:write")
         with _transaction(state.pool) as conn:
             result = ingest_lead(
                 conn,
@@ -344,6 +396,7 @@ def register_routes(app: FastAPI) -> None:
 
     @app.get("/leads/{lead_id}", response_model=LeadResponse)
     def get_lead(lead_id: UUID, state: StateDep, auth: AuthDep) -> LeadResponse:
+        _require_scope(auth, "leads:read")
         with state.pool.connection() as conn:
             record = fetch_lead(conn, lead_id, organization_id=auth.organization_id)
         if record is None:
@@ -383,6 +436,7 @@ def register_routes(app: FastAPI) -> None:
         (dead-lettered before a decision), and "decided" — see
         ``arie.api.receipt.DecisionReceipt``.
         """
+        _require_scope(auth, "leads:read")
         with state.pool.connection() as conn:
             receipt = build_receipt(
                 conn, state.ledger, lead_id, organization_id=auth.organization_id
@@ -393,6 +447,7 @@ def register_routes(app: FastAPI) -> None:
 
     @app.get("/reviews/{review_id}", response_model=ReviewResponse)
     def get_review_endpoint(review_id: UUID, state: StateDep, auth: AuthDep) -> ReviewResponse:
+        _require_scope(auth, "reviews:read")
         with state.pool.connection() as conn:
             record = get_review(conn, review_id, organization_id=auth.organization_id)
         if record is None:
@@ -421,6 +476,7 @@ def register_routes(app: FastAPI) -> None:
         state: StateDep,
         auth: AuthDep,
     ) -> ReviewDecisionResponse:
+        _require_scope(auth, "reviews:write")
         # Every failure mode below rolls back the whole transaction, including
         # the review's own compare-and-swap update if it got that far — see
         # `arie.approval.workflow.submit_decision`'s docstring. `_transaction`'s
@@ -457,6 +513,53 @@ def register_routes(app: FastAPI) -> None:
             lead_version=result.lead_version,
             already_applied=result.already_applied,
         )
+
+    # ---------------------------------------------------------- api keys --
+    #
+    # Productization M2A. Every route here requires an owner/admin *JWT*
+    # session (`_require_org_admin`) — an API key can never manage API keys,
+    # including the one authenticating the request that asks, regardless of
+    # its own scopes. `organization_id` is always `auth.organization_id`,
+    # never a path parameter, matching every other tenant-scoped route in
+    # this API — there is no way to address another organization's keys at
+    # all, not even one that would be rejected.
+
+    @app.post(
+        "/api-keys", response_model=ApiKeyCreatedResponse, status_code=status.HTTP_201_CREATED
+    )
+    def create_api_key_endpoint(
+        payload: CreateApiKeyRequest, state: StateDep, auth: AuthDep
+    ) -> ApiKeyCreatedResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        with _transaction(state.pool) as conn:
+            record, raw_key = create_api_key(
+                conn,
+                organization_id=auth.organization_id,
+                created_by_user_id=auth.user_id,
+                label=payload.label,
+                scopes=payload.scopes,
+            )
+        base = ApiKeyResponse.model_validate(record)
+        return ApiKeyCreatedResponse(**base.model_dump(), raw_key=raw_key)
+
+    @app.get("/api-keys", response_model=list[ApiKeyResponse])
+    def list_api_keys_endpoint(state: StateDep, auth: AuthDep) -> list[ApiKeyResponse]:
+        _require_org_admin(auth)
+        with state.pool.connection() as conn:
+            records = list_api_keys(conn, organization_id=auth.organization_id)
+        return [ApiKeyResponse.model_validate(record) for record in records]
+
+    @app.post("/api-keys/{key_id}/revoke", response_model=ApiKeyResponse)
+    def revoke_api_key_endpoint(key_id: UUID, state: StateDep, auth: AuthDep) -> ApiKeyResponse:
+        _require_org_admin(auth)
+        with _transaction(state.pool) as conn:
+            record = revoke_api_key(conn, organization_id=auth.organization_id, key_id=key_id)
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"no API key {key_id}"
+            )
+        return ApiKeyResponse.model_validate(record)
 
 
 # Module-level app for `uvicorn arie.api.main:app` (see the Makefile's `serve`
