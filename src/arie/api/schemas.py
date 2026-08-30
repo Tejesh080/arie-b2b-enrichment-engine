@@ -24,6 +24,7 @@ from arie.approval.workflow import ReviewAction
 from arie.core.types import LeadStatus
 from arie.icp_profiles import InvalidICPConfigError, validate_config
 from arie.identity.normalize import normalize_domain, normalize_email
+from arie.organizations import InvalidOrganizationSettingsError, validate_timezone
 
 
 class IngestLeadRequest(BaseModel):
@@ -477,6 +478,68 @@ class ICPProfileResponse(BaseModel):
     created_at: datetime
     activated_at: datetime
     retired_at: datetime | None
+
+
+# ---------------------------------------------------------- organization settings --
+#
+# Productization M4 Part 1. `GET /organization` is read-gated identically to
+# ICP configuration (`_require_jwt_session` — any active member); `PATCH
+# /organization` requires an owner/admin JWT session
+# (`_require_org_admin`), same rule as ICP writes and API keys.
+
+
+class OrganizationResponse(BaseModel):
+    """Mirrors `arie.organizations.OrganizationRecord` field for field."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    organization_id: UUID
+    name: str
+    slug: str
+    status: str
+    timezone: str
+    company_domain: str | None
+    onboarding_completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class UpdateOrganizationRequest(BaseModel):
+    """`PATCH /organization`. Every field is optional and, via
+    `exclude_unset`, only the fields actually present in the request body
+    reach `arie.organizations.update_organization` — a field simply omitted
+    is left untouched, while `company_domain` sent as explicit `null` clears
+    it (the only nullable field here). At least one field must be present;
+    an empty body is rejected rather than silently accepted as a no-op PATCH,
+    which is almost always a client mistake worth surfacing.
+    """
+
+    name: Annotated[str, Field(min_length=1, max_length=200)] | None = None
+    timezone: str | None = None
+    company_domain: Annotated[str | None, Field(max_length=253)] = None
+
+    @field_validator("timezone")
+    @classmethod
+    def _timezone_is_known(cls, value: str | None) -> str | None:
+        if value is not None:
+            try:
+                validate_timezone(value)
+            except InvalidOrganizationSettingsError as exc:
+                raise ValueError(str(exc)) from exc
+        return value
+
+    @field_validator("company_domain")
+    @classmethod
+    def _domain_is_normalizable(cls, value: str | None) -> str | None:
+        if value is not None:
+            normalize_domain(value)
+        return value
+
+    @model_validator(mode="after")
+    def _at_least_one_field(self) -> UpdateOrganizationRequest:
+        if not self.model_fields_set:
+            raise ValueError("at least one field must be provided")
+        return self
 
 
 # --------------------------------------------------------------- CSV batches --

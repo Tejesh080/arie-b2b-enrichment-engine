@@ -53,10 +53,12 @@ from arie.api.schemas import (
     IngestLeadResponse,
     LeadCostResponse,
     LeadResponse,
+    OrganizationResponse,
     ReceiptResponse,
     ReviewDecisionRequest,
     ReviewDecisionResponse,
     ReviewResponse,
+    UpdateOrganizationRequest,
     UsageSummaryResponse,
 )
 from arie.apikeys import create_api_key, list_api_keys, looks_like_api_key, revoke_api_key
@@ -100,6 +102,11 @@ from arie.jobs.queue import PostgresJobQueue
 from arie.ledger.store import PostgresCostLedger
 from arie.migrations import MigrationsDirectoryError, pending_migrations
 from arie.observability.tracing import configure_tracing, shutdown_tracing
+from arie.organizations import (
+    InvalidOrganizationSettingsError,
+    get_organization,
+    update_organization,
+)
 from arie.statemachine.apply import OptimisticConcurrencyError
 from arie.usage import get_usage_summary
 
@@ -581,6 +588,46 @@ def register_routes(app: FastAPI) -> None:
             lead_version=result.lead_version,
             already_applied=result.already_applied,
         )
+
+    # -------------------------------------------------- organization settings --
+    #
+    # Productization M4 Part 1. Same permission split as ICP configuration
+    # just below: read open to any active member (`_require_jwt_session`),
+    # write owner/admin-only (`_require_org_admin`). No API-key scope for
+    # either — organization settings are not a data-plane concern any
+    # existing machine caller touches.
+
+    @app.get("/organization", response_model=OrganizationResponse)
+    def get_organization_endpoint(state: StateDep, auth: AuthDep) -> OrganizationResponse:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            record = get_organization(conn, organization_id=auth.organization_id)
+        if record is None:  # pragma: no cover - an authenticated org always exists
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="organization not found"
+            )
+        return OrganizationResponse.model_validate(record)
+
+    @app.patch("/organization", response_model=OrganizationResponse)
+    def update_organization_endpoint(
+        payload: UpdateOrganizationRequest, state: StateDep, auth: AuthDep
+    ) -> OrganizationResponse:
+        _require_org_admin(auth)
+        updates = payload.model_dump(exclude_unset=True)
+        try:
+            with _transaction(state.pool) as conn:
+                record = update_organization(
+                    conn, organization_id=auth.organization_id, updates=updates
+                )
+        except InvalidOrganizationSettingsError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+        if record is None:  # pragma: no cover - an authenticated org always exists
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="organization not found"
+            )
+        return OrganizationResponse.model_validate(record)
 
     # ------------------------------------------------------- icp profiles --
     #
