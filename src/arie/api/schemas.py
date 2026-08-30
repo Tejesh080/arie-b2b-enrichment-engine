@@ -635,6 +635,48 @@ class AcceptInvitationRequest(BaseModel):
     token: Annotated[str, Field(min_length=1)]
 
 
+# ------------------------------------------------------------- provider configs --
+#
+# Productization M4 Parts 3-5. Reads open to any active member
+# (`_require_jwt_session`) — the response shape below never carries a
+# secret, only metadata a member is safe to see; writes (save/replace
+# credential, enable/disable, remove, test) are owner/admin-only
+# (`_require_org_admin`), same tier as ICP configuration writes.
+
+
+class ProviderStatusResponse(BaseModel):
+    """Mirrors `arie.provider_configs.ProviderStatus` field for field.
+    Never a secret, never an encrypted value — see that class's own
+    docstring for why every supported provider gets an entry regardless of
+    whether it has been configured."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    provider: str
+    configured: bool
+    enabled: bool
+    updated_at: datetime | None
+    last_tested_at: datetime | None
+    last_test_status: str | None
+    last_test_error: str | None
+
+
+class SetProviderCredentialRequest(BaseModel):
+    """`PUT /organization/providers/{provider}` — save (or replace) a
+    credential. Deliberately not named `api_key`: not every provider's
+    credential is literally an API key in shape, and this field is the same
+    for all three today."""
+
+    credential: Annotated[str, Field(min_length=1, max_length=4000)]
+
+
+class SetProviderEnabledRequest(BaseModel):
+    """`PATCH /organization/providers/{provider}` — toggle without touching
+    the stored credential."""
+
+    enabled: bool
+
+
 # --------------------------------------------------------------- CSV batches --
 #
 # Productization M3. `arie.batches.BatchProgress` is always computed fresh

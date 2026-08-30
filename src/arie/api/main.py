@@ -59,10 +59,13 @@ from arie.api.schemas import (
     LeadResponse,
     MemberResponse,
     OrganizationResponse,
+    ProviderStatusResponse,
     ReceiptResponse,
     ReviewDecisionRequest,
     ReviewDecisionResponse,
     ReviewResponse,
+    SetProviderCredentialRequest,
+    SetProviderEnabledRequest,
     UpdateMemberRoleRequest,
     UpdateOrganizationRequest,
     UsageSummaryResponse,
@@ -97,6 +100,7 @@ from arie.batches import (
     list_batches,
 )
 from arie.config import DATABASE, OBSERVABILITY
+from arie.credential_resolver import resolve_provider_credential
 from arie.icp_profiles import (
     create_profile as create_icp_profile_row,
 )
@@ -134,6 +138,17 @@ from arie.organizations import (
     get_organization,
     update_organization,
 )
+from arie.provider_configs import (
+    InvalidProviderError,
+    ProviderStatus,
+    delete_provider_config,
+    get_provider_status,
+    list_provider_statuses,
+    record_test_result,
+    set_provider_credential,
+    set_provider_enabled,
+)
+from arie.provider_testing import ConnectionTestResult, test_connection
 from arie.statemachine.apply import OptimisticConcurrencyError
 from arie.usage import get_usage_summary
 
@@ -853,6 +868,157 @@ def register_routes(app: FastAPI) -> None:
                 detail="this invitation was sent to a different email address",
             ) from exc
         return InvitationResponse.model_validate(record)
+
+    # ------------------------------------------------------ provider configs --
+    #
+    # Productization M4 Parts 3-5. Reads open to any active member
+    # (`_require_jwt_session`) — see the schemas module's own banner
+    # comment for why (never a secret in the response shape). Writes
+    # (save/replace credential, enable/disable, remove, test) are
+    # owner/admin-only. No API-key scope for any of it — a machine
+    # credential must never manage another credential.
+
+    @app.get("/organization/providers", response_model=list[ProviderStatusResponse])
+    def list_provider_statuses_endpoint(
+        state: StateDep, auth: AuthDep
+    ) -> list[ProviderStatusResponse]:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            statuses = list_provider_statuses(conn, organization_id=auth.organization_id)
+        return [ProviderStatusResponse.model_validate(s) for s in statuses]
+
+    @app.get("/organization/providers/{provider}", response_model=ProviderStatusResponse)
+    def get_provider_status_endpoint(
+        provider: str, state: StateDep, auth: AuthDep
+    ) -> ProviderStatusResponse:
+        _require_jwt_session(auth)
+        try:
+            with state.pool.connection() as conn:
+                result = get_provider_status(
+                    conn, organization_id=auth.organization_id, provider=provider
+                )
+        except InvalidProviderError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        return ProviderStatusResponse.model_validate(result)
+
+    @app.put("/organization/providers/{provider}", response_model=ProviderStatusResponse)
+    def set_provider_credential_endpoint(
+        provider: str,
+        payload: SetProviderCredentialRequest,
+        state: StateDep,
+        auth: AuthDep,
+    ) -> ProviderStatusResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        try:
+            with _transaction(state.pool) as conn:
+                record = set_provider_credential(
+                    conn,
+                    organization_id=auth.organization_id,
+                    provider=provider,
+                    raw_credential=payload.credential,
+                    actor_user_id=auth.user_id,
+                )
+        except InvalidProviderError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        return ProviderStatusResponse.model_validate(ProviderStatus.from_record(record))
+
+    @app.patch("/organization/providers/{provider}", response_model=ProviderStatusResponse)
+    def set_provider_enabled_endpoint(
+        provider: str,
+        payload: SetProviderEnabledRequest,
+        state: StateDep,
+        auth: AuthDep,
+    ) -> ProviderStatusResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        try:
+            with _transaction(state.pool) as conn:
+                record = set_provider_enabled(
+                    conn,
+                    organization_id=auth.organization_id,
+                    provider=provider,
+                    enabled=payload.enabled,
+                    actor_user_id=auth.user_id,
+                )
+        except InvalidProviderError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"{provider} has not been configured for this organization",
+            )
+        return ProviderStatusResponse.model_validate(ProviderStatus.from_record(record))
+
+    @app.delete("/organization/providers/{provider}", status_code=status.HTTP_204_NO_CONTENT)
+    def delete_provider_config_endpoint(provider: str, state: StateDep, auth: AuthDep) -> None:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        try:
+            with _transaction(state.pool) as conn:
+                deleted = delete_provider_config(
+                    conn,
+                    organization_id=auth.organization_id,
+                    provider=provider,
+                    actor_user_id=auth.user_id,
+                )
+        except InvalidProviderError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"{provider} has not been configured for this organization",
+            )
+
+    @app.post("/organization/providers/{provider}/test", response_model=ProviderStatusResponse)
+    def test_provider_connection_endpoint(
+        provider: str, state: StateDep, auth: AuthDep
+    ) -> ProviderStatusResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+
+        try:
+            with state.pool.connection() as conn:
+                current = get_provider_status(
+                    conn, organization_id=auth.organization_id, provider=provider
+                )
+        except InvalidProviderError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        if not current.configured:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"{provider} has not been configured for this organization",
+            )
+
+        with state.pool.connection() as conn:
+            raw_credential = resolve_provider_credential(
+                conn, organization_id=auth.organization_id, provider=provider
+            )
+        # `current.configured` already confirmed a row exists; the only way
+        # this is still None is a genuinely orphaned Vault secret, which
+        # `arie.provider_configs`'s single-transaction writes are designed
+        # to make impossible — treated as a transport-shaped test failure
+        # rather than a 5xx, so the admin sees "test failed," not a crash.
+        if raw_credential is None:
+            result = ConnectionTestResult(success=False, sanitized_error="credential_unavailable")
+        else:
+            result = test_connection(provider, raw_credential)
+
+        with _transaction(state.pool) as conn:
+            record = record_test_result(
+                conn,
+                organization_id=auth.organization_id,
+                provider=provider,
+                success=result.success,
+                sanitized_error=result.sanitized_error,
+                actor_user_id=auth.user_id,
+            )
+        if record is None:  # a concurrent removal raced this test to completion
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"{provider} has not been configured for this organization",
+            )
+        return ProviderStatusResponse.model_validate(ProviderStatus.from_record(record))
 
     # ------------------------------------------------------- icp profiles --
     #
