@@ -39,6 +39,7 @@ from arie.api.ingest import ingest_lead
 from arie.api.reads import fetch_lead
 from arie.api.receipt import build_receipt
 from arie.api.schemas import (
+    AcceptInvitationRequest,
     ApiKeyCreatedResponse,
     ApiKeyResponse,
     BatchProgressResponse,
@@ -47,17 +48,22 @@ from arie.api.schemas import (
     BatchRowsPageResponse,
     CreateApiKeyRequest,
     CreateICPProfileRequest,
+    CreateInvitationRequest,
     HealthResponse,
     ICPProfileResponse,
     IngestLeadRequest,
     IngestLeadResponse,
+    InvitationCreatedResponse,
+    InvitationResponse,
     LeadCostResponse,
     LeadResponse,
+    MemberResponse,
     OrganizationResponse,
     ReceiptResponse,
     ReviewDecisionRequest,
     ReviewDecisionResponse,
     ReviewResponse,
+    UpdateMemberRoleRequest,
     UpdateOrganizationRequest,
     UsageSummaryResponse,
 )
@@ -74,8 +80,10 @@ from arie.auth import (
     InvalidApiKeyError,
     NotAMemberError,
     RevokedApiKeyError,
+    VerifiedIdentity,
     resolve_api_key_context,
     resolve_auth_context,
+    resolve_verified_identity,
 )
 from arie.batches import (
     MAX_FILE_SIZE_BYTES,
@@ -98,8 +106,27 @@ from arie.icp_profiles import (
     list_profiles,
 )
 from arie.identity.resolver import IdentityResolver
+from arie.invitations import (
+    DuplicateInvitationError,
+    InvalidInvitationRoleError,
+    InvitationExpiredError,
+    InvitationNotFoundError,
+    MismatchedInvitationEmailError,
+    accept_invitation,
+    create_invitation,
+    list_invitations,
+    revoke_invitation,
+)
 from arie.jobs.queue import PostgresJobQueue
 from arie.ledger.store import PostgresCostLedger
+from arie.members import (
+    CannotActOnSelfError,
+    InvalidMemberRoleError,
+    LastOwnerError,
+    list_members,
+    remove_member,
+    update_member_role,
+)
 from arie.migrations import MigrationsDirectoryError, pending_migrations
 from arie.observability.tracing import configure_tracing, shutdown_tracing
 from arie.organizations import (
@@ -253,6 +280,20 @@ def instrument(app: FastAPI) -> None:
 StateDep = Annotated[AppState, Depends(get_state)]
 
 
+def _extract_bearer_token(request: Request) -> str:
+    """The one place either authentication path (`get_auth_context`,
+    `get_verified_identity`) reads the `Authorization` header — shared so a
+    future change to the expected header shape can't drift between them."""
+    authorization = request.headers.get("authorization", "")
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing or malformed Authorization header — expected 'Bearer <token>'",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return authorization[len("Bearer ") :].strip()
+
+
 def get_auth_context(request: Request, state: StateDep) -> AuthContext:
     """The auth boundary every customer-facing endpoint below depends on —
     which is what makes "forgetting the organization_id filter" impossible to
@@ -272,14 +313,7 @@ def get_auth_context(request: Request, state: StateDep) -> AuthContext:
       the required `X-Organization-Id` header, checked against the token's
       membership.
     """
-    authorization = request.headers.get("authorization", "")
-    if not authorization.lower().startswith("bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="missing or malformed Authorization header — expected 'Bearer <token>'",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = authorization[len("Bearer ") :].strip()
+    token = _extract_bearer_token(request)
 
     if looks_like_api_key(token):
         try:
@@ -317,6 +351,34 @@ def get_auth_context(request: Request, state: StateDep) -> AuthContext:
 
 
 AuthDep = Annotated[AuthContext, Depends(get_auth_context)]
+
+
+def get_verified_identity(request: Request) -> VerifiedIdentity:
+    """The auth boundary for `POST /invitations/accept` alone — deliberately
+    not `AuthDep`/`get_auth_context`: that path always requires an existing
+    organization membership (`resolve_auth_context` raises `NotAMemberError`
+    without one), which is exactly what accepting an invitation does not yet
+    have. Requires a real Supabase JWT; an ARIE API key is refused outright
+    — a machine credential has no email to match an invitation against and
+    must never be able to join an organization as a member.
+    """
+    token = _extract_bearer_token(request)
+    if looks_like_api_key(token):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="requires a user session (API keys cannot accept invitations)",
+        )
+    try:
+        return resolve_verified_identity(token)
+    except AuthenticationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+
+IdentityDep = Annotated[VerifiedIdentity, Depends(get_verified_identity)]
 
 
 def _require_scope(auth: AuthContext, scope: str) -> None:
@@ -628,6 +690,169 @@ def register_routes(app: FastAPI) -> None:
                 status_code=status.HTTP_404_NOT_FOUND, detail="organization not found"
             )
         return OrganizationResponse.model_validate(record)
+
+    # ---------------------------------------------------------- membership --
+    #
+    # Productization M4 Part 2. Reads and writes both owner/admin-only
+    # (`_require_org_admin`) — see the schemas module's own banner comment
+    # for why this differs from ICP configuration's read-open split. No
+    # API-key scope for any of it: a machine credential must never manage
+    # who belongs to an organization, the same rule API keys already follow
+    # for managing API keys themselves.
+
+    @app.get("/organization/members", response_model=list[MemberResponse])
+    def list_members_endpoint(state: StateDep, auth: AuthDep) -> list[MemberResponse]:
+        _require_org_admin(auth)
+        with state.pool.connection() as conn:
+            records = list_members(conn, organization_id=auth.organization_id)
+        return [MemberResponse.model_validate(record) for record in records]
+
+    @app.patch("/organization/members/{user_id}", response_model=MemberResponse)
+    def update_member_role_endpoint(
+        user_id: UUID, payload: UpdateMemberRoleRequest, state: StateDep, auth: AuthDep
+    ) -> MemberResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        try:
+            with _transaction(state.pool) as conn:
+                record = update_member_role(
+                    conn,
+                    organization_id=auth.organization_id,
+                    target_user_id=user_id,
+                    new_role=payload.role,
+                    actor_user_id=auth.user_id,
+                )
+        except InvalidMemberRoleError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+        except CannotActOnSelfError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="cannot change your own role",
+            ) from exc
+        except LastOwnerError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="cannot demote the organization's only remaining owner",
+            ) from exc
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="member not found")
+        return MemberResponse.model_validate(record)
+
+    @app.delete("/organization/members/{user_id}", response_model=MemberResponse)
+    def remove_member_endpoint(user_id: UUID, state: StateDep, auth: AuthDep) -> MemberResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        try:
+            with _transaction(state.pool) as conn:
+                record = remove_member(
+                    conn,
+                    organization_id=auth.organization_id,
+                    target_user_id=user_id,
+                    actor_user_id=auth.user_id,
+                )
+        except CannotActOnSelfError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="cannot remove yourself",
+            ) from exc
+        except LastOwnerError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="cannot remove the organization's only remaining owner",
+            ) from exc
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="member not found")
+        return MemberResponse.model_validate(record)
+
+    # -------------------------------------------------------- invitations --
+    #
+    # `/organization/invitations/*` (list/create/revoke) are owner/admin-only
+    # JWT-session actions, same tier as membership above. `POST /invitations
+    # /accept` is deliberately NOT under `/organization/` and does not take
+    # `AuthDep` at all — the accepting user has no organization membership
+    # yet, which `AuthDep`'s `X-Organization-Id` + membership check always
+    # requires; see `get_verified_identity`'s own docstring.
+
+    @app.get("/organization/invitations", response_model=list[InvitationResponse])
+    def list_invitations_endpoint(state: StateDep, auth: AuthDep) -> list[InvitationResponse]:
+        _require_org_admin(auth)
+        with state.pool.connection() as conn:
+            records = list_invitations(conn, organization_id=auth.organization_id)
+        return [InvitationResponse.model_validate(record) for record in records]
+
+    @app.post(
+        "/organization/invitations",
+        response_model=InvitationCreatedResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_invitation_endpoint(
+        payload: CreateInvitationRequest, state: StateDep, auth: AuthDep
+    ) -> InvitationCreatedResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        try:
+            with _transaction(state.pool) as conn:
+                generated = create_invitation(
+                    conn,
+                    organization_id=auth.organization_id,
+                    invited_by_user_id=auth.user_id,
+                    email=payload.email,
+                    role=payload.role,
+                )
+        except DuplicateInvitationError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except InvalidInvitationRoleError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+        base = InvitationResponse.model_validate(generated.record)
+        return InvitationCreatedResponse(**base.model_dump(), raw_token=generated.raw_token)
+
+    @app.delete("/organization/invitations/{invitation_id}", response_model=InvitationResponse)
+    def revoke_invitation_endpoint(
+        invitation_id: UUID, state: StateDep, auth: AuthDep
+    ) -> InvitationResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        with _transaction(state.pool) as conn:
+            record = revoke_invitation(
+                conn,
+                organization_id=auth.organization_id,
+                invitation_id=invitation_id,
+                actor_user_id=auth.user_id,
+            )
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="invitation not found"
+            )
+        return InvitationResponse.model_validate(record)
+
+    @app.post("/invitations/accept", response_model=InvitationResponse)
+    def accept_invitation_endpoint(
+        payload: AcceptInvitationRequest, state: StateDep, identity: IdentityDep
+    ) -> InvitationResponse:
+        try:
+            with _transaction(state.pool) as conn:
+                record = accept_invitation(
+                    conn,
+                    raw_token=payload.token,
+                    verified_email=identity.email,
+                    user_id=identity.user_id,
+                )
+        except InvitationNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="invitation not found"
+            ) from exc
+        except InvitationExpiredError as exc:
+            raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(exc)) from exc
+        except MismatchedInvitationEmailError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="this invitation was sent to a different email address",
+            ) from exc
+        return InvitationResponse.model_validate(record)
 
     # ------------------------------------------------------- icp profiles --
     #

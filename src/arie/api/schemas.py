@@ -21,6 +21,7 @@ from arie.api.ingest import LeadIngestCommand
 from arie.api.receipt import DecisionReceipt
 from arie.apikeys import SCOPES
 from arie.approval.workflow import ReviewAction
+from arie.auth import ROLES
 from arie.core.types import LeadStatus
 from arie.icp_profiles import InvalidICPConfigError, validate_config
 from arie.identity.normalize import normalize_domain, normalize_email
@@ -540,6 +541,98 @@ class UpdateOrganizationRequest(BaseModel):
         if not self.model_fields_set:
             raise ValueError("at least one field must be provided")
         return self
+
+
+# ------------------------------------------------------- members / invitations --
+#
+# Productization M4 Part 2. Member/invitation *reads* (`GET /organization
+# /members`, `GET /organization/invitations`) and every write below are all
+# owner/admin-only (`_require_org_admin`) — unlike ICP configuration,
+# membership and pending-invitation email addresses are an organization-
+# management concern, the same permission tier as API keys, not something
+# every active member should see or change by default.
+
+
+class MemberResponse(BaseModel):
+    """Mirrors `arie.members.MemberRecord` field for field."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    organization_id: UUID
+    user_id: UUID
+    role: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class UpdateMemberRoleRequest(BaseModel):
+    """`PATCH /organization/members/{user_id}`."""
+
+    role: str
+
+    @field_validator("role")
+    @classmethod
+    def _role_is_known(cls, value: str) -> str:
+        if value not in ROLES:
+            raise ValueError(f"unknown role {value!r} — must be one of {list(ROLES)}")
+        return value
+
+
+class CreateInvitationRequest(BaseModel):
+    """`POST /organization/invitations`."""
+
+    email: Annotated[str, Field(min_length=3, max_length=320)]
+    role: str
+
+    @field_validator("email")
+    @classmethod
+    def _email_is_normalizable(cls, value: str) -> str:
+        normalize_email(value)
+        return value
+
+    @field_validator("role")
+    @classmethod
+    def _role_is_known(cls, value: str) -> str:
+        if value not in ROLES:
+            raise ValueError(f"unknown role {value!r} — must be one of {list(ROLES)}")
+        return value
+
+
+class InvitationResponse(BaseModel):
+    """Mirrors `arie.invitations.InvitationRecord` field for field. Never
+    the raw token — see `InvitationCreatedResponse`."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    invitation_id: UUID
+    organization_id: UUID
+    email_normalized: str
+    role: str
+    status: str
+    invited_by_user_id: UUID
+    created_at: datetime
+    expires_at: datetime
+    accepted_at: datetime | None
+    revoked_at: datetime | None
+
+
+class InvitationCreatedResponse(InvitationResponse):
+    """`POST /organization/invitations`'s response — the one and only place
+    the raw token is ever shown, mirroring `ApiKeyCreatedResponse`. Not
+    retrievable afterward by any endpoint; losing it means revoking the
+    invitation and creating a new one."""
+
+    raw_token: str
+
+
+class AcceptInvitationRequest(BaseModel):
+    """`POST /invitations/accept`. The token in the request body, not the
+    URL — an invitation token is a bearer secret, and a URL path segment
+    routinely ends up in server access logs and browser history in a way a
+    POST body does not."""
+
+    token: Annotated[str, Field(min_length=1)]
 
 
 # --------------------------------------------------------------- CSV batches --

@@ -47,9 +47,11 @@ __all__ = [
     "InvalidApiKeyError",
     "NotAMemberError",
     "RevokedApiKeyError",
+    "VerifiedIdentity",
     "decode_supabase_jwt",
     "resolve_api_key_context",
     "resolve_auth_context",
+    "resolve_verified_identity",
 ]
 
 ROLES: tuple[str, ...] = ("owner", "admin", "analyst_reviewer")
@@ -231,6 +233,43 @@ def resolve_auth_context(pool: ConnectionPool, *, token: str, organization_id: U
     return AuthContext(
         organization_id=organization_id, auth_method="jwt", user_id=user_id, role=row["role"]
     )
+
+
+@dataclass(frozen=True)
+class VerifiedIdentity:
+    """A Supabase-authenticated human, verified with **no** organization
+    membership check — the one thing `resolve_auth_context` always requires
+    and the one thing invitation acceptance cannot: accepting an invitation
+    is precisely the action that creates that membership
+    (`arie.invitations.accept_invitation`), so it needs an identity proven
+    independent of any pre-existing one."""
+
+    user_id: UUID
+    email: str
+
+
+def resolve_verified_identity(token: str) -> VerifiedIdentity:
+    """Verify `token` and extract the caller's identity, with no
+    organization in scope yet. Raises `AuthenticationError` for a token that
+    doesn't verify, has no `sub` claim, or has no `email` claim — Supabase
+    only omits `email` for phone-based auth, which this application does not
+    offer as a sign-in method, so its absence means this token cannot be
+    used for anything that needs to prove an email address.
+    """
+    claims = decode_supabase_jwt(token)
+    sub = claims.get("sub")
+    if not sub:
+        raise AuthenticationError("token has no 'sub' claim")
+    try:
+        user_id = UUID(str(sub))
+    except ValueError as exc:
+        raise AuthenticationError(f"token 'sub' claim is not a UUID: {sub!r}") from exc
+
+    email = claims.get("email")
+    if not email or not isinstance(email, str):
+        raise AuthenticationError("token has no 'email' claim")
+
+    return VerifiedIdentity(user_id=user_id, email=email)
 
 
 def resolve_api_key_context(pool: ConnectionPool, *, raw_key: str) -> AuthContext:
