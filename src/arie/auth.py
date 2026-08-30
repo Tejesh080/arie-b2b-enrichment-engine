@@ -33,6 +33,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 import jwt
+from jwt import PyJWKClient
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -141,27 +142,65 @@ class AuthContext:
         return self.auth_method == "jwt" and self.role in ("owner", "admin")
 
 
+_jwk_clients: dict[str, PyJWKClient] = {}
+"""One `PyJWKClient` per JWKS URL, reused across calls so its own key cache
+(refetches only on an unknown `kid`, e.g. after Supabase rotates keys) is
+actually effective — a fresh client per request would refetch the JWKS every
+single time. Keyed by URL, not a single global, so a config change (tests
+monkeypatching `SUPABASE_AUTH`, or a real URL change) can't serve stale keys
+fetched for a different project."""
+
+
+def _signing_key_for(token: str) -> Any:
+    """The public key that verifies `token`, resolved from Supabase's JWKS by
+    the token's own `kid` header — `PyJWKClient.get_signing_key_from_jwt`
+    does the header-parsing and `kid`-matching itself. A separate seam
+    (rather than inlining this in `decode_supabase_jwt`) so tests can
+    monkeypatch key resolution directly instead of mocking network I/O or
+    standing up a fake JWKS endpoint.
+    """
+    jwks_url = SUPABASE_AUTH.jwks_url
+    client = _jwk_clients.get(jwks_url)
+    if client is None:
+        client = PyJWKClient(jwks_url, cache_keys=True)
+        _jwk_clients[jwks_url] = client
+    return client.get_signing_key_from_jwt(token).key
+
+
 def decode_supabase_jwt(token: str) -> dict[str, Any]:
     """Verify and decode a Supabase-issued access token.
 
-    HS256 against `SUPABASE_JWT_SECRET` — Supabase's shared-secret
-    verification path, the simplest mechanism available without adding the
-    Supabase SDK as a dependency for three endpoints' worth of auth. Every
-    failure (unconfigured secret, bad signature, expired token, malformed
-    token, wrong audience) raises `AuthenticationError` rather than letting
-    `PyJWT`'s exception hierarchy leak into callers that would otherwise have
-    to know its vocabulary too.
+    Verified against Supabase's published JWKS (`SUPABASE_AUTH.jwks_url`),
+    matched by the token's `kid` header, using whatever algorithm that key
+    actually is — `ES256` for this project's current signing key (see
+    `SupabaseAuthConfig`'s own docstring for why HS256 never applied here).
+    `algorithms` is still passed explicitly to `jwt.decode`, not inferred
+    from the token's own `alg` header, so a forged token cannot select its
+    own verification algorithm (the classic JWT algorithm-confusion attack).
+    Every failure — unconfigured `SUPABASE_URL`, no matching `kid`, a JWKS
+    fetch that fails outright, bad signature, expired token, wrong audience
+    or issuer, malformed token — raises `AuthenticationError` rather than
+    letting `PyJWT`'s (or `PyJWKClient`'s) exception hierarchy leak into
+    callers that would otherwise have to know its vocabulary too.
     """
-    if not SUPABASE_AUTH.jwt_secret:
-        raise AuthenticationError("SUPABASE_JWT_SECRET is not configured")
+    if not SUPABASE_AUTH.configured:
+        raise AuthenticationError("SUPABASE_URL is not configured")
     try:
+        signing_key = _signing_key_for(token)
         return jwt.decode(
             token,
-            SUPABASE_AUTH.jwt_secret,
-            algorithms=["HS256"],
+            signing_key,
+            algorithms=["ES256"],
             audience="authenticated",
+            issuer=SUPABASE_AUTH.issuer,
         )
     except jwt.PyJWTError as exc:
+        raise AuthenticationError(f"invalid bearer token: {exc}") from exc
+    except Exception as exc:
+        # A JWKS fetch failure (DNS, connection refused, malformed JSON) is
+        # not a PyJWTError, but it means the same thing to a caller: this
+        # token could not be verified. See the docstring's "every failure"
+        # promise above.
         raise AuthenticationError(f"invalid bearer token: {exc}") from exc
 
 

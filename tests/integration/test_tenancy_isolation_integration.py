@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 import jwt
 import psycopg
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 from tests.integration.conftest import IngestCleanup
 
@@ -40,7 +41,14 @@ from arie.tenancy import LEGACY_ORGANIZATION_ID
 pytestmark = pytest.mark.integration
 
 NOW = datetime(2026, 8, 16, 12, 0, 0, tzinfo=UTC)
-_JWT_SECRET = "tenancy-isolation-test-secret-at-least-32-bytes"
+
+# ES256, matching this project's real Supabase signing key (confirmed via its
+# dashboard — see `SupabaseAuthConfig`'s own docstring). `_AUTH_CONFIG`'s
+# `issuer` is what every signed token below must carry, and what
+# `_signing_key_for` is monkeypatched to resolve to `_PRIVATE_KEY`'s public
+# half for — see the "the auth boundary" tests below.
+_AUTH_CONFIG = SupabaseAuthConfig(url="https://tenancy-isolation-test.supabase.co")
+_PRIVATE_KEY = ec.generate_private_key(ec.SECP256R1())
 
 
 def _unique_domain(label: str) -> str:
@@ -49,9 +57,14 @@ def _unique_domain(label: str) -> str:
 
 def _sign(*, sub: str) -> str:
     return jwt.encode(
-        {"sub": sub, "aud": "authenticated", "exp": datetime.now(UTC) + timedelta(hours=1)},
-        _JWT_SECRET,
-        algorithm="HS256",
+        {
+            "sub": sub,
+            "aud": "authenticated",
+            "iss": _AUTH_CONFIG.issuer,
+            "exp": datetime.now(UTC) + timedelta(hours=1),
+        },
+        _PRIVATE_KEY,
+        algorithm="ES256",
     )
 
 
@@ -277,7 +290,8 @@ def test_missing_authorization_header_is_rejected(app_state: AppState) -> None:
 def test_missing_organization_header_is_rejected(
     app_state: AppState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("arie.auth.SUPABASE_AUTH", SupabaseAuthConfig(jwt_secret=_JWT_SECRET))
+    monkeypatch.setattr("arie.auth.SUPABASE_AUTH", _AUTH_CONFIG)
+    monkeypatch.setattr("arie.auth._signing_key_for", lambda token: _PRIVATE_KEY.public_key())
     token = _sign(sub=str(uuid4()))
     app = create_app(state=app_state)
     with TestClient(app, raise_server_exceptions=False) as client:
@@ -291,7 +305,8 @@ def test_a_user_with_no_membership_is_rejected_with_403(
     """A valid, correctly signed token for a user who simply isn't a member
     of the requested organization — the case a stolen or mismatched
     `X-Organization-Id` produces."""
-    monkeypatch.setattr("arie.auth.SUPABASE_AUTH", SupabaseAuthConfig(jwt_secret=_JWT_SECRET))
+    monkeypatch.setattr("arie.auth.SUPABASE_AUTH", _AUTH_CONFIG)
+    monkeypatch.setattr("arie.auth._signing_key_for", lambda token: _PRIVATE_KEY.public_key())
     token = _sign(sub=str(uuid4()))  # never inserted into organization_members
     app = create_app(state=app_state)
     with TestClient(app, raise_server_exceptions=False) as client:
@@ -312,7 +327,8 @@ def test_a_real_member_with_a_valid_token_is_authenticated(
     `organization_members` row plus a correctly signed token authenticates —
     proven by reaching the *lead* lookup (404, the lead genuinely doesn't
     exist) rather than being turned away at the auth boundary (401/403)."""
-    monkeypatch.setattr("arie.auth.SUPABASE_AUTH", SupabaseAuthConfig(jwt_secret=_JWT_SECRET))
+    monkeypatch.setattr("arie.auth.SUPABASE_AUTH", _AUTH_CONFIG)
+    monkeypatch.setattr("arie.auth._signing_key_for", lambda token: _PRIVATE_KEY.public_key())
     user_id = uuid4()
     with db_conn.cursor() as cur:
         cur.execute(

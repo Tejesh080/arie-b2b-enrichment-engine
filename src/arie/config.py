@@ -162,18 +162,31 @@ class SupabaseAuthConfig:
 
     Productization M1's auth model (`arie.auth`): a Supabase JWT bearer token
     plus an `X-Organization-Id` header, checked against `organization_members`.
-    `jwt_secret` is Supabase's legacy/shared HS256 signing secret — the
-    simplest verification path for a backend with no Supabase SDK dependency;
-    there is no API-key mechanism yet (`organization_api_keys` is explicitly
-    out of scope for this milestone), so every caller, human or machine,
-    authenticates this same way.
+
+    Verified against Supabase's published JWKS (`jwks_url`), not a shared
+    secret. This project's Supabase Auth signing keys (Dashboard -> Settings
+    -> JWT Keys) are the newer asymmetric kind — current key ECC/P-256
+    (ES256), with the legacy HS256 shared secret retained only as the
+    *previous* key for rotation continuity — confirmed directly, not assumed.
+    A `SUPABASE_JWT_SECRET`/HS256 verifier (this config's original shape)
+    could never have verified a token those keys sign: wrong algorithm
+    entirely, not merely a wrong secret. `SUPABASE_URL` is the same value
+    already used for `SUPABASE_SERVICE_ROLE_KEY`'s project, not a new secret.
     """
 
-    jwt_secret: str = field(default_factory=lambda: os.getenv("SUPABASE_JWT_SECRET", ""))
+    url: str = field(default_factory=lambda: os.getenv("SUPABASE_URL", "").rstrip("/"))
+
+    @property
+    def jwks_url(self) -> str:
+        return f"{self.url}/auth/v1/.well-known/jwks.json"
+
+    @property
+    def issuer(self) -> str:
+        return f"{self.url}/auth/v1"
 
     @property
     def configured(self) -> bool:
-        return bool(self.jwt_secret)
+        return bool(self.url)
 
 
 @dataclass(frozen=True)

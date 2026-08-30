@@ -28,7 +28,7 @@ service = [
     "opentelemetry-sdk>=1.25",
     "opentelemetry-exporter-otlp>=1.25",
     "opentelemetry-instrumentation-fastapi>=0.46b0",
-    "pyjwt>=2.8",
+    "pyjwt[crypto]>=2.8",  # [crypto] pulls in `cryptography`, required for ES256 (Supabase's current signing-key algorithm)
 ]
 dev = [
     "pytest>=8.2",
