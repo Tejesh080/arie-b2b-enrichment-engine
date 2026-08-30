@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -22,6 +22,7 @@ from arie.api.receipt import DecisionReceipt
 from arie.apikeys import SCOPES
 from arie.approval.workflow import ReviewAction
 from arie.core.types import LeadStatus
+from arie.icp_profiles import InvalidICPConfigError, validate_config
 from arie.identity.normalize import normalize_domain, normalize_email
 
 
@@ -318,6 +319,9 @@ class ReceiptVersionsResponse(BaseModel):
     policy: str
     scorer: str
     confidence_calibration: str
+    icp_profile_id: UUID | None = None
+    """Productization M3 — see `arie.api.receipt.ReceiptVersions.icp_profile_id`."""
+    icp_profile_version: int | None = None
 
 
 class ReceiptResponse(BaseModel):
@@ -404,3 +408,72 @@ class ApiKeyCreatedResponse(ApiKeyResponse):
     revoking the key and creating a new one."""
 
     raw_key: str
+
+
+# Productization M3. `arie.icp_profiles.validate_config` stays the single
+# source of truth for the actual rules (weight sums, threshold ordering, band
+# well-formedness) — reused here via a model validator rather than restated as
+# separate Pydantic constraints, the same discipline this module's own
+# docstring states for `arie.identity.normalize`.
+
+
+class EmployeeCountBandInput(BaseModel):
+    min_employees: Annotated[int, Field(ge=0)]
+    max_employees: Annotated[int, Field(ge=0)]
+    points: Annotated[float, Field(ge=0)]
+
+
+class ICPProfileConfigInput(BaseModel):
+    """The `config` an organization submits for a new ICP profile version —
+    mirrors `arie.icp_profiles.REFERENCE_CONFIG`'s shape field for field.
+    """
+
+    qualify_threshold: float
+    reject_threshold: float
+    employee_count_bands: Annotated[list[EmployeeCountBandInput], Field(min_length=1)]
+    industry_points: dict[str, float] = Field(default_factory=dict)
+    seniority_points: dict[str, float] = Field(default_factory=dict)
+    function_points: dict[str, float] = Field(default_factory=dict)
+    buying_intent_weight: float
+    trigger_event_weight: float
+    target_geographies: list[str] = Field(default_factory=list)
+    """Advisory only — no evidence field supplies geography today, so this
+    never affects scoring. See `arie.icp_profiles`'s module docstring."""
+    disqualifier_enabled: bool = True
+
+    @model_validator(mode="after")
+    def _validate_with_domain_rules(self) -> ICPProfileConfigInput:
+        try:
+            validate_config(self.model_dump(mode="json"))
+        except InvalidICPConfigError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
+
+
+class CreateICPProfileRequest(BaseModel):
+    """`POST /organization/icp` — create a new ICP profile version, which
+    immediately becomes active for this organization (see
+    `arie.icp_profiles.create_profile`). Requires an owner/admin JWT session.
+    """
+
+    name: Annotated[str, Field(min_length=1, max_length=200)]
+    config: ICPProfileConfigInput
+
+
+class ICPProfileResponse(BaseModel):
+    """One ICP profile version. Mirrors `arie.icp_profiles.ICPProfileRecord`
+    field for field."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    profile_id: UUID
+    organization_id: UUID
+    version: int
+    name: str
+    config: dict[str, Any]
+    scorer_version: str
+    status: str
+    created_by_user_id: UUID | None
+    created_at: datetime
+    activated_at: datetime
+    retired_at: datetime | None

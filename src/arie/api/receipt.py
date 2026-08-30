@@ -244,6 +244,12 @@ class ReceiptVersions:
     policy: str
     scorer: str
     confidence_calibration: str
+    icp_profile_id: UUID | None = None
+    """Productization M3. `None` for a receipt written before organization
+    ICP profiles existed, or for one whose organization had no active profile
+    at decision time (both scored against the reference config, identically
+    — see `arie.icp_profiles.resolve_scoring_config`)."""
+    icp_profile_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -279,9 +285,16 @@ class DecisionReceipt:
 _SELECT_DECISION_RECEIPT = """
     SELECT decision, autonomous, confidence, tau, score_value, score_lower, score_upper,
            stop_reason, policy_name, scorer_version, confidence_calibration,
-           evidence_snapshot, created_at
+           evidence_snapshot, created_at, icp_profile_id, icp_profile_version
     FROM decision_receipts
     WHERE lead_id = %(lead_id)s
+"""
+
+_SELECT_ICP_PROFILE_THRESHOLDS = """
+    SELECT config->>'qualify_threshold' AS qualify_threshold,
+           config->>'reject_threshold' AS reject_threshold
+    FROM organization_icp_profiles
+    WHERE profile_id = %(profile_id)s
 """
 
 _SELECT_PROVIDER_CALLS = """
@@ -362,6 +375,32 @@ def _human_review(
         ),
         human_override,
     )
+
+
+def _decision_thresholds(
+    conn: psycopg.Connection, icp_profile_id: UUID | None
+) -> tuple[float, float]:
+    """The `(qualify, reject)` thresholds actually in effect when this
+    decision was made.
+
+    A receipt does not store these directly — `icp_profile_id` (Productization
+    M3) already immutably names the exact `organization_icp_profiles` row, so
+    reading its `config` here reproduces the thresholds without a second,
+    redundant copy that could drift from the profile's own. `None` (every
+    receipt written before M3, or a lead scored while its organization had no
+    active profile) falls back to the reference constants — the same values
+    `arie.icp_profiles.resolve_scoring_config` itself falls back to, so this
+    is not a *different* claim about what ran, only where the receipt reads
+    it from.
+    """
+    if icp_profile_id is None:
+        return QUALIFY_THRESHOLD, REJECT_THRESHOLD
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(_SELECT_ICP_PROFILE_THRESHOLDS, {"profile_id": icp_profile_id})
+        row = cur.fetchone()
+    if row is None:  # pragma: no cover - profiles are never deleted
+        return QUALIFY_THRESHOLD, REJECT_THRESHOLD
+    return float(row["qualify_threshold"]), float(row["reject_threshold"])
 
 
 def _evidence_items(snapshot: dict[str, Any]) -> tuple[ReceiptEvidenceItem, ...]:
@@ -451,6 +490,7 @@ def build_receipt(
         )
 
     snapshot = receipt_row["evidence_snapshot"] or {}
+    threshold_qualify, threshold_reject = _decision_thresholds(conn, receipt_row["icp_profile_id"])
     return DecisionReceipt(
         receipt_version=RECEIPT_VERSION,
         lead_id=lead_id,
@@ -469,8 +509,8 @@ def build_receipt(
         ),
         score=ReceiptScore(
             value=float(receipt_row["score_value"]),
-            threshold_qualify=QUALIFY_THRESHOLD,
-            threshold_reject=REJECT_THRESHOLD,
+            threshold_qualify=threshold_qualify,
+            threshold_reject=threshold_reject,
             bounds=ReceiptScoreBounds(
                 lower=float(receipt_row["score_lower"]), upper=float(receipt_row["score_upper"])
             ),
@@ -485,6 +525,8 @@ def build_receipt(
             policy=receipt_row["policy_name"],
             scorer=receipt_row["scorer_version"],
             confidence_calibration=receipt_row["confidence_calibration"],
+            icp_profile_id=receipt_row["icp_profile_id"],
+            icp_profile_version=receipt_row["icp_profile_version"],
         ),
         cost=receipt_cost,
         evidence=ReceiptEvidence(

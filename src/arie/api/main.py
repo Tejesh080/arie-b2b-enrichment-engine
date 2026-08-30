@@ -41,7 +41,9 @@ from arie.api.schemas import (
     ApiKeyCreatedResponse,
     ApiKeyResponse,
     CreateApiKeyRequest,
+    CreateICPProfileRequest,
     HealthResponse,
+    ICPProfileResponse,
     IngestLeadRequest,
     IngestLeadResponse,
     LeadCostResponse,
@@ -68,6 +70,14 @@ from arie.auth import (
     resolve_auth_context,
 )
 from arie.config import DATABASE, OBSERVABILITY
+from arie.icp_profiles import (
+    create_profile as create_icp_profile_row,
+)
+from arie.icp_profiles import (
+    get_active_profile,
+    get_profile_by_version,
+    list_profiles,
+)
 from arie.identity.resolver import IdentityResolver
 from arie.jobs.queue import PostgresJobQueue
 from arie.ledger.store import PostgresCostLedger
@@ -304,6 +314,20 @@ def _require_org_admin(auth: AuthContext) -> None:
         )
 
 
+def _require_jwt_session(auth: AuthContext) -> None:
+    """Gate an action (reading ICP configuration today) on any authenticated
+    *human* session — owner, admin, or analyst_reviewer alike; unlike
+    `_require_org_admin` this is not owner/admin-only. Refuses an API key
+    outright rather than adding a new scope: no existing machine caller
+    (n8n, the demo script) needs organization configuration, and Productization
+    M3's brief asks not to add one without a concrete use case."""
+    if auth.auth_method != "jwt":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="requires a user session (API keys cannot read organization configuration)",
+        )
+
+
 def register_routes(app: FastAPI) -> None:
     @app.get("/healthz", response_model=HealthResponse)
     def healthz(state: StateDep) -> Response:
@@ -513,6 +537,71 @@ def register_routes(app: FastAPI) -> None:
             lead_version=result.lead_version,
             already_applied=result.already_applied,
         )
+
+    # ------------------------------------------------------- icp profiles --
+    #
+    # Productization M3. Config-write requires an owner/admin *JWT* session
+    # (`_require_org_admin`, same rule as api-keys below); config-read only
+    # requires any authenticated human session (`_require_jwt_session`) — an
+    # active member of any role may see what "a good lead" currently means
+    # for their organization, only owner/admin may change it. No API-key
+    # scope exists for either: no machine caller needs this today.
+    #
+    # `/organization/icp/versions` is registered before `/organization/icp/
+    # {version}` deliberately — Starlette matches routes in registration
+    # order, and `{version}` is typed `int`, so registering it first would
+    # make a request for the literal path `versions` fail int coercion
+    # (422) instead of falling through to the static route below it.
+
+    @app.get("/organization/icp", response_model=ICPProfileResponse)
+    def get_active_icp_profile(state: StateDep, auth: AuthDep) -> ICPProfileResponse:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            record = get_active_profile(conn, organization_id=auth.organization_id)
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="this organization has no active ICP profile",
+            )
+        return ICPProfileResponse.model_validate(record)
+
+    @app.get("/organization/icp/versions", response_model=list[ICPProfileResponse])
+    def list_icp_profiles(state: StateDep, auth: AuthDep) -> list[ICPProfileResponse]:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            records = list_profiles(conn, organization_id=auth.organization_id)
+        return [ICPProfileResponse.model_validate(record) for record in records]
+
+    @app.get("/organization/icp/{version}", response_model=ICPProfileResponse)
+    def get_icp_profile_version(version: int, state: StateDep, auth: AuthDep) -> ICPProfileResponse:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            record = get_profile_by_version(
+                conn, organization_id=auth.organization_id, version=version
+            )
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"no ICP profile version {version}"
+            )
+        return ICPProfileResponse.model_validate(record)
+
+    @app.post(
+        "/organization/icp", response_model=ICPProfileResponse, status_code=status.HTTP_201_CREATED
+    )
+    def create_icp_profile(
+        payload: CreateICPProfileRequest, state: StateDep, auth: AuthDep
+    ) -> ICPProfileResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        with _transaction(state.pool) as conn:
+            record = create_icp_profile_row(
+                conn,
+                organization_id=auth.organization_id,
+                created_by_user_id=auth.user_id,
+                name=payload.name,
+                config=payload.config.model_dump(mode="json"),
+            )
+        return ICPProfileResponse.model_validate(record)
 
     # ---------------------------------------------------------- api keys --
     #

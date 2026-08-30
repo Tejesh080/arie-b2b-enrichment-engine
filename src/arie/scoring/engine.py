@@ -34,12 +34,9 @@ from arie.scoring.merge import (
     resolve_candidates,
 )
 from arie.scoring.rules import (
-    COMPLETENESS_WEIGHTS,
     DISQUALIFIER_FIELD,
-    MAX_FIELD_POINTS,
-    QUALIFY_THRESHOLD,
-    REJECT_THRESHOLD,
     SCORED_FIELDS,
+    active_config,
     decide,
     is_disqualified,
     is_known,
@@ -62,11 +59,12 @@ class ScoreBounds:
         ``None`` means the interval straddles a boundary and the outcome is
         still genuinely open.
         """
-        if self.lower >= QUALIFY_THRESHOLD:
+        config = active_config()
+        if self.lower >= config.qualify_threshold:
             return Decision.AUTO_ROUTE
-        if self.upper < REJECT_THRESHOLD:
+        if self.upper < config.reject_threshold:
             return Decision.REJECT
-        if self.lower >= REJECT_THRESHOLD and self.upper < QUALIFY_THRESHOLD:
+        if self.lower >= config.reject_threshold and self.upper < config.qualify_threshold:
             # The entire reachable range sits inside the borderline band, so
             # the lead is provably one a human should look at.
             return Decision.ESCALATE_HUMAN
@@ -151,18 +149,23 @@ def compute_bounds(facts: Mapping[str, Any]) -> ScoreBounds:
     # canonical taxonomy layer exists to prevent.
     unknown = [name for name in SCORED_FIELDS if not is_known(facts, name)]
 
+    config = active_config()
     # Unknown additive fields contribute zero today and at most their ceiling
     # later, so they only raise the upper bound.
-    upper = current + sum(MAX_FIELD_POINTS.get(name, 0.0) for name in unknown)
+    upper = current + sum(config.max_field_points.get(name, 0.0) for name in unknown)
 
-    # An unchecked blocker can zero everything, so the floor collapses to zero.
-    lower = 0.0 if DISQUALIFIER_FIELD in unknown else current
+    # An unchecked blocker can zero everything, so the floor collapses to
+    # zero — unless this organization has disabled the disqualifier
+    # mechanism entirely, in which case an unknown flag can never move the
+    # decision and must not pin the floor.
+    lower = 0.0 if (config.disqualifier_enabled and DISQUALIFIER_FIELD in unknown) else current
 
     return ScoreBounds(current=current, lower=lower, upper=upper)
 
 
 def _boundary_distance(score: float) -> float:
-    return min(abs(score - QUALIFY_THRESHOLD), abs(score - REJECT_THRESHOLD))
+    config = active_config()
+    return min(abs(score - config.qualify_threshold), abs(score - config.reject_threshold))
 
 
 def compute_signals(
@@ -176,8 +179,9 @@ def compute_signals(
     known = tuple(name for name in SCORED_FIELDS if is_known(facts, name))
     unknown = tuple(name for name in SCORED_FIELDS if not is_known(facts, name))
 
-    total_weight = sum(COMPLETENESS_WEIGHTS.values())
-    known_weight = sum(COMPLETENESS_WEIGHTS.get(name, 0.0) for name in known)
+    completeness_weights = active_config().completeness_weights
+    total_weight = sum(completeness_weights.values())
+    known_weight = sum(completeness_weights.get(name, 0.0) for name in known)
     completeness = known_weight / total_weight if total_weight else 0.0
 
     # Only fields with more than one source can disagree. Using every field as

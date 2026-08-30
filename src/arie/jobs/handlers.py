@@ -100,6 +100,7 @@ from arie.core.types import (
 )
 from arie.evidence.store import PostgresEvidenceStore
 from arie.evidence.ttl_policy import ttl_for_field
+from arie.icp_profiles import resolve_scoring_config
 from arie.identity.normalize import domain_from_email, normalize_domain, normalize_email
 from arie.identity.validation import (
     MISMATCH,
@@ -138,6 +139,7 @@ from arie.providers.live_hunter import HunterEnrichmentProvider
 from arie.providers.simulated import CallLedger, build_from_leads
 from arie.providers.synthetic import synthesize_corpus_lead
 from arie.scoring.engine import ScoringResult, score_evidence
+from arie.scoring.rules import use_scoring_config
 from arie.statemachine.apply import apply_transition
 from arie.statemachine.transitions import next_status
 
@@ -304,11 +306,13 @@ _INSERT_DECISION_RECEIPT = """
     INSERT INTO decision_receipts (
         organization_id, lead_id, decision, autonomous, confidence, tau,
         score_value, score_lower, score_upper, stop_reason,
-        policy_name, scorer_version, confidence_calibration, evidence_snapshot
+        policy_name, scorer_version, confidence_calibration, evidence_snapshot,
+        icp_profile_id, icp_profile_version
     ) VALUES (
         %(organization_id)s, %(lead_id)s, %(decision)s, %(autonomous)s, %(confidence)s, %(tau)s,
         %(score_value)s, %(score_lower)s, %(score_upper)s, %(stop_reason)s,
-        %(policy_name)s, %(scorer_version)s, %(confidence_calibration)s, %(evidence_snapshot)s
+        %(policy_name)s, %(scorer_version)s, %(confidence_calibration)s, %(evidence_snapshot)s,
+        %(icp_profile_id)s, %(icp_profile_version)s
     )
 """
 
@@ -762,7 +766,16 @@ def _build_simulated_handlers(
                     evidence_store, entities, organization_id=identity.organization_id
                 ),
             )
-            outcome = resolved_runtime.policy.run(corpus_lead, run_ctx)
+            # Productization M3: score/decide against this organization's
+            # active ICP profile, or the reference config unchanged if it has
+            # none — see `arie.scoring.rules.use_scoring_config`'s own
+            # docstring for why this needs no change to `CalibratedBoundsPolicy`
+            # or anything else `policy.run` calls internally.
+            scoring_config = resolve_scoring_config(
+                ctx.conn, organization_id=identity.organization_id
+            )
+            with use_scoring_config(scoring_config):
+                outcome = resolved_runtime.policy.run(corpus_lead, run_ctx)
             tau = resolved_runtime.policy.model.tau
 
             # Walk the scaffold NEW -> ... -> DECISION as the graph defines it,
@@ -812,6 +825,8 @@ def _build_simulated_handlers(
                         "scorer_version": outcome.scoring.breakdown.model_version,
                         "confidence_calibration": resolved_runtime.policy.model.method,
                         "evidence_snapshot": Jsonb(_evidence_snapshot(outcome.scoring)),
+                        "icp_profile_id": scoring_config.profile_id,
+                        "icp_profile_version": scoring_config.profile_version,
                     },
                 )
 
@@ -2090,37 +2105,47 @@ def _build_live_handlers(
             identity = _load_identity(ctx.conn, job.lead_id)
             version = _walk_to_decision(ctx.conn, lead_id=job.lead_id, version=ctx.lead_version)
 
+            # Productization M3 — see the identical comment in
+            # `_build_simulated_handlers.compute_score`. Wraps the whole
+            # acquisition call (which itself re-scores after every provider
+            # response) rather than a single `score_evidence` call, since
+            # every one of those internal re-scores must see the same
+            # organization-specific config as the first.
+            scoring_config = resolve_scoring_config(
+                ctx.conn, organization_id=identity.organization_id
+            )
             evaluation: dict[str, Any] | None = None
-            if strategy == EVALUATION_PARALLEL:
-                acquisition, evaluation = _acquire_evaluation_parallel(
-                    providers=providers,
-                    identity=identity,
-                    lead_id=job.lead_id,
-                    job_id=job.job_id,
-                    organization_id=identity.organization_id,
-                    evidence_store=evidence_store,
-                    cost_ledger=cost_ledger,
-                    spend_guard=spend_guard,
-                    cooldown_guard=cooldown_guard,
-                    outcome_guard=outcome_guard,
-                    now=datetime.now(UTC),
-                )
-            else:
-                acquisition = _acquire_live_evidence(
-                    providers=providers,
-                    identity=identity,
-                    lead_id=job.lead_id,
-                    job_id=job.job_id,
-                    organization_id=identity.organization_id,
-                    evidence_store=evidence_store,
-                    cost_ledger=cost_ledger,
-                    spend_guard=spend_guard,
-                    cooldown_guard=cooldown_guard,
-                    outcome_guard=outcome_guard,
-                    model=model,
-                    now=datetime.now(UTC),
-                    stop_check=stop_check or _default_stop_check,
-                )
+            with use_scoring_config(scoring_config):
+                if strategy == EVALUATION_PARALLEL:
+                    acquisition, evaluation = _acquire_evaluation_parallel(
+                        providers=providers,
+                        identity=identity,
+                        lead_id=job.lead_id,
+                        job_id=job.job_id,
+                        organization_id=identity.organization_id,
+                        evidence_store=evidence_store,
+                        cost_ledger=cost_ledger,
+                        spend_guard=spend_guard,
+                        cooldown_guard=cooldown_guard,
+                        outcome_guard=outcome_guard,
+                        now=datetime.now(UTC),
+                    )
+                else:
+                    acquisition = _acquire_live_evidence(
+                        providers=providers,
+                        identity=identity,
+                        lead_id=job.lead_id,
+                        job_id=job.job_id,
+                        organization_id=identity.organization_id,
+                        evidence_store=evidence_store,
+                        cost_ledger=cost_ledger,
+                        spend_guard=spend_guard,
+                        cooldown_guard=cooldown_guard,
+                        outcome_guard=outcome_guard,
+                        model=model,
+                        now=datetime.now(UTC),
+                        stop_check=stop_check or _default_stop_check,
+                    )
             scoring = acquisition.scoring
 
             confidence = model.predict(scoring)
@@ -2184,6 +2209,8 @@ def _build_live_handlers(
                                 **({"evaluation": evaluation} if evaluation is not None else {}),
                             }
                         ),
+                        "icp_profile_id": scoring_config.profile_id,
+                        "icp_profile_version": scoring_config.profile_version,
                     },
                 )
 

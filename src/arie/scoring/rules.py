@@ -23,8 +23,12 @@ leaving four hand-maintained copies to drift apart.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
+from uuid import UUID
 
 from arie.core.types import Decision, ScoreBreakdown
 
@@ -174,8 +178,109 @@ COMPLETENESS_WEIGHTS: dict[str, float] = {
 }
 
 
+# --- organization-configurable scoring (Productization M3) ------------------
+#
+# The scorer is not rewritten below — every function in this module and in
+# `arie.scoring.engine` keeps its existing signature and algorithm. What
+# becomes overridable is only *where the numbers above come from*: a
+# dynamically-scoped `ScoringConfig`, read through a contextvar, defaulting to
+# exactly the reference constants already defined above. Building
+# `ScoringConfig()` and activating it is therefore behaviourally invisible —
+# which is what lets every caller that has never heard of organization
+# profiles (the oracle, `arie.evalgen`, the confidence fitting/calibration
+# stack, every `arie.policy.*` class, `arie.icp.REFERENCE_ICP_V1`) keep
+# calling `score_facts`/`decide`/`field_points`/`best_case_value` with zero
+# arguments and get byte-identical results, including the frozen M0 benchmark.
+#
+# Field *names* stay fixed — SCORED_FIELDS above is not configurable. An
+# organization profile (`arie.icp_profiles`) can only supply new *values* for
+# the six field weights, the two decision thresholds, and the disqualifier
+# on/off toggle; that is what keeps this "structured validated configuration"
+# rather than a rule language.
+@dataclass(frozen=True)
+class ScoringConfig:
+    qualify_threshold: float = QUALIFY_THRESHOLD
+    reject_threshold: float = REJECT_THRESHOLD
+    size_bands: tuple[tuple[int, int, float], ...] = _SIZE_POINTS
+    industry_points: Mapping[str, float] = field(default_factory=lambda: dict(_INDUSTRY_POINTS))
+    seniority_points: Mapping[str, float] = field(default_factory=lambda: dict(_SENIORITY_POINTS))
+    function_points: Mapping[str, float] = field(default_factory=lambda: dict(_FUNCTION_POINTS))
+    intent_max_points: float = _INTENT_MAX_POINTS
+    trigger_points: float = _TRIGGER_POINTS
+    disqualifier_enabled: bool = True
+    profile_id: UUID | None = None
+    """`organization_icp_profiles.profile_id`, carried through only so a
+    caller that already has the active `ScoringConfig` in hand (`arie.jobs.
+    handlers`) doesn't need a second lookup to stamp a Decision Receipt's
+    provenance. Never read by any function in this module."""
+    profile_version: int | None = None
+
+    @property
+    def max_field_points(self) -> dict[str, float]:
+        """Config-aware per-field ceilings — the dynamic counterpart of the
+        module-level `MAX_FIELD_POINTS`, which keeps reflecting the reference
+        config only (callers that intentionally want the reference ceiling
+        regardless of what is currently active, e.g. `arie.icp`, still import
+        that constant directly)."""
+        return {
+            "employee_count": max((pts for _, _, pts in self.size_bands), default=0.0),
+            "industry": max(self.industry_points.values(), default=0.0),
+            "title_seniority": max(self.seniority_points.values(), default=0.0),
+            "title_function": max(self.function_points.values(), default=0.0),
+            "buying_intent": self.intent_max_points,
+            "recent_trigger_event": self.trigger_points,
+        }
+
+    @property
+    def completeness_weights(self) -> dict[str, float]:
+        return {**self.max_field_points, DISQUALIFIER_FIELD: DISQUALIFIER_COMPLETENESS_WEIGHT}
+
+
+_REFERENCE_CONFIG = ScoringConfig()
+_ACTIVE_CONFIG: ContextVar[ScoringConfig] = ContextVar(
+    "arie_active_scoring_config", default=_REFERENCE_CONFIG
+)
+
+
+def active_config() -> ScoringConfig:
+    """The `ScoringConfig` in effect for the current call. The reference
+    config unless `use_scoring_config` is currently active higher up the same
+    synchronous call stack."""
+    return _ACTIVE_CONFIG.get()
+
+
+@contextmanager
+def use_scoring_config(config: ScoringConfig) -> Iterator[None]:
+    """Dynamically scope every `rules`/`engine` function to `config` for the
+    duration of the `with` block.
+
+    This is the seam that lets an organization's ICP profile drive the
+    existing, unmodified scorer/policy call graph
+    (`arie.policy.production.CalibratedBoundsPolicy.run` ->
+    `arie.policy.evidence_view.score_results` -> `score_resolved` ->
+    `score_facts`/`decide` -> ... -> `arie.scoring.engine`'s bounds/signals)
+    without changing a single one of those functions' signatures or bodies.
+
+    **Thread-pool caveat, checked and found safe.** `contextvars` do not
+    propagate into a plain `concurrent.futures.ThreadPoolExecutor` worker
+    thread. This codebase has exactly one such pool inside a single lead's
+    processing (`arie.jobs.handlers`'s live `evaluation_parallel`
+    provider-fetch pool), and it only ever submits `provider.fetch(...)` —
+    never a scoring function — so no worker thread ever reads
+    `active_config`. A future call site that submits scoring work to a
+    thread/process pool must wrap its callable in
+    `contextvars.copy_context().run(...)` or this override silently fails to
+    apply inside it.
+    """
+    token = _ACTIVE_CONFIG.set(config)
+    try:
+        yield
+    finally:
+        _ACTIVE_CONFIG.reset(token)
+
+
 def _size_points(employee_count: float) -> float:
-    for lo, hi, pts in _SIZE_POINTS:
+    for lo, hi, pts in active_config().size_bands:
         if lo <= employee_count <= hi:
             return pts
     return 0.0
@@ -197,40 +302,35 @@ def field_points(field_name: str, value: Any) -> float:
     if is_unknown(value):
         return 0.0
 
+    config = active_config()
     if field_name == "employee_count":
         try:
             return _size_points(float(value))
         except (TypeError, ValueError):
             return 0.0
     if field_name == "industry":
-        return _INDUSTRY_POINTS.get(str(value), 0.0)
+        return config.industry_points.get(str(value), 0.0)
     if field_name == "title_seniority":
-        return _SENIORITY_POINTS.get(str(value), 0.0)
+        return config.seniority_points.get(str(value), 0.0)
     if field_name == "title_function":
-        return _FUNCTION_POINTS.get(str(value), 0.0)
+        return config.function_points.get(str(value), 0.0)
     if field_name == "buying_intent":
         try:
-            return max(0.0, min(1.0, float(value))) * _INTENT_MAX_POINTS
+            return max(0.0, min(1.0, float(value))) * config.intent_max_points
         except (TypeError, ValueError):
             return 0.0
     if field_name == "recent_trigger_event":
-        return _TRIGGER_POINTS if value else 0.0
+        return config.trigger_points if value else 0.0
 
     return 0.0
 
 
-_BEST_CASE_CATEGORICAL_VALUES: dict[str, dict[str, float]] = {
-    "industry": _INDUSTRY_POINTS,
-    "title_seniority": _SENIORITY_POINTS,
-    "title_function": _FUNCTION_POINTS,
-}
-
-
 def best_case_value(field_name: str) -> Any | None:
-    """The categorical value that earns ``field_name``'s ``MAX_FIELD_POINTS``
-    ceiling, or ``None`` if the field has no single best categorical value
-    (a continuous field like ``employee_count``/``buying_intent``/
-    ``recent_trigger_event``, the disqualifier, or an unrecognised name).
+    """The categorical value that earns ``field_name``'s ceiling under the
+    currently active :class:`ScoringConfig`, or ``None`` if the field has no
+    single best categorical value (a continuous field like
+    ``employee_count``/``buying_intent``/``recent_trigger_event``, the
+    disqualifier, or an unrecognised name).
 
     Exists so a caller deciding whether a still-unknown field is worth buying
     can ask "if this resolved as favorably as possible, would the
@@ -239,13 +339,21 @@ def best_case_value(field_name: str) -> Any | None:
     scoring machinery, don't duplicate it" rule applied to acquisition
     strategy, not just to the scorer's own callers.
     """
-    points = _BEST_CASE_CATEGORICAL_VALUES.get(field_name)
-    if points is None:
+    config = active_config()
+    points_by_field: dict[str, Mapping[str, float]] = {
+        "industry": config.industry_points,
+        "title_seniority": config.seniority_points,
+        "title_function": config.function_points,
+    }
+    points = points_by_field.get(field_name)
+    if not points:
         return None
     return max(points, key=points.get)  # type: ignore[arg-type]
 
 
 def is_disqualified(facts: Mapping[str, Any]) -> bool:
+    if not active_config().disqualifier_enabled:
+        return False
     return facts.get(DISQUALIFIER_FIELD) is True
 
 
@@ -283,8 +391,9 @@ def decide(total_score: float) -> Decision:
     borderline". Distinguishing those two cases is the confidence model's job,
     not the scorer's.
     """
-    if total_score >= QUALIFY_THRESHOLD:
+    config = active_config()
+    if total_score >= config.qualify_threshold:
         return Decision.AUTO_ROUTE
-    if total_score < REJECT_THRESHOLD:
+    if total_score < config.reject_threshold:
         return Decision.REJECT
     return Decision.ESCALATE_HUMAN
