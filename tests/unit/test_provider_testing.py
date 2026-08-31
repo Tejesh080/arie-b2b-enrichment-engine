@@ -42,11 +42,23 @@ def test_a_200_response_is_success(provider: str) -> None:
     "provider",
     ["abstract_company_enrichment", "hunter_combined_enrichment", "apollo_person_enrichment"],
 )
-@pytest.mark.parametrize("status_code", [401, 403])
-def test_an_auth_failure_is_reported_sanitized(provider: str, status_code: int) -> None:
-    result = run_connection_test(provider, "fake-credential", client=_client_returning(status_code))
+def test_a_401_is_reported_as_authentication_failed(provider: str) -> None:
+    result = run_connection_test(provider, "fake-credential", client=_client_returning(401))
     assert result.success is False
-    assert result.sanitized_error == f"authentication_failed:{status_code}"
+    assert result.sanitized_error == "authentication_failed:401"
+
+
+@pytest.mark.parametrize(
+    "provider",
+    ["abstract_company_enrichment", "hunter_combined_enrichment", "apollo_person_enrichment"],
+)
+def test_a_403_is_reported_as_forbidden_not_authentication_failed(provider: str) -> None:
+    """Verified against Hunter's docs (Part 12B): 403 on the account-status
+    endpoint means rate-limited, not an invalid key — conflating it with
+    401 would misreport a throttled-but-valid credential as bad."""
+    result = run_connection_test(provider, "fake-credential", client=_client_returning(403))
+    assert result.success is False
+    assert result.sanitized_error == "forbidden:403"
 
 
 @pytest.mark.parametrize(

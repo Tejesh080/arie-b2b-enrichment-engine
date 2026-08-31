@@ -6,34 +6,42 @@ so tests never need real network access or real credentials, exactly like
 `arie.providers.live_abstract`/`live_hunter`/`live_apollo` already do for
 their own enrichment calls.
 
-**Best-effort choice of "cheapest endpoint" per vendor — flag for human
-verification before this runs against a real credential for the first
-time**, since nothing in this environment can make a real vendor call to
-confirm:
+**Verified against each vendor's current public documentation (2026-09-01,
+Productization M4 Part 12B)** — web research only, no real vendor call made
+from this environment (no credential available to make one safely):
 
-* **Hunter** — `GET https://api.hunter.io/v2/account?api_key=...`, Hunter's
-  own documented account-status endpoint, not the combined-enrichment
-  endpoint `arie.providers.live_hunter` uses for real work. Chosen because
-  Hunter's public docs describe this endpoint as free (no search credit
-  consumed) — not independently verified against a live call from this
-  session, so confirm against Hunter's current documentation before relying
-  on it in production.
+* **Hunter** — `GET https://api.hunter.io/v2/account`, credential sent via
+  the `X-API-KEY` header. Confirmed: Hunter's docs explicitly support the
+  API key via query parameter, `X-API-KEY` header, or `Authorization`
+  header — this codebase's header choice is one of the three documented
+  methods. Confirmed 401 means "no valid API key was provided"; **403 means
+  rate-limited, not an invalid key** (this account-status call itself is
+  not documented as free, so a valid-but-throttled key returning 403 is a
+  real, expected outcome, not evidence of a bad credential — see
+  `_sanitized_status_result`, which reports 403 as `forbidden:403`,
+  distinct from `authentication_failed:401`, specifically because of this).
 * **Apollo** — the same person-match endpoint `arie.providers.live_apollo`
   uses for real enrichment, called with a deliberately synthetic,
   never-matching identifier (`_APOLLO_TEST_EMAIL`, a `.invalid` address).
-  `ApolloPersonConfig`'s own docstring states a match that finds nothing
-  costs 0 credits, and a bad key 401s before any match is attempted — so
-  this distinguishes "valid key" from "invalid key" while spending nothing
-  on a real key. No cheaper dedicated endpoint is documented anywhere in
-  this codebase's own Apollo integration.
+  Confirmed via Apollo's current docs: `/v1/people/match` credits are
+  "charged only if credit-consuming data is found" (1 credit for
+  email/demographics, +8 for a revealed mobile phone) — a request that
+  matches no real person returns no revealed data and so consumes nothing.
+  `reveal_personal_emails=false`/`reveal_phone_number=false` are kept as an
+  extra safety margin even though the `.invalid` email already guarantees
+  no match. No cheaper dedicated endpoint is documented anywhere in this
+  codebase's own Apollo integration.
 * **Abstract** — the same, only, Company Enrichment endpoint
   `arie.providers.live_abstract` uses for real work, called with a fixed,
-  stable test domain. Abstract's Company Enrichment product has no separate
-  account/auth-check endpoint documented anywhere this codebase references
-  — this is the cheapest call available, and unlike Hunter/Apollo it is a
-  real, billable lookup. If that turns out to be unacceptable, the fix is
-  rate-limiting how often one organization may test, not a different
-  endpoint (none exists to switch to).
+  stable test domain. Confirmed via Abstract's current docs: 401 for a
+  missing/incorrect key, and **every request consumes a credit regardless
+  of outcome** ("credits are counted per request, not per successful
+  response") — there is no separate free auth-check endpoint documented
+  anywhere. This confirms, rather than contradicts, this module's own
+  original assumption that Abstract's test is the one genuinely billable
+  call of the three. If that turns out to be unacceptable in production,
+  the fix is rate-limiting how often one organization may test, not a
+  different endpoint (none exists to switch to).
 
 **Sanitized errors, never a raw provider response, never the credential.**
 Every tester returns a :class:`ConnectionTestResult` carrying only
@@ -88,10 +96,19 @@ def _sanitized_transport_result(exc: httpx.HTTPError) -> ConnectionTestResult:
 def _sanitized_status_result(status_code: int) -> ConnectionTestResult:
     if status_code == httpx.codes.OK:
         return ConnectionTestResult(success=True, sanitized_error=None)
-    if status_code in (httpx.codes.UNAUTHORIZED, httpx.codes.FORBIDDEN):
+    if status_code == httpx.codes.UNAUTHORIZED:
         return ConnectionTestResult(
             success=False, sanitized_error=f"authentication_failed:{status_code}"
         )
+    if status_code == httpx.codes.FORBIDDEN:
+        # Verified against Hunter's current API docs (2026-09): 403 on
+        # `/v2/account` means rate-limited, not an invalid key (only 401
+        # means that) — reporting it as "authentication_failed" would tell
+        # an org admin their credential is bad when it may just be
+        # temporarily throttled. Kept distinct from 401 for all three
+        # providers rather than special-cased, since nothing in Abstract's
+        # or Apollo's own docs says 403 means "bad credential" either.
+        return ConnectionTestResult(success=False, sanitized_error=f"forbidden:{status_code}")
     return ConnectionTestResult(success=False, sanitized_error=f"unexpected_status:{status_code}")
 
 
