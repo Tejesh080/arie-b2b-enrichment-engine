@@ -25,7 +25,7 @@ from arie.auth import ROLES
 from arie.core.types import LeadStatus
 from arie.icp_profiles import InvalidICPConfigError, validate_config
 from arie.identity.normalize import normalize_domain, normalize_email
-from arie.organizations import InvalidOrganizationSettingsError, validate_timezone
+from arie.organizations import EXECUTION_MODES, InvalidOrganizationSettingsError, validate_timezone
 
 
 class IngestLeadRequest(BaseModel):
@@ -294,6 +294,13 @@ class ReceiptProviderCallResponse(BaseModel):
     latency_ms: int | None
     cache_hit: bool
     suppressed_reason: str | None = None
+    credential_source: str | None = None
+    """Productization M5 — see `arie.api.receipt.ReceiptProviderCall.
+    credential_source`. Additive and nullable: absent on every receipt an
+    existing client has ever seen."""
+    actual_cost_usd: Decimal | None = None
+    """Productization M5 — see `arie.api.receipt.ReceiptProviderCall.
+    actual_cost_usd`."""
 
 
 class ReceiptProvidersResponse(BaseModel):
@@ -301,6 +308,9 @@ class ReceiptProvidersResponse(BaseModel):
 
     called: list[ReceiptProviderCallResponse]
     not_called: list[str]
+    unavailable: dict[str, str] = Field(default_factory=dict)
+    """Productization M5 — see `arie.api.receipt.ReceiptProviders.
+    unavailable`."""
 
 
 class ReceiptHumanReviewResponse(BaseModel):
@@ -340,6 +350,10 @@ class ReceiptResponse(BaseModel):
     created_at: datetime | None
     shadow: bool
     """Post-M1 P5 — see `arie.api.receipt.DecisionReceipt.shadow`."""
+    execution_mode: str | None = None
+    """Productization M5 — see `arie.api.receipt.DecisionReceipt.
+    execution_mode`. Additive and nullable: `None` for every receipt an
+    existing client has ever seen."""
 
     decision: ReceiptDecisionResponse | None
     score: ReceiptScoreResponse | None
@@ -500,6 +514,11 @@ class OrganizationResponse(BaseModel):
     status: str
     timezone: str
     company_domain: str | None
+    execution_mode: str
+    """Productization M5 Part 14 — one of `arie.organizations.EXECUTION_MODES`.
+    Read-only here; change it via `PATCH /organization/execution-mode`, a
+    separate, owner/admin-only, individually audited endpoint — see that
+    route and `arie.organizations.set_execution_mode`."""
     onboarding_completed_at: datetime | None
     created_at: datetime
     updated_at: datetime
@@ -541,6 +560,29 @@ class UpdateOrganizationRequest(BaseModel):
         if not self.model_fields_set:
             raise ValueError("at least one field must be provided")
         return self
+
+
+class UpdateExecutionModeRequest(BaseModel):
+    """`PATCH /organization/execution-mode` (Productization M5 Part 14).
+
+    Deliberately its own request model, and its own route, rather than one
+    more optional field on `UpdateOrganizationRequest` — this setting gates
+    real provider spend and real evidence acquisition, a materially
+    different class of consequence than a display name or timezone, and it
+    gets its own audit event (`arie.organizations.set_execution_mode`) the
+    generic organization-settings path doesn't produce.
+    """
+
+    execution_mode: str
+
+    @field_validator("execution_mode")
+    @classmethod
+    def _execution_mode_is_known(cls, value: str) -> str:
+        if value not in EXECUTION_MODES:
+            raise ValueError(
+                f"unknown execution_mode {value!r} — must be one of {list(EXECUTION_MODES)}"
+            )
+        return value
 
 
 # ------------------------------------------------------- members / invitations --

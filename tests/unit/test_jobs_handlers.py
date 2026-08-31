@@ -25,7 +25,10 @@ from arie.jobs.handlers import (
     build_runtime,
     decision_route,
 )
-from arie.providers.live_abstract import AbstractCompanyConfigurationError
+from arie.providers.live_abstract import (
+    AbstractCompanyConfigurationError,
+    AbstractCompanyEnrichmentProvider,
+)
 from arie.statemachine.transitions import job_type_for
 
 
@@ -190,20 +193,50 @@ def test_an_injected_stop_check_builds_a_live_handler_under_the_optimized_name(
     assert "compute_score" in handlers
 
 
-def test_live_provider_mode_without_a_configured_key_fails_clearly(
+def test_live_provider_mode_with_no_injected_provider_builds_without_a_system_key(
     runtime: SimulatedEnrichmentRuntime,
     unopened_pool: ConnectionPool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Missing ABSTRACT_COMPANY_API_KEY must fail at build time, not silently
-    fall back to the simulator — the same boundary DeepSeekConfigurationError
-    draws for arie.llm. Patches the module-level config singleton directly so
-    this is deterministic regardless of the ambient environment/.env."""
+    """Productization M5 Part 2: ordinary (non-test, non-smoke-script) live
+    processing must never depend on a process-wide system credential being
+    configured — each organization's own BYOK credential is resolved per
+    job, not at worker startup. Before M5, building with no injected
+    provider and no system key raised `AbstractCompanyConfigurationError` at
+    build time (`_default_live_providers` built every adapter eagerly); this
+    is the replacement invariant, proven the same way — patch the key away
+    and show the *build* no longer even looks at it. `credential_unavailable`
+    per-organization handling is covered where organization/provider state
+    actually lives: `tests/integration/test_provider_availability_
+    integration.py`.
+    """
+    monkeypatch.setattr(
+        "arie.providers.live_abstract.LIVE_PROVIDER", LiveProviderConfig(api_key="")
+    )
+    handlers = build_handlers(unopened_pool, runtime=runtime, provider_mode="live")
+    assert "compute_score" in handlers
+
+
+def test_live_provider_mode_with_an_injected_provider_still_fails_clearly_on_a_missing_key(
+    runtime: SimulatedEnrichmentRuntime,
+    unopened_pool: ConnectionPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one path that still may use the system credential — explicit
+    injection with no `client` override — keeps the original "missing key
+    fails at build time" guarantee: `_resolve_live_providers` still calls
+    `_default_live_providers()` whenever a caller asks for every adapter by
+    passing neither `live_provider` nor `live_providers`... except
+    `_build_live_handlers` itself never does that anymore (see the test
+    above). This test instead proves the adapter-level guarantee directly:
+    building a real, unconfigured adapter still raises, regardless of which
+    milestone's code calls `.build()`.
+    """
     monkeypatch.setattr(
         "arie.providers.live_abstract.LIVE_PROVIDER", LiveProviderConfig(api_key="")
     )
     with pytest.raises(AbstractCompanyConfigurationError):
-        build_handlers(unopened_pool, runtime=runtime, provider_mode="live")
+        AbstractCompanyEnrichmentProvider.build()
 
 
 # ----------------------------------------------------------- corpus lookup --

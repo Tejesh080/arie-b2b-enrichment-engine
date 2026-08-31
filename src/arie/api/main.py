@@ -67,6 +67,7 @@ from arie.api.schemas import (
     ReviewResponse,
     SetProviderCredentialRequest,
     SetProviderEnabledRequest,
+    UpdateExecutionModeRequest,
     UpdateMemberRoleRequest,
     UpdateOrganizationRequest,
     UsageAgainstLimitsResponse,
@@ -144,8 +145,10 @@ from arie.migrations import MigrationsDirectoryError, pending_migrations
 from arie.observability.tracing import configure_tracing, shutdown_tracing
 from arie.onboarding import get_onboarding_status
 from arie.organizations import (
+    InvalidExecutionModeError,
     InvalidOrganizationSettingsError,
     get_organization,
+    set_execution_mode,
     update_organization,
 )
 from arie.provider_configs import (
@@ -715,6 +718,39 @@ def register_routes(app: FastAPI) -> None:
                     conn, organization_id=auth.organization_id, updates=updates
                 )
         except InvalidOrganizationSettingsError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+        if record is None:  # pragma: no cover - an authenticated org always exists
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="organization not found"
+            )
+        return OrganizationResponse.model_validate(record)
+
+    @app.patch("/organization/execution-mode", response_model=OrganizationResponse)
+    def update_execution_mode_endpoint(
+        payload: UpdateExecutionModeRequest, state: StateDep, auth: AuthDep
+    ) -> OrganizationResponse:
+        """Productization M5 Part 14. Deliberately a separate route from
+        `PATCH /organization` — see `UpdateExecutionModeRequest`'s own
+        docstring. Owner/admin-only, same as every other organization-
+        settings write; the request body's own validator already rejects a
+        value outside `arie.organizations.EXECUTION_MODES` as a 422 before
+        this ever reaches `set_execution_mode`, so the `InvalidExecutionMode
+        Error` branch below only guards a race no request-time validation
+        can catch on its own.
+        """
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        try:
+            with _transaction(state.pool) as conn:
+                record = set_execution_mode(
+                    conn,
+                    organization_id=auth.organization_id,
+                    execution_mode=payload.execution_mode,
+                    actor_user_id=auth.user_id,
+                )
+        except InvalidExecutionModeError as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
             ) from exc

@@ -54,12 +54,12 @@ _RECORD_PROVIDER_CALL = """
     INSERT INTO provider_calls (
         organization_id, lead_id, provider, entity_type, entity_id, idempotency_key,
         completed_at, latency_ms, cost_usd, status, cache_hit, raw_response_ref,
-        error_kind, credits_used, cost_basis, suppressed_reason
+        error_kind, credits_used, cost_basis, suppressed_reason, credential_source, actual_cost_usd
     ) VALUES (
         %(organization_id)s, %(lead_id)s, %(provider)s, %(entity_type)s, %(entity_id)s,
         %(idempotency_key)s, %(completed_at)s, %(latency_ms)s, %(cost_usd)s, %(status)s,
         %(cache_hit)s, %(raw_response_ref)s, %(error_kind)s, %(credits_used)s, %(cost_basis)s,
-        %(suppressed_reason)s
+        %(suppressed_reason)s, %(credential_source)s, %(actual_cost_usd)s
     )
     ON CONFLICT (idempotency_key) DO UPDATE
         SET idempotency_key = provider_calls.idempotency_key
@@ -171,6 +171,8 @@ class PostgresCostLedger:
         credits_used: float | Decimal | None = None,
         cost_basis: str | None = None,
         suppressed_reason: str | None = None,
+        credential_source: str | None = None,
+        actual_cost_usd: float | Decimal | None = None,
     ) -> LedgerWrite:
         """Record one provider call. Idempotent on `idempotency_key`.
 
@@ -197,6 +199,19 @@ class PostgresCostLedger:
         field value, reused) — both are zero-cost, but only one of them
         reused a value. ``None`` for every real call and for a plain
         evidence-cache hit; see ``arie.live.outcome_cache``.
+
+        `credential_source` (0028) records which credential a real call used
+        — ``"organization"`` for an organization's own BYOK Vault credential
+        (``arie.live.provider_availability``) or ``"system"`` for the
+        process-wide env-var credential, reachable only through explicit
+        test/smoke-script injection after this milestone. ``None`` for
+        simulated-mode rows, for which it does not apply.
+
+        `actual_cost_usd` (0028) is the provider's own billed figure, only
+        when the vendor's response states one explicitly — never computed or
+        estimated here or by any caller. ``None`` means "not reported by the
+        vendor," not "free" — `cost_usd` (this function's own modeled
+        figure) is unaffected either way.
         """
         billed_cost = Decimal(0) if cache_hit else usd(cost_usd)
         billed_latency = 0 if cache_hit else int(latency_ms)
@@ -234,6 +249,10 @@ class PostgresCostLedger:
                         else Decimal(str(credits_used)),
                         "cost_basis": None if cache_hit else cost_basis,
                         "suppressed_reason": suppressed_reason,
+                        "credential_source": credential_source,
+                        "actual_cost_usd": None
+                        if actual_cost_usd is None
+                        else usd(actual_cost_usd),
                     },
                 )
                 row = cur.fetchone()

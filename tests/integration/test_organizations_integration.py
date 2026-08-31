@@ -278,3 +278,108 @@ def test_rls_anon_cannot_update_any_organization(
             (two_orgs.org_a,),
         )
         assert cur.rowcount == 0
+
+
+# ------------------------------------------------------------------- execution mode --
+#
+# Productization M5 Part 14. Deliberately its own route/tests, not folded
+# into the PATCH /organization suite above — see `UpdateExecutionModeRequest`
+# and `arie.organizations.set_execution_mode`'s own docstrings for why.
+
+
+def test_default_execution_mode_is_simulated(api_client: TestClient) -> None:
+    """No existing organization becomes live by migration — migration 0027's
+    own `DEFAULT 'simulated'` — and the same default must hold for an
+    organization created fresh in this suite's fixtures."""
+    body = api_client.get("/organization").json()
+    assert body["execution_mode"] == "simulated"
+
+
+def test_owner_can_change_execution_mode(
+    api_client_org_b: TestClient, db_conn: psycopg.Connection
+) -> None:
+    response = api_client_org_b.patch(
+        "/organization/execution-mode", json={"execution_mode": "live_shadow"}
+    )
+    assert response.status_code == 200
+    assert response.json()["execution_mode"] == "live_shadow"
+
+    reread = api_client_org_b.get("/organization").json()
+    assert reread["execution_mode"] == "live_shadow"
+
+
+def test_changing_execution_mode_is_audited(
+    api_client_org_b: TestClient, other_org: uuid.UUID, db_conn: psycopg.Connection
+) -> None:
+    api_client_org_b.patch(
+        "/organization/execution-mode", json={"execution_mode": "live_human_only"}
+    )
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT event_type, payload FROM organization_audit_events "
+            "WHERE organization_id = %s AND event_type = 'organization.execution_mode_changed' "
+            "ORDER BY event_id DESC LIMIT 1",
+            (other_org,),
+        )
+        row = cur.fetchone()
+    assert row is not None
+    assert row[1] == {"execution_mode": "live_human_only"}
+
+
+def test_an_unknown_execution_mode_is_rejected(api_client_org_b: TestClient) -> None:
+    response = api_client_org_b.patch(
+        "/organization/execution-mode", json={"execution_mode": "live_autonomous"}
+    )
+    assert response.status_code == 422
+
+    reread = api_client_org_b.get("/organization").json()
+    assert reread["execution_mode"] == "simulated"  # unchanged
+
+
+def test_changing_execution_mode_requires_owner_or_admin(app_state: AppState) -> None:
+    app = create_app(state=app_state)
+    authorize_app(
+        app,
+        AuthContext(
+            organization_id=uuid.uuid4(),
+            auth_method="jwt",
+            user_id=uuid.uuid4(),
+            role="analyst_reviewer",
+        ),
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.patch(
+            "/organization/execution-mode", json={"execution_mode": "live_shadow"}
+        )
+    assert response.status_code == 403
+
+
+def test_an_api_key_cannot_change_execution_mode(
+    api_client: TestClient, app_state: AppState, cleanup_api_keys: list[uuid.UUID]
+) -> None:
+    created = api_client.post(
+        "/api-keys", json={"label": "execution-mode-probe", "scopes": ["leads:write"]}
+    )
+    assert created.status_code == 201
+    cleanup_api_keys.append(uuid.UUID(created.json()["key_id"]))
+    headers = {"Authorization": f"Bearer {created.json()['raw_key']}"}
+
+    with TestClient(create_app(state=app_state), raise_server_exceptions=False) as raw_client:
+        response = raw_client.patch(
+            "/organization/execution-mode", json={"execution_mode": "live_shadow"}, headers=headers
+        )
+    assert response.status_code == 403
+
+
+def test_changing_execution_mode_cannot_reach_another_organization(
+    api_client_org_b: TestClient,
+) -> None:
+    before = api_client_org_b.get("/organization").json()
+
+    response = api_client_org_b.patch(
+        "/organization/execution-mode", json={"execution_mode": "live_shadow"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["organization_id"] == before["organization_id"]

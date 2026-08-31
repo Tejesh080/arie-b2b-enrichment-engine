@@ -113,8 +113,13 @@ from arie.ledger.store import PostgresCostLedger
 from arie.live.budget import LiveSpendGuard
 from arie.live.cooldown import PROVIDER_UNAVAILABLE, ProviderCooldownGuard
 from arie.live.evaluation import classify_agreement, overall_agreement
+from arie.live.org_budget import OrganizationSpendGuard
 from arie.live.outcome_cache import RECENT_MISS, RECENT_PARTIAL, ProviderOutcomeGuard
 from arie.live.person_relevance import person_evidence_is_decision_relevant
+from arie.live.provider_availability import (
+    CREDENTIAL_SOURCE_ORGANIZATION,
+    resolve_organization_providers,
+)
 from arie.live.providers import acquisition_order
 from arie.live.safety import (
     LIVE_GUARD_REASON,
@@ -130,6 +135,7 @@ from arie.live.strategy import (
     resolve_strategy,
 )
 from arie.observability.tracing import get_tracer, set_attributes, traced
+from arie.organizations import LIVE_SHADOW, SIMULATED, get_execution_mode
 from arie.policy.base import EvidenceCache, PolicyOutcome, RunContext
 from arie.providers.base import EnrichmentProvider, ProviderRegistry
 from arie.providers.catalog import BY_NAME
@@ -824,7 +830,19 @@ def _build_simulated_handlers(
                         "policy_name": resolved_runtime.policy.name,
                         "scorer_version": outcome.scoring.breakdown.model_version,
                         "confidence_calibration": resolved_runtime.policy.model.method,
-                        "evidence_snapshot": Jsonb(_evidence_snapshot(outcome.scoring)),
+                        "evidence_snapshot": Jsonb(
+                            {
+                                **_evidence_snapshot(outcome.scoring),
+                                # Productization M5 Part 13 — symmetric with
+                                # the live handler's own `execution_mode` key
+                                # (arie.organizations.EXECUTION_MODES), so
+                                # every receipt, simulated or live, carries
+                                # one honest label a viewer can render
+                                # without special-casing "key absent means
+                                # simulated."
+                                "execution_mode": SIMULATED,
+                            }
+                        ),
                         "icp_profile_id": scoring_config.profile_id,
                         "icp_profile_version": scoring_config.profile_version,
                     },
@@ -1156,9 +1174,19 @@ def _acquire_live_evidence(
     model: ConfidenceModel,
     now: datetime,
     stop_check: _StopCheck = _default_stop_check,
+    org_spend_guard: OrganizationSpendGuard | None = None,
+    credential_source: str | None = None,
 ) -> _LiveAcquisitionOutcome:
     """Walk the live providers in order, stopping as soon as more evidence
     stops being worth buying.
+
+    `org_spend_guard` (Productization M5 Part 6), when given, is checked
+    immediately after `spend_guard` and before every call — both must permit
+    it. `None` (every existing caller; the test/smoke-script injection path
+    in `arie.jobs.handlers` never passes it) preserves this function's exact
+    pre-M5 behaviour. `credential_source` (Part 1/5) is threaded straight
+    onto every `_ledger_live_call` this function makes — see that function's
+    own docstring.
 
     ``stop_check`` decides that, asked before every provider — defaults to
     the "optimized" strategy's own rule (:func:`_default_stop_check`, an
@@ -1329,6 +1357,18 @@ def _acquire_live_evidence(
             not_needed = [candidate.name for candidate in providers[index + 1 :]]
             break
 
+        if org_spend_guard is not None:
+            org_allowance = org_spend_guard.allowance(
+                organization_id=organization_id,
+                provider=provider.name,
+                estimated_cost_usd=provider.base_cost_usd,
+            )
+            if not org_allowance.permitted:
+                assert org_allowance.reason is not None  # set whenever not permitted
+                stop_reason = org_allowance.reason
+                not_needed = [candidate.name for candidate in providers[index + 1 :]]
+                break
+
         result = provider.fetch(ref.as_entity())
         result, validation = _validate_person_match(identity, provider, result)
         if validation is not None:
@@ -1349,6 +1389,7 @@ def _acquire_live_evidence(
             provider_name=provider.name,
             ref=ref,
             result=result,
+            credential_source=credential_source,
         )
 
         if result.status in (ProviderStatus.ERROR, ProviderStatus.TIMEOUT):
@@ -1508,6 +1549,7 @@ def _ledger_live_call(
     provider_name: str,
     ref: _LiveEntityRef,
     result: ProviderResult,
+    credential_source: str | None = None,
 ) -> None:
     """One real call's ledger row, provenance included.
 
@@ -1519,6 +1561,15 @@ def _ledger_live_call(
     so the quota-cooldown guard can read failure kinds back out of the same
     ledger the spend caps read, and so a ledger row's dollars can always be
     audited back to what the vendor actually counted.
+
+    ``credential_source`` (0028) is threaded straight through — ``None`` for
+    the test/smoke-script injection path (the default), or
+    ``arie.live.provider_availability.CREDENTIAL_SOURCE_ORGANIZATION`` when
+    the caller resolved this provider from an organization's own BYOK
+    credential. None of today's adapters report a vendor-stated billed cost
+    on ``result.raw`` (see migration 0028's own docstring), so
+    ``actual_cost_usd`` is always ``None`` here — never computed, only ever
+    passed through if a future adapter starts reporting one.
     """
     error_kind = result.raw.get("error_kind")
     credits = result.raw.get("credits_consumed")
@@ -1537,6 +1588,7 @@ def _ledger_live_call(
         error_kind=error_kind if isinstance(error_kind, str) else None,
         credits_used=credits if isinstance(credits, int | float) else None,
         cost_basis=cost_basis if isinstance(cost_basis, str) else None,
+        credential_source=credential_source,
     )
 
 
@@ -1563,9 +1615,16 @@ def _acquire_evaluation_parallel(
     cooldown_guard: ProviderCooldownGuard,
     outcome_guard: ProviderOutcomeGuard,
     now: datetime,
+    org_spend_guard: OrganizationSpendGuard | None = None,
+    credential_source: str | None = None,
 ) -> tuple[_LiveAcquisitionOutcome, dict[str, Any]]:
     """The ``evaluation_parallel`` strategy: measure the person providers
     against each other on one lead.
+
+    ``org_spend_guard``/``credential_source`` — see
+    :func:`_acquire_live_evidence`'s identical parameters; both default to
+    ``None``, preserving this function's exact pre-M5 behaviour for every
+    existing caller.
 
     Deliberately different from :func:`_acquire_live_evidence` in exactly two
     ways, and identical in every other:
@@ -1681,6 +1740,16 @@ def _acquire_evaluation_parallel(
             assert allowance.reason is not None  # set whenever not permitted
             budget_stop = budget_stop or allowance.reason
             continue
+        if org_spend_guard is not None:
+            org_allowance = org_spend_guard.allowance(
+                organization_id=organization_id,
+                provider=provider.name,
+                estimated_cost_usd=provider.base_cost_usd,
+            )
+            if not org_allowance.permitted:
+                assert org_allowance.reason is not None  # set whenever not permitted
+                budget_stop = budget_stop or org_allowance.reason
+                continue
         result = provider.fetch(ref.as_entity())
         called.append(provider.name)
         cost_usd += result.cost_usd
@@ -1692,6 +1761,7 @@ def _acquire_evaluation_parallel(
             provider_name=provider.name,
             ref=ref,
             result=result,
+            credential_source=credential_source,
         )
         if result.status in (ProviderStatus.ERROR, ProviderStatus.TIMEOUT):
             failed.append(provider.name)
@@ -1804,6 +1874,20 @@ def _acquire_evaluation_parallel(
                 "reason": allowance.reason,
             }
             continue
+        if org_spend_guard is not None:
+            org_allowance = org_spend_guard.allowance(
+                organization_id=organization_id,
+                provider=provider.name,
+                estimated_cost_usd=provider.base_cost_usd + pending_estimate,
+            )
+            if not org_allowance.permitted:
+                assert org_allowance.reason is not None  # set whenever not permitted
+                budget_stop = budget_stop or org_allowance.reason
+                person_records[provider.name] = {
+                    "served_from": "skipped_budget",
+                    "reason": org_allowance.reason,
+                }
+                continue
         pending_estimate += provider.base_cost_usd
         to_call.append((provider, ref))
 
@@ -1852,6 +1936,7 @@ def _acquire_evaluation_parallel(
             provider_name=provider.name,
             ref=ref,
             result=result,
+            credential_source=credential_source,
         )
         if result.status in (ProviderStatus.ERROR, ProviderStatus.TIMEOUT):
             failed.append(provider.name)
@@ -2065,13 +2150,38 @@ def _build_live_handlers(
     `verify_live_status` asserts it. Adding a second provider does not soften
     this, and widening the evidence is not evidence that the threshold
     transfers.
+
+    **Productization M5 — organization-scoped credentials, by default.** When
+    the caller injects `live_provider`/`live_providers` (tests,
+    `scripts/live_provider_smoke.py`), that injected set is used exactly as
+    before this milestone — a fixed set, resolved once, from whatever
+    credential the caller built it with. That is the one and only path that
+    may ever use the process-wide system credential
+    (`arie.config.LIVE_PROVIDER`/`HUNTER`/`APOLLO_PERSON`) here; see
+    `arie.live.provider_availability`'s module docstring.
+
+    When neither is injected — the only path ordinary job processing takes —
+    `compute_score` resolves providers *per job*, after the lead's
+    `organization_id` is known: `arie.organizations.get_execution_mode`
+    decides whether this organization has opted into live processing at all,
+    and `arie.live.provider_availability.resolve_organization_providers`
+    builds an adapter for every provider that organization has configured,
+    enabled, and has a resolvable Vault credential for — never a different
+    organization's credential, never the system credential, and never a
+    provider it hasn't configured. Each such adapter is built fresh for this
+    one job and `.close()`-d when the job is done (`finally`, below) —
+    deliberately not cached across jobs; see that module's docstring for why.
     """
     # An injected strategy goes through the same validation as the env one —
     # a test or script passing a typo must fail the same loud way.
     strategy: LiveStrategy = resolve_strategy(
         None if live_strategy is None else LiveStrategyConfig(strategy=live_strategy)
     )
-    providers = _resolve_live_providers(live_provider=live_provider, live_providers=live_providers)
+    injected_providers: tuple[EnrichmentProvider, ...] | None = None
+    if live_provider is not None or live_providers is not None:
+        injected_providers = _resolve_live_providers(
+            live_provider=live_provider, live_providers=live_providers
+        )
     evidence_store = PostgresEvidenceStore(pool)
     cost_ledger = PostgresCostLedger(pool)
     # The evaluation strategy deliberately calls overlapping providers, so it
@@ -2082,6 +2192,7 @@ def _build_live_handlers(
     )
     cooldown_guard = ProviderCooldownGuard(pool)
     outcome_guard = ProviderOutcomeGuard(pool)
+    org_spend_guard = OrganizationSpendGuard(pool)
     model = resolved_runtime.policy.model
     autonomy_allowed = autonomy_allowed_for("live")
     policy_name = (
@@ -2105,47 +2216,97 @@ def _build_live_handlers(
             identity = _load_identity(ctx.conn, job.lead_id)
             version = _walk_to_decision(ctx.conn, lead_id=job.lead_id, version=ctx.lead_version)
 
-            # Productization M3 — see the identical comment in
-            # `_build_simulated_handlers.compute_score`. Wraps the whole
-            # acquisition call (which itself re-scores after every provider
-            # response) rather than a single `score_evidence` call, since
-            # every one of those internal re-scores must see the same
-            # organization-specific config as the first.
-            scoring_config = resolve_scoring_config(
-                ctx.conn, organization_id=identity.organization_id
-            )
-            evaluation: dict[str, Any] | None = None
-            with use_scoring_config(scoring_config):
-                if strategy == EVALUATION_PARALLEL:
-                    acquisition, evaluation = _acquire_evaluation_parallel(
-                        providers=providers,
-                        identity=identity,
-                        lead_id=job.lead_id,
-                        job_id=job.job_id,
-                        organization_id=identity.organization_id,
-                        evidence_store=evidence_store,
-                        cost_ledger=cost_ledger,
-                        spend_guard=spend_guard,
-                        cooldown_guard=cooldown_guard,
-                        outcome_guard=outcome_guard,
-                        now=datetime.now(UTC),
-                    )
-                else:
-                    acquisition = _acquire_live_evidence(
-                        providers=providers,
-                        identity=identity,
-                        lead_id=job.lead_id,
-                        job_id=job.job_id,
-                        organization_id=identity.organization_id,
-                        evidence_store=evidence_store,
-                        cost_ledger=cost_ledger,
-                        spend_guard=spend_guard,
-                        cooldown_guard=cooldown_guard,
-                        outcome_guard=outcome_guard,
-                        model=model,
-                        now=datetime.now(UTC),
-                        stop_check=stop_check or _default_stop_check,
-                    )
+            # Productization M5 Parts 1-4: resolve which adapters this job may
+            # use. Injected providers (tests, the smoke script) bypass
+            # organization credential/execution-mode resolution entirely —
+            # see this function's own docstring — and own nothing this
+            # handler must close. The default (production) path resolves
+            # fresh, organization-scoped adapters every job and owns closing
+            # them.
+            execution_mode: str | None = None
+            provider_unavailability: dict[str, str] = {}
+            active_org_spend_guard: OrganizationSpendGuard | None = None
+            credential_source: str | None = None
+            owns_active_providers = False
+            if injected_providers is not None:
+                active_providers = injected_providers
+                effective_is_shadow = identity.is_shadow
+            else:
+                execution_mode = get_execution_mode(
+                    ctx.conn, organization_id=identity.organization_id
+                )
+                built_providers, provider_unavailability = resolve_organization_providers(
+                    ctx.conn,
+                    organization_id=identity.organization_id,
+                    execution_mode=execution_mode,
+                )
+                active_providers = acquisition_order(built_providers, order=_configured_order())
+                owns_active_providers = True
+                if active_providers:
+                    active_org_spend_guard = org_spend_guard
+                    credential_source = CREDENTIAL_SOURCE_ORGANIZATION
+                effective_is_shadow = identity.is_shadow or execution_mode == LIVE_SHADOW
+
+            try:
+                # Productization M3 — see the identical comment in
+                # `_build_simulated_handlers.compute_score`. Wraps the whole
+                # acquisition call (which itself re-scores after every
+                # provider response) rather than a single `score_evidence`
+                # call, since every one of those internal re-scores must see
+                # the same organization-specific config as the first.
+                scoring_config = resolve_scoring_config(
+                    ctx.conn, organization_id=identity.organization_id
+                )
+                evaluation: dict[str, Any] | None = None
+                with use_scoring_config(scoring_config):
+                    if strategy == EVALUATION_PARALLEL:
+                        acquisition, evaluation = _acquire_evaluation_parallel(
+                            providers=active_providers,
+                            identity=identity,
+                            lead_id=job.lead_id,
+                            job_id=job.job_id,
+                            organization_id=identity.organization_id,
+                            evidence_store=evidence_store,
+                            cost_ledger=cost_ledger,
+                            spend_guard=spend_guard,
+                            cooldown_guard=cooldown_guard,
+                            outcome_guard=outcome_guard,
+                            now=datetime.now(UTC),
+                            org_spend_guard=active_org_spend_guard,
+                            credential_source=credential_source,
+                        )
+                    else:
+                        acquisition = _acquire_live_evidence(
+                            providers=active_providers,
+                            identity=identity,
+                            lead_id=job.lead_id,
+                            job_id=job.job_id,
+                            organization_id=identity.organization_id,
+                            evidence_store=evidence_store,
+                            cost_ledger=cost_ledger,
+                            spend_guard=spend_guard,
+                            cooldown_guard=cooldown_guard,
+                            outcome_guard=outcome_guard,
+                            model=model,
+                            now=datetime.now(UTC),
+                            stop_check=stop_check or _default_stop_check,
+                            org_spend_guard=active_org_spend_guard,
+                            credential_source=credential_source,
+                        )
+            finally:
+                if owns_active_providers:
+                    # `EnrichmentProvider` (arie.providers.base) declares no
+                    # `close()` — it must stay the minimal shape simulated
+                    # providers and test fakes share too. Every real live
+                    # adapter `resolve_organization_providers` can return
+                    # does define one (each owns an `httpx.Client`); this
+                    # getattr is defensive against a future adapter that
+                    # doesn't need one, not a sign one might be silently
+                    # skipped today.
+                    for adapter in active_providers:
+                        close = getattr(adapter, "close", None)
+                        if close is not None:
+                            close()
             scoring = acquisition.scoring
 
             confidence = model.predict(scoring)
@@ -2207,6 +2368,27 @@ def _build_live_handlers(
                                 # agreement verdicts, identified by
                                 # policy_name above.
                                 **({"evaluation": evaluation} if evaluation is not None else {}),
+                                # Productization M5 Part 11 — additive, live-
+                                # provenance-only keys. `execution_mode` is
+                                # absent for the test/smoke-script injection
+                                # path (there is no organization setting to
+                                # report). `provider_unavailability` is
+                                # present only when at least one registered
+                                # provider was skipped for this organization,
+                                # naming why (Part 4's structured vocabulary)
+                                # without duplicating `acquisition.audit()`'s
+                                # own called/unreachable/unavailable/failed
+                                # breakdown, which stays exactly as it was.
+                                **(
+                                    {"execution_mode": execution_mode}
+                                    if execution_mode is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"provider_unavailability": provider_unavailability}
+                                    if provider_unavailability
+                                    else {}
+                                ),
                             }
                         ),
                         "icp_profile_id": scoring_config.profile_id,
@@ -2222,7 +2404,7 @@ def _build_live_handlers(
                     version=version,
                     decision=scoring.decision,
                     autonomous=model_autonomous,
-                    is_shadow=identity.is_shadow,
+                    is_shadow=effective_is_shadow,
                     autonomy_allowed=autonomy_allowed,
                 )
             )
@@ -2238,8 +2420,10 @@ def _build_live_handlers(
                     "arie.autonomy_guard": None if autonomy_allowed else LIVE_GUARD_REASON,
                     "arie.lead.final_status": str(final),
                     "arie.stop_reason": acquisition.stop_reason,
-                    "arie.shadow": identity.is_shadow,
+                    "arie.shadow": effective_is_shadow,
                     "arie.live_strategy": strategy,
+                    "arie.execution_mode": execution_mode,
+                    "arie.credential_source": credential_source,
                     **{f"arie.acquisition.{k}": v for k, v in acquisition.audit().items()},
                 },
             )

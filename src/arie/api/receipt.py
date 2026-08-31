@@ -27,7 +27,7 @@ happened, possibly after a human overrode the recommendation).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -211,6 +211,20 @@ class ReceiptProviderCall:
     outcome already answered this, so nothing was asked" — the distinction
     ``arie.live.outcome_cache`` exists to keep truthful: a suppressed call
     reused a *fact that nothing new was found*, not a value."""
+    credential_source: str | None = None
+    """Productization M5 Part 11 (migration 0028). ``'organization'`` when
+    this call used the calling organization's own BYOK Vault credential,
+    ``'system'`` for the process-wide credential (reachable only through
+    explicit test/smoke-script injection, never ordinary tenant traffic —
+    see `arie.live.provider_availability`). ``None`` for a simulated-mode
+    call, a cache hit/suppression row, or any row written before this
+    migration. Never a secret, never a Vault id — only which *kind* of
+    credential was used."""
+    actual_cost_usd: Decimal | None = None
+    """The provider's own billed figure, only when its response stated one
+    explicitly (migration 0028). ``None`` means "not reported by the
+    vendor" — an honest unknown, never computed or estimated, and never
+    to be confused with `cost_usd` (ARIE's modeled figure, always present)."""
 
 
 @dataclass(frozen=True)
@@ -221,6 +235,19 @@ class ReceiptProviders:
     difference against the static, cheapest-first catalogue order, not a claim that
     each one was individually evaluated and rejected. See `stopping` for why the
     acquisition loop stopped before reaching them."""
+    unavailable: dict[str, str] = field(default_factory=dict)
+    """Productization M5 Part 11. Why a provider in `not_called` was never
+    even attempted for *this organization* — one of
+    `arie.live.provider_availability.UNAVAILABILITY_REASONS`
+    (`provider_not_configured`, `provider_disabled`, `credential_unavailable`,
+    `provider_mode_disallows_live`), keyed by provider name. Empty for a
+    simulated-mode receipt, for a live receipt where every registered
+    provider was available, and for the test/smoke-script injection path —
+    all cases where nothing was excluded for an organization-configuration
+    reason. A provider skipped for a live-acquisition-time reason instead
+    (cooldown, budget, a recent settled miss) is not listed here — that
+    reason is on the acquisition side (`stopping`/`called[].suppressed_
+    reason`), not this organization-configuration side."""
 
 
 @dataclass(frozen=True)
@@ -269,7 +296,18 @@ class DecisionReceipt:
     will never be an authoritative routing outcome (AUTO_ROUTED/AWAITING_HUMAN/
     MANUAL_REVIEW/SYNCED) and `human_review` will always be `None`: shadow
     evaluation never opens a real review. See `arie.jobs.handlers`' shadow
-    branch for what is and isn't suppressed."""
+    branch for what is and isn't suppressed. Note this can be `True` for a
+    reason `execution_mode` explains and the lead's own ingestion mode
+    doesn't: an organization running `live_shadow` forces every one of its
+    leads through this branch regardless of how each lead was ingested."""
+
+    execution_mode: str | None
+    """Productization M5 Part 13 — one of `arie.organizations.EXECUTION_MODES`
+    (`'simulated'`, `'live_shadow'`, `'live_human_only'`), so a viewer never
+    has to infer live-vs-simulated from `providers`/`cost` being empty.
+    `None` only for a receipt written before this milestone, or one produced
+    by the test/smoke-script provider-injection path, which consults no
+    organization setting."""
 
     decision: ReceiptDecision | None
     score: ReceiptScore | None
@@ -298,7 +336,8 @@ _SELECT_ICP_PROFILE_THRESHOLDS = """
 """
 
 _SELECT_PROVIDER_CALLS = """
-    SELECT provider, status, cost_usd, latency_ms, cache_hit, suppressed_reason
+    SELECT provider, status, cost_usd, latency_ms, cache_hit, suppressed_reason,
+           credential_source, actual_cost_usd
     FROM provider_calls
     WHERE lead_id = %(lead_id)s
     ORDER BY requested_at
@@ -333,6 +372,8 @@ def _provider_calls(conn: psycopg.Connection, lead_id: UUID) -> tuple[ReceiptPro
             latency_ms=row["latency_ms"],
             cache_hit=row["cache_hit"],
             suppressed_reason=row["suppressed_reason"],
+            credential_source=row["credential_source"],
+            actual_cost_usd=row["actual_cost_usd"],
         )
         for row in rows
     )
@@ -474,6 +515,7 @@ def build_receipt(
             lead_status=lead.status,
             created_at=None,
             shadow=lead.is_shadow,
+            execution_mode=None,
             decision=None,
             score=None,
             stopping=None,
@@ -498,6 +540,7 @@ def build_receipt(
         lead_status=lead.status,
         created_at=receipt_row["created_at"],
         shadow=lead.is_shadow,
+        execution_mode=snapshot.get("execution_mode"),
         decision=ReceiptDecision(
             recommended_action=receipt_row["decision"],
             autonomous=receipt_row["autonomous"],
@@ -535,6 +578,10 @@ def build_receipt(
             items=_evidence_items(snapshot),
             unknown_fields=tuple(snapshot.get("unknown", [])),
         ),
-        providers=ReceiptProviders(called=calls, not_called=not_called),
+        providers=ReceiptProviders(
+            called=calls,
+            not_called=not_called,
+            unavailable=dict(snapshot.get("provider_unavailability", {})),
+        ),
         human_review=human_review,
     )

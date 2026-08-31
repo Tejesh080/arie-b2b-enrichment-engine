@@ -11,6 +11,15 @@ Deliberately does not own onboarding *step* tracking — see
 `migrations/0023_organization_settings.sql`'s own docstring for why each
 step is derived from other tables (`organization_icp_profiles`,
 `lead_batches`, ...) rather than stored again here.
+
+**`execution_mode` (Productization M5 Part 14)** is deliberately not in
+:data:`UPDATABLE_FIELDS` and has its own dedicated
+:func:`set_execution_mode`, not the generic `update_organization` whitelist
+path. It gates real provider spend and real evidence acquisition — a
+materially different class of consequence than a display name or timezone —
+so it gets its own function, with its own audit event, the same way
+`arie.provider_configs.set_provider_enabled` is a dedicated function rather
+than a field on some generic "provider settings" updater.
 """
 
 from __future__ import annotations
@@ -25,11 +34,20 @@ from zoneinfo import available_timezones
 import psycopg
 from psycopg.rows import dict_row
 
+from arie.audit import record_event
+
 __all__ = [
+    "EXECUTION_MODES",
+    "LIVE_HUMAN_ONLY",
+    "LIVE_SHADOW",
+    "SIMULATED",
     "UPDATABLE_FIELDS",
+    "InvalidExecutionModeError",
     "InvalidOrganizationSettingsError",
     "OrganizationRecord",
+    "get_execution_mode",
     "get_organization",
+    "set_execution_mode",
     "update_organization",
     "validate_timezone",
 ]
@@ -45,12 +63,28 @@ UPDATABLE_FIELDS: tuple[str, ...] = ("name", "timezone", "company_domain")
 """The only columns `update_organization` will ever write — a whitelist, not
 merely documentation: an update dict containing any other key raises before a
 query is built, and every key in this tuple is safe to interpolate directly
-into a `SET` clause precisely because it can only ever come from here."""
+into a `SET` clause precisely because it can only ever come from here.
+`execution_mode` is intentionally excluded — see :func:`set_execution_mode`."""
+
+SIMULATED = "simulated"
+LIVE_SHADOW = "live_shadow"
+LIVE_HUMAN_ONLY = "live_human_only"
+
+EXECUTION_MODES: tuple[str, ...] = (SIMULATED, LIVE_SHADOW, LIVE_HUMAN_ONLY)
+"""Mirrors `migrations/0027_organization_execution_mode.sql`'s CHECK
+constraint exactly — the database is the ultimate enforcement, this tuple is
+what lets an invalid value be rejected before a query is even built, with a
+message better than a raw constraint-violation error."""
 
 
 class InvalidOrganizationSettingsError(ValueError):
     """`update_organization`'s payload failed validation, or named a field
     outside :data:`UPDATABLE_FIELDS`."""
+
+
+class InvalidExecutionModeError(ValueError):
+    """`set_execution_mode`'s `execution_mode` argument is outside
+    :data:`EXECUTION_MODES`."""
 
 
 @dataclass(frozen=True)
@@ -61,6 +95,7 @@ class OrganizationRecord:
     status: str
     timezone: str
     company_domain: str | None
+    execution_mode: str
     onboarding_completed_at: datetime | None
     created_at: datetime
     updated_at: datetime
@@ -74,6 +109,7 @@ def _row_to_record(row: Mapping[str, Any]) -> OrganizationRecord:
         status=row["status"],
         timezone=row["timezone"],
         company_domain=row["company_domain"],
+        execution_mode=row["execution_mode"],
         onboarding_completed_at=row["onboarding_completed_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -82,9 +118,21 @@ def _row_to_record(row: Mapping[str, Any]) -> OrganizationRecord:
 
 _SELECT = """
     SELECT organization_id, name, slug, status, timezone, company_domain,
-           onboarding_completed_at, created_at, updated_at
+           execution_mode, onboarding_completed_at, created_at, updated_at
     FROM organizations
     WHERE organization_id = %(organization_id)s
+"""
+
+_SELECT_EXECUTION_MODE = """
+    SELECT execution_mode FROM organizations WHERE organization_id = %(organization_id)s
+"""
+
+_UPDATE_EXECUTION_MODE = """
+    UPDATE organizations
+    SET execution_mode = %(execution_mode)s, updated_at = now()
+    WHERE organization_id = %(organization_id)s
+    RETURNING organization_id, name, slug, status, timezone, company_domain,
+              execution_mode, onboarding_completed_at, created_at, updated_at
 """
 
 
@@ -144,7 +192,7 @@ def update_organization(
         SET {set_clause}, updated_at = now()
         WHERE organization_id = %(organization_id)s
         RETURNING organization_id, name, slug, status, timezone, company_domain,
-                  onboarding_completed_at, created_at, updated_at
+                  execution_mode, onboarding_completed_at, created_at, updated_at
     """  # `field` names above come only from UPDATABLE_FIELDS, checked above
 
     params: dict[str, Any] = dict(updates)
@@ -154,5 +202,63 @@ def update_organization(
         row = cur.fetchone()
     if row is None:
         return None
+    conn.commit()
+    return _row_to_record(row)
+
+
+def get_execution_mode(conn: psycopg.Connection, *, organization_id: UUID) -> str:
+    """`organization_id`'s current execution mode, or :data:`SIMULATED` if the
+    organization doesn't exist at all.
+
+    Defensive rather than `None`-returning on a missing organization: this is
+    read by `arie.jobs.handlers`' live acquisition path on every job, where
+    the safe reading of "I cannot determine this organization's mode" is
+    "treat it as simulated" (no real provider call), never "treat it as
+    live" — the same fail-safe direction every other guard in this
+    milestone takes. In practice a job's own `organization_id` always
+    resolves to a real row (the lead was ingested under it), so this branch
+    is defensive, not expected.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(_SELECT_EXECUTION_MODE, {"organization_id": organization_id})
+        row = cur.fetchone()
+    return row["execution_mode"] if row is not None else SIMULATED
+
+
+def set_execution_mode(
+    conn: psycopg.Connection,
+    *,
+    organization_id: UUID,
+    execution_mode: str,
+    actor_user_id: UUID,
+) -> OrganizationRecord | None:
+    """Change `organization_id`'s execution mode and commit. Only the caller
+    (`arie.api.main`'s route, via `_require_org_admin`) may call this for a
+    non-owner/admin actor — this function itself enforces no role, the same
+    division of responsibility `update_organization` uses.
+
+    Raises :class:`InvalidExecutionModeError` for a value outside
+    :data:`EXECUTION_MODES`. Returns `None` only if `organization_id`
+    doesn't exist — the same IDOR-safe shape `update_organization` returns.
+    """
+    if execution_mode not in EXECUTION_MODES:
+        raise InvalidExecutionModeError(
+            f"unknown execution_mode {execution_mode!r} — must be one of {list(EXECUTION_MODES)}"
+        )
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            _UPDATE_EXECUTION_MODE,
+            {"organization_id": organization_id, "execution_mode": execution_mode},
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    record_event(
+        conn,
+        organization_id=organization_id,
+        actor_user_id=actor_user_id,
+        event_type="organization.execution_mode_changed",
+        payload={"execution_mode": execution_mode},
+    )
     conn.commit()
     return _row_to_record(row)
