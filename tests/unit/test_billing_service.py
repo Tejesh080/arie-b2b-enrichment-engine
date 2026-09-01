@@ -56,3 +56,29 @@ def test_start_checkout_rejects_an_unpurchasable_plan_before_any_stripe_or_db_ca
             success_url="https://app.example/success",
             cancel_url="https://app.example/cancel",
         )
+
+
+def test_scheduled_to_cancel_reads_the_legacy_boolean() -> None:
+    assert billing_service._scheduled_to_cancel({"cancel_at_period_end": True}) is True
+    assert billing_service._scheduled_to_cancel({"cancel_at_period_end": False}) is False
+    assert billing_service._scheduled_to_cancel({}) is False
+
+
+def test_scheduled_to_cancel_reads_cancel_at_when_the_boolean_stays_false() -> None:
+    """The shape a Customer Portal cancellation actually produces on Stripe
+    API versions from `2026-08-26` on: `cancel_at_period_end` stays `False`
+    and `cancel_at` carries the end of service. Reading only the boolean
+    recorded such a subscription as renewing normally, so the console's
+    "cancels on <date>" notice never rendered for a cancellation the
+    customer had just requested."""
+    portal_cancellation = {
+        "cancel_at_period_end": False,
+        "cancel_at": 1_790_885_913,
+        "canceled_at": 1_788_294_091,
+        "status": "active",
+    }
+    assert billing_service._scheduled_to_cancel(portal_cancellation) is True
+
+
+def test_scheduled_to_cancel_ignores_a_null_cancel_at() -> None:
+    assert billing_service._scheduled_to_cancel({"cancel_at": None, "canceled_at": None}) is False

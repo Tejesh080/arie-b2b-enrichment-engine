@@ -10,6 +10,7 @@ ask for.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -197,6 +198,27 @@ def _first_item_price_id(subscription: dict[str, Any]) -> str | None:
     return price.get("id") if isinstance(price, dict) else None
 
 
+def _scheduled_to_cancel(subscription: Mapping[str, Any]) -> bool:
+    """Whether this subscription is set to end rather than renew.
+
+    Not simply `cancel_at_period_end`. On Stripe API versions from
+    `2026-08-26` on, cancelling through the Customer Portal leaves
+    `cancel_at_period_end` **false** and instead stamps `cancel_at` with the
+    moment service ends — observed directly against a portal cancellation,
+    not inferred from the changelog. Reading only the boolean therefore
+    records "renewing normally" for a subscription Stripe has already
+    scheduled to end, and the console's own "cancels on <date>" notice
+    (`BillingPanel`, gated on this flag) silently never renders — a customer
+    is told nothing about a cancellation they themselves requested.
+
+    Either signal means the same thing to every consumer of this column, so
+    both are folded into it here rather than at each call site.
+    """
+    if bool(subscription.get("cancel_at_period_end", False)):
+        return True
+    return subscription.get("cancel_at") is not None
+
+
 def _apply_subscription(
     conn: psycopg.Connection,
     *,
@@ -230,7 +252,7 @@ def _apply_subscription(
         status=subscription.get("status", "active"),
         current_period_start=period_start,
         current_period_end=period_end,
-        cancel_at_period_end=bool(subscription.get("cancel_at_period_end", False)),
+        cancel_at_period_end=_scheduled_to_cancel(subscription),
         canceled_at=canceled_at,
         stripe_created_at=stripe_created_at,
     )
@@ -393,7 +415,7 @@ def _process_webhook_event_impl(
                         event_type=audit_type,
                         payload={
                             "status": obj.get("status", ""),
-                            "cancel_at_period_end": bool(obj.get("cancel_at_period_end", False)),
+                            "cancel_at_period_end": _scheduled_to_cancel(obj),
                         },
                     )
             elif event_type == "customer.subscription.deleted":
