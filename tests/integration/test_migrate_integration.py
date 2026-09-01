@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 
 import psycopg
 import pytest
+import scripts.migrate as migrate_module
 from scripts.migrate import checksum_of, migrate, migration_files
 
 from arie.migrations import MigrationsDirectoryError, pending_migrations
@@ -275,4 +276,84 @@ def test_reapplying_a_changed_migration_raises(
                 "UPDATE schema_migrations SET checksum = %s WHERE filename = %s",
                 (checksum_of(real.read_text(encoding="utf-8")), "0001_init.sql"),
             )
+        db_conn.commit()
+
+
+def test_cli_production_dry_run_writes_nothing_against_a_real_database(
+    migrated_database_direct: str,
+    db_conn: psycopg.Connection,
+    integration_run_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Requirement 4 of the corrective fix, proved at the layer an operator
+    actually types rather than one function below it.
+
+    `test_dry_run_against_a_schema_with_no_schema_migrations_table_creates_
+    nothing` proves `migrate(dry_run=True)` writes nothing; this proves
+    `main(["--target", "production", "--dry-run"])` reaches that behavior —
+    i.e. the CLI resolves the production variable family, needs no
+    acknowledgement flag to *look*, and still creates not even the bootstrap
+    table. A fresh schema on the test server stands in for production, which
+    is the only honest way to assert "zero writes to production" in a test.
+    """
+    schema = f"it_cli_dryrun_{integration_run_id.replace('-', '')}"
+    with db_conn.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA {schema}")
+    db_conn.commit()
+
+    try:
+        conninfo = f"{migrated_database_direct}?options={quote(f'-c search_path={schema}')}"
+        monkeypatch.setenv("DATABASE_DIRECT_URL", conninfo)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+
+        exit_code = migrate_module.main(["--target", "production", "--dry-run"])
+
+        assert exit_code == 0
+        out = capsys.readouterr().out
+        assert "Mode:   dry run (no writes)" in out
+        assert "Would apply" in out
+
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = %s",
+                (schema,),
+            )
+            assert cur.fetchall() == [], "a production dry run must create no tables at all"
+    finally:
+        with db_conn.cursor() as cur:
+            cur.execute(f"DROP SCHEMA {schema} CASCADE")
+        db_conn.commit()
+
+
+def test_cli_production_apply_without_acknowledgement_never_connects(
+    migrated_database_direct: str,
+    db_conn: psycopg.Connection,
+    integration_run_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The acknowledgement gate is checked before anything opens a connection,
+    so an unacknowledged `--apply` against a genuinely migratable database
+    still leaves it untouched."""
+    schema = f"it_cli_noack_{integration_run_id.replace('-', '')}"
+    with db_conn.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA {schema}")
+    db_conn.commit()
+
+    try:
+        conninfo = f"{migrated_database_direct}?options={quote(f'-c search_path={schema}')}"
+        monkeypatch.setenv("DATABASE_DIRECT_URL", conninfo)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+
+        assert migrate_module.main(["--target", "production", "--apply"]) == 1
+
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = %s",
+                (schema,),
+            )
+            assert cur.fetchall() == []
+    finally:
+        with db_conn.cursor() as cur:
+            cur.execute(f"DROP SCHEMA {schema} CASCADE")
         db_conn.commit()

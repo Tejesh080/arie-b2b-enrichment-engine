@@ -42,6 +42,19 @@ def test_migrate_service_uses_the_canonical_runner(services: dict[str, Any]) -> 
     )
 
 
+def test_migrate_service_names_its_target_and_mode_explicitly(
+    services: dict[str, Any],
+) -> None:
+    """The runner has no default target and no default mode, so a command that
+    just says `python scripts/migrate.py` would exit non-zero and take the whole
+    stack down at `service_completed_successfully`. Asserting the flags here
+    catches that at lint speed instead of at `docker compose up` speed."""
+    command = services["migrate"]["command"]
+    assert "--target production" in command
+    assert "--apply" in command
+    assert "--confirm-production-write" in command
+
+
 def test_migrate_waits_for_a_healthy_database(services: dict[str, Any]) -> None:
     assert services["migrate"]["depends_on"]["db"]["condition"] == "service_healthy"
 

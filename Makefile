@@ -1,4 +1,4 @@
-.PHONY: help install dev-install lint fmt type test test-all test-db test-db-status dataset validate-dataset bench clean db-migrate serve worker sync-supabase-migrations check-supabase-migrations
+.PHONY: help install dev-install lint fmt type test test-all test-db test-db-status dataset validate-dataset bench clean db-migrate-test db-migrate-prod-check db-migrate-prod serve worker sync-supabase-migrations check-supabase-migrations
 
 help:
 	@echo "Adaptive Revenue Intelligence Engine"
@@ -16,7 +16,9 @@ help:
 	@echo "  make validate-dataset  Assert the dataset is non-trivial (CI gate)"
 	@echo "  make bench           Run the full benchmark  [NO API KEYS NEEDED]"
 	@echo ""
-	@echo "  make db-migrate      Apply SQL migrations (the only path that touches production)"
+	@echo "  make db-migrate-test       Apply SQL migrations to TEST_DATABASE_URL"
+	@echo "  make db-migrate-prod-check Dry-run production migrations (read-only)"
+	@echo "  make db-migrate-prod       Apply SQL migrations to production (writes!)"
 	@echo "  make sync-supabase-migrations   Regenerate supabase/migrations/ from migrations/"
 	@echo "  make check-supabase-migrations  CI gate: fail if the mirror has drifted"
 	@echo "  make serve           Run the ingestion API"
@@ -69,8 +71,18 @@ bench:
 
 # --- M1: the system ----------------------------------------------------------
 
-db-migrate:
-	python scripts/migrate.py
+# Three explicit targets, no default. `scripts/migrate.py` refuses a bare
+# invocation, so there is deliberately no `make db-migrate` that could write to
+# production by being the shortest thing to type — see that script's docstring
+# for the incident that removed it.
+db-migrate-test:
+	python scripts/migrate.py --target test --apply
+
+db-migrate-prod-check:
+	python scripts/migrate.py --target production --dry-run
+
+db-migrate-prod:
+	python scripts/migrate.py --target production --apply --confirm-production-write
 
 sync-supabase-migrations:
 	python scripts/sync_supabase_migrations.py

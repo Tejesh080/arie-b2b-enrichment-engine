@@ -53,10 +53,15 @@ is `migrate`'s `depends_on: db: condition: service_healthy` plus
 (the exact fix for the clean-start race Step 12 found: workers booting before
 the schema existed). A platform without Compose's dependency graph needs the
 same ordering expressed as a **pre-deploy / release step**: run
-`python scripts/migrate.py` (with `DATABASE_DIRECT_URL` set — the *direct*
-connection, not the pooled one; see the script's own docstring for why a
-transaction-mode pooler can't be trusted with DDL) to completion, and only
-then roll out the new API/worker revision. Most container platforms have a
+`python scripts/migrate.py --target production --apply --confirm-production-write`
+(with `DATABASE_DIRECT_URL` set — the *direct* connection, not the pooled one;
+see the script's own docstring for why a transaction-mode pooler can't be
+trusted with DDL, and why the runner refuses a production `--apply` that could
+only resolve the pooled URL) to completion, and only then roll out the new
+API/worker revision. Every flag is mandatory: the runner has no default target
+and no default mode, so `python scripts/migrate.py` on its own is an error
+rather than a production write. To see what a deploy *would* run first, without
+writing anything, use `python scripts/migrate.py --target production --dry-run`. Most container platforms have a
 named concept for this (a "release phase," "pre-deploy command," or
 "one-off task run before rollout"); use whichever one the target platform
 offers rather than running migrations from inside the API or worker
@@ -192,7 +197,11 @@ command differs, exactly as `docker-compose.yml` already models locally.
   described above — a `degraded` (503, schema not fully migrated) response
   correctly blocks traffic promotion rather than Railway treating any
   response as "started, good enough." **Pre-Deploy Command** =
-  `python scripts/migrate.py`: Railway runs this in an isolated container
+  `python scripts/migrate.py --target production --apply --confirm-production-write`
+  (this changed in Productization M6 — an older single-word
+  `python scripts/migrate.py` now exits non-zero and would block every
+  deploy until the Railway setting is updated): Railway runs this in an
+  isolated container
   and blocks cutover until it exits 0 — the platform's release-phase
   primitive the Migrations section above asks for. Needs
   `DATABASE_DIRECT_URL`; nothing else does. On this project, that variable's

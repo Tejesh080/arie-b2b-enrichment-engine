@@ -86,7 +86,11 @@ not silently ships stale preview schema.
 - Branching's automatic *production* deploy was deliberately left untouched
   (not enabled, not disabled — that toggle lives in the Supabase dashboard,
   outside this repo). Production changes continue exclusively through
-  `make db-migrate`.
+  `make db-migrate-prod`
+  (`python scripts/migrate.py --target production --apply
+  --confirm-production-write`) — three mandatory flags since Productization
+  M6, because the runner's older bare invocation had no way to name its
+  database and applied unreleased migrations to production once.
 
 ## What would change this
 

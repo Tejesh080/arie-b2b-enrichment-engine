@@ -36,7 +36,14 @@ services:
   # construction, so restarting the stack re-runs it as a no-op.
   migrate:
     build: .
-    command: python scripts/migrate.py
+    # `--target production` names the DATABASE_* variable family, not a hosted
+    # deployment — in this stack those point at the `db` service below, and the
+    # runner prints the resolved host/database before it writes. The flags are
+    # spelled out because the runner has no default target and no default mode:
+    # a bare `python scripts/migrate.py` is an error by design.
+    command: >-
+      python scripts/migrate.py --target production --apply
+      --confirm-production-write
     environment:
       DATABASE_URL: postgresql://arie:arie_local_dev@db:5432/arie
       # Locally the "direct" and pooled connections are the same Postgres;

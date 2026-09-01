@@ -75,9 +75,12 @@ jobs:
         # the path works rather than bypassing it.
         run: python scripts/test_db.py designate
       - name: Apply migrations (the canonical runner — ADR 0005)
-        run: python scripts/migrate.py
-        env:
-          DATABASE_DIRECT_URL: postgresql://arie:arie_ci@localhost:5432/arie
+        # `--target test` resolves TEST_DATABASE_DIRECT_URL, already set for
+        # this job. This step used to define DATABASE_DIRECT_URL purely to
+        # satisfy a runner that had no way to say "the test database" — the
+        # exact ambiguity that later applied unreleased migrations to
+        # production. Naming the target removes the need for that variable.
+        run: python scripts/migrate.py --target test --apply
       - name: Integration tests
         run: pytest -m integration --cov=src/arie --cov-report=term-missing
 
