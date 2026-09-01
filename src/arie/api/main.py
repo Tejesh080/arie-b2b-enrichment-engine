@@ -73,9 +73,14 @@ from arie.api.schemas import (
     ReviewDecisionRequest,
     ReviewDecisionResponse,
     ReviewResponse,
+    ScoringDimensionSummary,
     SetProviderCredentialRequest,
     SetProviderEnabledRequest,
     StartCheckoutRequest,
+    TargetingConfirmRequest,
+    TargetingDraftRequest,
+    TargetingDraftResponse,
+    TargetingVocabulariesResponse,
     UpdateExecutionModeRequest,
     UpdateMemberRoleRequest,
     UpdateOrganizationRequest,
@@ -137,6 +142,12 @@ from arie.icp_profiles import (
     list_profiles,
 )
 from arie.identity.resolver import IdentityResolver
+from arie.intelligence.targeting import (
+    TargetingGenerationError,
+    canonical_vocabularies,
+    confirm_targeting_draft,
+    generate_targeting_draft,
+)
 from arie.invitations import (
     DuplicateInvitationError,
     GeneratedInvitation,
@@ -159,6 +170,8 @@ from arie.limits import (
     enforce_lead_quota,
     get_usage_against_limits,
 )
+from arie.llm.budget import LLMBudgetReason
+from arie.llm.service import LLMService
 from arie.members import (
     CannotActOnSelfError,
     InvalidMemberRoleError,
@@ -348,6 +361,25 @@ def instrument(app: FastAPI) -> None:
 StateDep = Annotated[AppState, Depends(get_state)]
 
 
+def get_llm_service(state: StateDep) -> LLMService:
+    """The intelligence layer's model access, as a dependency.
+
+    A dependency rather than a `LLMService(state.pool)` built inline in each
+    handler, for the same reason `get_auth_context` is one: it is the seam a
+    test overrides. `tests/integration/test_intelligence_targeting_integration
+    .py` substitutes a service wired to `FakeLLMProvider`, so the targeting
+    endpoints are exercisable end to end on a machine with no model credential
+    — which is the whole point of having a fake provider at all.
+
+    Constructed per request. `LLMService` builds its provider lazily and closes
+    it again, so this costs nothing on a request that never reaches a model.
+    """
+    return LLMService(state.pool)
+
+
+LLMServiceDep = Annotated[LLMService, Depends(get_llm_service)]
+
+
 def _extract_bearer_token(request: Request) -> str:
     """The one place either authentication path (`get_auth_context`,
     `get_verified_identity`) reads the `Authorization` header — shared so a
@@ -456,6 +488,43 @@ def _require_scope(auth: AuthContext, scope: str) -> None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail=f"missing required scope: {scope}"
         )
+
+
+_TARGETING_FAILURE_STATUS: dict[LLMBudgetReason, int] = {
+    LLMBudgetReason.PROVIDER_UNAVAILABLE: status.HTTP_503_SERVICE_UNAVAILABLE,
+    LLMBudgetReason.LLM_DISABLED: status.HTTP_409_CONFLICT,
+    LLMBudgetReason.BATCH_CALL_LIMIT_REACHED: status.HTTP_429_TOO_MANY_REQUESTS,
+    LLMBudgetReason.BATCH_COST_LIMIT_REACHED: status.HTTP_429_TOO_MANY_REQUESTS,
+    LLMBudgetReason.MONTHLY_COST_LIMIT_REACHED: status.HTTP_429_TOO_MANY_REQUESTS,
+    LLMBudgetReason.ALLOWED: status.HTTP_502_BAD_GATEWAY,
+}
+"""How an AI-generation failure reaches the client. None of these is a 5xx by
+accident: a budget ceiling is a 429 (the same shape `arie.limits`'
+`LimitExceededError` gets), an organization that switched AI off is a 409
+(nothing is wrong and retrying will not help), an unconfigured or unreachable
+provider is a 503, and `ALLOWED` — the budget said yes and the model still
+produced nothing usable — is a 502, because the failure really is upstream."""
+
+_TARGETING_FAILURE_DETAIL: dict[LLMBudgetReason, str] = {
+    LLMBudgetReason.PROVIDER_UNAVAILABLE: (
+        "AI targeting generation is not configured for this deployment. You can "
+        "still set targeting up directly through the ICP configuration."
+    ),
+    LLMBudgetReason.LLM_DISABLED: (
+        "AI assistance is switched off for this organization. An owner or admin "
+        "can raise the AI limits in organization settings."
+    ),
+    LLMBudgetReason.ALLOWED: (
+        "AI targeting generation is temporarily unavailable. Please try again."
+    ),
+}
+"""Customer-facing replacements for the reasons whose internal detail would
+either say too little or too much. The budget-ceiling reasons are deliberately
+absent: `arie.llm.budget` already writes those messages with the organization's
+own figures in them, which is more useful than anything fixed here, and they
+contain nothing a member cannot already see on their settings page. No branch
+here can emit a prompt, a provider response, or a credential — the only strings
+available are these constants and `arie.llm.budget`'s own."""
 
 
 def _require_org_admin(auth: AuthContext) -> None:
@@ -1533,6 +1602,94 @@ def register_routes(app: FastAPI) -> None:
                 created_by_user_id=auth.user_id,
                 name=payload.name,
                 config=payload.config.model_dump(mode="json"),
+            )
+        return ICPProfileResponse.model_validate(record)
+
+    # --------------------------------------------- intelligence: targeting --
+    #
+    # M7 Slice 2. The customer-facing way to configure targeting: describe the
+    # business in normal English instead of assigning six point weights by
+    # hand. `POST /organization/icp` is untouched and remains the way to submit
+    # a configuration directly.
+    #
+    # Both write-shaped routes require an owner/admin JWT session
+    # (`_require_org_admin`), matching `POST /organization/icp` — confirming
+    # *is* that operation, and drafting spends the organization's AI budget, so
+    # neither is something a read-only member should be able to do. No API-key
+    # scope exists for either: a machine caller has no business describing a
+    # company's ideal customer in prose, and the M3 comment above says the same
+    # thing about ICP configuration generally.
+    #
+    # Drafting is a POST despite not writing anything. It is not idempotent in
+    # the way a GET promises — it spends money and returns a different
+    # interpretation each time — and its input is two paragraphs of free text
+    # that have no business in a query string.
+
+    @app.get("/intelligence/targeting/vocabularies", response_model=TargetingVocabulariesResponse)
+    def get_targeting_vocabularies(auth: AuthDep) -> TargetingVocabulariesResponse:
+        _require_jwt_session(auth)
+        vocabularies = canonical_vocabularies()
+        return TargetingVocabulariesResponse(
+            industries=list(vocabularies["industries"]),
+            seniorities=list(vocabularies["seniorities"]),
+            functions=list(vocabularies["functions"]),
+            objectives=list(vocabularies["objectives"]),
+            preference_levels=list(vocabularies["preference_levels"]),
+            scoring_dimensions=list(vocabularies["scoring_dimensions"]),
+        )
+
+    @app.post("/intelligence/targeting/draft", response_model=TargetingDraftResponse)
+    def draft_targeting_profile(
+        payload: TargetingDraftRequest, auth: AuthDep, llm: LLMServiceDep
+    ) -> TargetingDraftResponse:
+        _require_org_admin(auth)
+        try:
+            draft = generate_targeting_draft(
+                llm,
+                organization_id=auth.organization_id,
+                what_you_sell=payload.what_you_sell,
+                who_you_want=payload.who_you_want,
+                objective=payload.objective,
+                now=datetime.now(UTC),
+            )
+        except TargetingGenerationError as exc:
+            raise HTTPException(
+                status_code=_TARGETING_FAILURE_STATUS.get(
+                    exc.reason, status.HTTP_503_SERVICE_UNAVAILABLE
+                ),
+                detail=_TARGETING_FAILURE_DETAIL.get(exc.reason, exc.detail),
+            ) from exc
+        return TargetingDraftResponse(
+            objective=draft.objective,
+            profile=draft.profile,
+            scoring_config=draft.scoring_config,
+            allocation=[ScoringDimensionSummary.model_validate(row) for row in draft.allocation],
+            llm_provider=draft.provider,
+            llm_model=draft.model,
+            llm_cost_usd=draft.cost_usd,
+        )
+
+    @app.post(
+        "/intelligence/targeting/confirm",
+        response_model=ICPProfileResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def confirm_targeting_profile(
+        payload: TargetingConfirmRequest, state: StateDep, auth: AuthDep
+    ) -> ICPProfileResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s JWT check
+        with _transaction(state.pool) as conn:
+            record = confirm_targeting_draft(
+                conn,
+                organization_id=auth.organization_id,
+                created_by_user_id=auth.user_id,
+                name=payload.name,
+                profile=payload.profile,
+                objective=payload.objective,
+                now=datetime.now(UTC),
+                provider=payload.llm_provider,
+                model=payload.llm_model,
             )
         return ICPProfileResponse.model_validate(record)
 

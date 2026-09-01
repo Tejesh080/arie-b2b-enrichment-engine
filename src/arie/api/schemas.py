@@ -26,6 +26,7 @@ from arie.billing.service import PURCHASABLE_PLANS
 from arie.core.types import LeadStatus
 from arie.icp_profiles import InvalidICPConfigError, validate_config
 from arie.identity.normalize import normalize_domain, normalize_email
+from arie.intelligence.schemas import BusinessProfileDraft, TargetingObjective
 from arie.organizations import EXECUTION_MODES, InvalidOrganizationSettingsError, validate_timezone
 
 
@@ -996,3 +997,96 @@ class UsageSummaryResponse(BaseModel):
     provider_cost_usd: float
     model_cost_usd: float
     total_cost_usd: float
+
+
+# ------------------------------------------------------ intelligence: targeting --
+#
+# M7 Slice 2. `POST /intelligence/targeting/draft` interprets two free-text
+# answers into a reviewable profile and changes nothing; `POST /intelligence/
+# targeting/confirm` turns a reviewed draft into a new immutable ICP profile
+# version. Both require an owner/admin JWT session — the same rule as `POST
+# /organization/icp`, because confirming is that operation, and generating a
+# draft spends the organization's AI budget. `GET /intelligence/targeting/
+# vocabularies` is read-gated like every other configuration read.
+#
+# Note what is NOT in the confirm request: a scoring configuration. The client
+# receives one in the draft response so it can show the customer what confirming
+# will do, and the server recomputes it from the reviewed profile rather than
+# accepting it back. See `arie.intelligence.targeting`'s module docstring.
+
+
+class TargetingDraftRequest(BaseModel):
+    """`POST /intelligence/targeting/draft` — the two questions, plus an objective.
+
+    Both answers are untrusted business data and are fenced as such before they
+    reach a model (`arie.llm.structured`). The length caps here are the API's
+    own; `arie.intelligence.targeting.MAX_DESCRIPTION_CHARS` truncates again on
+    the way into the prompt, so neither layer relies on the other.
+    """
+
+    what_you_sell: Annotated[str, Field(min_length=1, max_length=4000)]
+    who_you_want: Annotated[str, Field(min_length=1, max_length=4000)]
+    objective: TargetingObjective = TargetingObjective.BEST_PROSPECTS
+
+
+class ScoringDimensionSummary(BaseModel):
+    """One row of the plain-language reading of a generated configuration."""
+
+    dimension: str
+    label: str
+    points: float
+    rank: int
+
+
+class TargetingDraftResponse(BaseModel):
+    """A generated interpretation and what confirming it would do.
+
+    `scoring_config` is the full technical document, for an Advanced Details
+    panel; `allocation` is the same information a customer can read. Both are
+    previews — nothing has changed on the server, and this response is not
+    persisted anywhere.
+    """
+
+    objective: TargetingObjective
+    profile: BusinessProfileDraft
+    scoring_config: dict[str, Any]
+    allocation: list[ScoringDimensionSummary]
+    llm_provider: str | None
+    llm_model: str | None
+    llm_cost_usd: str
+    """Modelled cost of the generation, as a string. Never a billed figure —
+    see `arie.ledger.pricing`."""
+
+
+class TargetingConfirmRequest(BaseModel):
+    """`POST /intelligence/targeting/confirm` — make a reviewed draft active.
+
+    Carries the profile the customer actually looked at, including any edits
+    they made. Everything numeric is re-derived server-side.
+    """
+
+    name: Annotated[str, Field(min_length=1, max_length=200)]
+    objective: TargetingObjective
+    profile: BusinessProfileDraft
+    llm_provider: Annotated[str | None, Field(max_length=64)] = None
+    llm_model: Annotated[str | None, Field(max_length=128)] = None
+    """Echoed back from the draft response purely so the stored provenance can
+    say which model's interpretation a human approved. Recorded, never trusted:
+    no branch reads either value, and a client that lies about them changes
+    nothing except its own audit trail."""
+
+
+class TargetingVocabulariesResponse(BaseModel):
+    """`GET /intelligence/targeting/vocabularies` — the value lists a review UI
+    must offer when a human edits a draft.
+
+    Served rather than duplicated in the console so a frontend build cannot
+    offer a value the schema rejects.
+    """
+
+    industries: list[str]
+    seniorities: list[str]
+    functions: list[str]
+    objectives: list[str]
+    preference_levels: list[str]
+    scoring_dimensions: list[str]
