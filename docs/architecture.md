@@ -132,6 +132,67 @@ class it caught.
 
 ---
 
+## The commercial layer
+
+Productization M6 added the part that makes this a product someone can buy:
+self-service signup, Stripe subscriptions, plan entitlements, and
+transactional email. It sits *beside* everything above rather than inside it —
+the policy loop, the scorer, and the confidence model have no idea a plan
+exists — and it is entirely optional to run (see
+[deployment.md](deployment.md#the-commercial-layer-productization-m6) for
+what each unset variable does).
+
+Four invariants carry the weight.
+
+**9. Stripe is the authority; a redirect is not a payment.**
+The success URL only means "the browser came back". A user can reach it by
+editing the address bar, and a real payment can complete without it ever
+loading. So `/checkout-return` reports "confirming" and grants nothing, and
+*every* entitlement change in the system happens in one place —
+`arie.billing.service.process_webhook_event`, behind a verified signature.
+Three guards make that safe to expose publicly: signature verification over
+the raw body (unsigned input is never parsed as truth), an insert into
+`billing_webhook_events` keyed on Stripe's event id (a redelivery is
+acknowledged, not re-applied), and a `stripe_created_at` comparison that
+refuses to let an event older than the state it would overwrite roll it
+backward. Stripe retries on 5xx, so a genuinely unfixable event — an
+unmapped price id, a configuration problem no retry cures — is deliberately
+answered 200 and recorded as failed rather than retried forever.
+
+**10. Entitlement resolution happens in exactly one function.**
+`arie.billing.plans.resolve_organization_entitlements` is the only thing that
+turns `(plan, subscription status)` into limits. The alternative — an
+`if plan == ...` at each call site — is how a system ends up enforcing four
+slightly different definitions of "subscribed". Plan says which tier an
+organization is *entitled to*; `organization_billing.status` (Stripe's own
+vocabulary) says whether that entitlement is *currently active*. Everything
+that is neither `internal` nor an active/trialing paid plan falls to
+`UNSUBSCRIBED`, a small safe floor — never free indefinite service, and never
+a lockout: an owner can always still read and manage their own billing.
+
+**11. A plan entitlement is not an execution authorization.**
+`live_provider_feature_allowed` means "this organization may *configure* a
+BYOK credential or move its execution mode off `simulated`". It is not
+`PROVIDER_MODE`, not `organization.execution_mode`, and not M5's live-autonomy
+guard. Stripe can make a live feature eligible; it can never itself cause a
+real provider call or a real dollar to be spent. M6's gate is strictly
+additive to M5's safety guards, never a substitute — which is why paying more
+cannot buy autonomy the calibration data doesn't support.
+
+**12. The Legacy Organization is not a customer.**
+`LEGACY_ORGANIZATION_ID` holds every pre-multi-tenancy row, the demo, and the
+n8n workflows. `migrations/0030` grandfathers it onto an `internal` plan that
+short-circuits subscription status entirely, with ceilings identical to the
+defaults M4 hard-coded — so the deployed instance's behavior is unchanged by a
+milestone about selling to *other* people. That exemption is one `CASE WHEN`
+in one migration, which is exactly the kind of thing a refactor drops
+silently; `tests/integration/test_legacy_organization_m6_regression.py` pins
+it as behavior (no gate fires, a limits re-sync cannot shrink it, the billing
+surfaces render for a tenant with no Stripe customer) rather than as a row
+value.
+
+---
+
 ## Things this project found the hard way
 
 Each is a bug or false result caught by measurement, and each is pinned by a
@@ -179,11 +240,20 @@ src/arie/
   normalization/ canonical taxonomy + the provider->scorer adapter boundary
   icp.py        the named reference ICP for Live V1 (descriptive, not a scorer)
   live/         live-mode autonomy guard and spend caps
-  jobs/         Postgres job queue (SKIP LOCKED), worker loop, handlers
+  jobs/         Postgres job queue (SKIP LOCKED), worker loop, handlers, heartbeat
   statemachine/ transitions, status groups, optimistic concurrency
   approval/     human review workflow
   evalgen/      frozen synthetic corpus generator (benchmark only)
   llm/          DeepSeek buying-signal extraction (built, standalone)
+  observability/ OpenTelemetry wiring; trace context across the process boundary
+
+  auth.py       Supabase JWT verification + organization membership
+  tenancy.py    the Legacy Organization constant and tenant helpers
+  billing/      Stripe gateway, webhook processing, plans/entitlements
+  provisioning.py  self-service organization creation
+  email/        AhaSend/fake senders behind one notifier
+  turnstile.py  CAPTCHA seam for self-service signup
+  limits.py     lead/CSV/spend quota enforcement (M4; M6 syncs its ceilings)
 
 bench/          benchmark harness, cost model, multi-seed runner
 migrations/     canonical SQL migrations (source of truth)

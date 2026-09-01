@@ -106,12 +106,96 @@ The two settings both processes actually require:
 running API or worker — don't hand it to either process's runtime
 environment beyond what the release step uses.
 
+Two more the API needs once real users sign in, both from the same Supabase
+project the database lives in: `SUPABASE_URL` (session tokens are verified
+against that project's published JWKS, not a shared secret) and
+`SUPABASE_SERVICE_ROLE_KEY` (the Auth Admin API is the only place a member's
+account email can be read — no table in this database stores it). The service
+role key is the most powerful credential in the system; it is read by
+`arie.supabase_admin` alone, never returned by an endpoint, and must never
+reach a frontend build.
+
+Everything the commercial layer reads — Stripe, AhaSend, Turnstile,
+`FRONTEND_BASE_URL` — is optional and covered in its own section below.
+
 **Nothing is ever logged.** `arie.llm.deepseek` puts the API key in an
 `Authorization` header and nowhere else; every `print()` in `arie.jobs.worker`
-and `scripts/migrate.py` emits job/migration bookkeeping, never a connection
-string or key. If a future change adds logging near either, keep it that way
-— grep for `DATABASE_URL`/`_API_KEY` before adding a new log line near
-connection setup.
+emits job bookkeeping, never a connection string or key. `scripts/migrate.py`
+does print a connection *identity* before it writes — host, port, and database
+name, extracted by allowlist precisely so no connection-string form can route
+a password into output. If a future change adds logging near either, keep it
+that way — grep for `DATABASE_URL`/`_API_KEY` before adding a new log line
+near connection setup.
+
+The same rule extends to traces, which leave the process entirely when an OTLP
+endpoint is configured. `tests/integration/test_commercial_observability_
+integration.py` asserts that Stripe's secret key, its webhook signing secret,
+the offered signature header, and an invitation's raw bearer token appear in
+no span name, attribute, event, or status description — including on the
+failure paths, where echoing the offending value back is the natural thing to
+write.
+
+---
+
+## The commercial layer (Productization M6)
+
+Self-service signup, Stripe subscriptions, plan entitlements, and
+transactional email. **All of it is optional to run the system**, and the
+unconfigured state is a deliberate, safe one rather than a broken one:
+
+| Unset | What happens |
+|---|---|
+| `STRIPE_SECRET_KEY` | No Stripe call is ever attempted. `/billing` still reports plan/entitlements; Checkout and Portal refuse with a clear 4xx. |
+| `STRIPE_WEBHOOK_SECRET` | `POST /billing/webhook` rejects everything. Unsigned input is never trusted, so "no secret" means "no entitlement can be granted", not "anyone can grant one". |
+| `AHASEND_API_KEY` / `AHASEND_ACCOUNT_ID` | `arie.email.fake.FakeEmailSender` — records the send, opens no socket. No email can escape a dev machine or CI. Both must be set for real sending; a half-configured environment keeps the fake. |
+| `TURNSTILE_SECRET_KEY` | Provisioning's CAPTCHA check is bypassed. A documented dev/CI seam — never a bypass in an environment where the secret *is* set. |
+| `FRONTEND_BASE_URL` | Invitation and review emails carry no working link. Set it before enabling real email. |
+
+The Legacy Organization is grandfathered onto the `internal` plan by
+`migrations/0030` and needs none of the above to keep working — see
+`tests/integration/test_legacy_organization_m6_regression.py`, which asserts
+that as behavior rather than as a row value.
+
+### External setup this repo cannot do for you
+
+Three third-party accounts, each configured in its own dashboard:
+
+1. **Stripe.** Create three recurring Prices (starter/growth/pro) and copy
+   their `price_...` ids — Price ids, not Product ids. Then add a webhook
+   endpoint pointing at `https://<api-host>/billing/webhook`, subscribed to
+   `checkout.session.completed`, `customer.subscription.created`,
+   `customer.subscription.updated`, `customer.subscription.deleted`,
+   `invoice.paid`, and `invoice.payment_failed` (the full set is
+   `arie.billing.service.HANDLED_EVENT_TYPES`; anything else is acknowledged
+   and recorded as ignored rather than retried forever). Copy that endpoint's signing secret into
+   `STRIPE_WEBHOOK_SECRET`. **Start in test mode.** Test and live mode are
+   entirely separate object graphs: a live price id will not resolve against
+   a test key, and an event signed with one mode's secret will not verify
+   against the other's — which is a feature, since it makes a half-migrated
+   configuration fail loudly rather than silently charge someone.
+
+2. **AhaSend.** Verify the sending domain and create an API key. The address
+   in `EMAIL_FROM_ADDRESS` must be one the account is verified for, or every
+   send is rejected at the provider rather than by this code.
+
+3. **Cloudflare Turnstile.** Create a widget; its site key is public and also
+   belongs in the frontend's build config, its secret key never leaves this
+   process.
+
+Nothing about signup, billing, or email is enabled by deploying the code. Each
+is enabled by setting its variables, and each can be enabled independently.
+
+### The one architectural rule to keep
+
+**A redirect is not a payment; the webhook is the only authority.** Stripe's
+success URL means "the browser came back", nothing more — a user can reach it
+by editing the address bar, and a real payment can complete without it ever
+being loaded. `/checkout-return` therefore reports "we're confirming this" and
+never grants anything. Every entitlement change in this system happens in
+`arie.billing.service.process_webhook_event`, behind a verified signature,
+recorded in `billing_webhook_events` for idempotency, and refusing to apply an
+event older than the state it would overwrite. If you add a new commercial
+capability, add it there.
 
 ---
 
@@ -138,11 +222,31 @@ own probe definition should point it at the same `/healthz`.
 
 The worker has no HTTP surface and is explicitly excluded from the image's
 `HEALTHCHECK` (`docker-compose.yml`'s `worker` service disables it — nothing
-listens on :8000 there). Its liveness signal is the process itself: a crashed
-worker exits non-zero and should be restarted by the platform's normal
+listens on :8000 there). Its *restart* signal is still the process itself: a
+crashed worker exits non-zero and should be restarted by the platform's normal
 process-supervision (`restart: unless-stopped` locally; the equivalent
 "restart on failure" policy wherever this runs) — not a synthetic health
 endpoint bolted on to satisfy a check that doesn't fit its shape.
+
+**`GET /healthz/worker` answers a different question** (Productization M6):
+is anything actually *consuming the queue*? An API with a reachable database,
+a current schema, and a dead worker fleet returns `ok` from `/healthz` and
+processes nothing, which is the failure this endpoint exists to make visible.
+Every `arie.jobs.worker.main` process upserts a `worker_heartbeats` row about
+every `WORKER_HEARTBEAT_INTERVAL_SECONDS`; the endpoint reports the fleet
+healthy when at least one row is fresher than
+`WORKER_HEARTBEAT_STALE_AFTER_SECONDS`.
+
+```json
+{"healthy": true, "active_workers": 2, "most_recent_heartbeat_at": "..."}
+```
+
+It is unauthenticated (an infra probe has no caller identity) and carries no
+tenant data — a count and a timestamp. It always returns **200**, reporting a
+down fleet in the body: deliberately *not* folded into `/healthz`'s status
+code, because `/healthz` is what gates traffic promotion and container
+restarts, and neither of those repairs a worker. Point an alert at
+`healthy: false`; do not point a load balancer at it.
 
 ---
 

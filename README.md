@@ -117,6 +117,17 @@ adding workers needs no coordination between them. No Redis, no Celery, no
 Temporal — Postgres already gives transactional consistency with the lead state
 those jobs mutate.
 
+The same database carries a multi-tenant layer on top of that: Supabase-issued
+sessions and scoped API keys for auth, row-level security per organization,
+BYOK provider credentials in Supabase Vault, and a self-serve commercial layer
+— signup, Stripe subscriptions, plan entitlements, transactional email.
+Entitlements only ever decide what an organization may *configure*; they can
+never grant autonomy the calibration data doesn't support, and every
+entitlement change goes through one signature-verified Stripe webhook rather
+than a browser redirect. All of it is optional to run — with no Stripe, email,
+or CAPTCHA credentials configured, the system still boots and behaves
+correctly, which is how the demo above runs.
+
 Full topology, environment variables and rollback path:
 [deployment.md](docs/deployment.md). Design decisions and the ones deliberately
 rejected: [architecture.md](docs/architecture.md) and [docs/adr/](docs/adr/).
@@ -195,6 +206,7 @@ Details of both: [provider-integration.md](docs/provider-integration.md).
 Python 3.12 · FastAPI · Postgres (Supabase) · pytest · Docker
 Next.js 16 · React 19 · TypeScript · Tailwind CSS v4 · Motion
 Railway (API + worker) · Vercel (frontend) · n8n Cloud (edge workflows)
+Supabase Auth + Vault · Stripe · OpenTelemetry
 
 ---
 
@@ -249,7 +261,10 @@ frozen corpus, and prints their receipts.
 - The cheapest-first provider order is a reasoned prior, not a measured result.
   The bake-off harness exists to replace it with data; until a controlled live
   run happens, no order claims to be optimal.
-- No auth, no tenancy. This is a single-tenant proof, not a product.
+- The commercial layer is built and tested end to end against a mocked Stripe
+  boundary — real local HMAC signatures, no Stripe account required — but it
+  has not yet processed a real Stripe test-mode payment, and no transactional
+  email has been sent to a real inbox. Both are dashboard-side setup, not code.
 - The hosted concurrency check is small — five simultaneous submissions
   completed without duplicate processing. That is not load testing.
 - `arie.llm` (DeepSeek buying-signal extraction) is built and tested but not
