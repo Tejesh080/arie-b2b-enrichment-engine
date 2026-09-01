@@ -3,8 +3,8 @@
 Two ceilings, checked **before** any real provider call:
 
 * **per-lead** — one pathological lead cannot consume the day's budget.
-* **global daily** — a stuck queue, a retry storm, or a bad deploy cannot
-  consume the account.
+* **daily, per organization** — a stuck queue, a retry storm, or a bad
+  deploy cannot consume more than one organization's own daily allowance.
 
 Both are enforced *predictively*: the guard asks "would this call take me over
 the cap?" and refuses if so. Checking afterwards would mean the cap is only
@@ -23,15 +23,28 @@ The live provider names filter is not cosmetic. Simulated-mode runs write
 ``provider_calls`` rows with the *catalogue's* fictional prices — a benchmark
 pass would otherwise blow through a real daily budget without spending a cent.
 
+**Organization-scoped, not process-global (Productization M5 corrective
+fix).** Before this fix, the daily query summed every organization's spend
+together — one tenant's live traffic (or a benchmark/smoke-test run under a
+throwaway organization id) could exhaust the shared counter and silently
+suppress every *other* tenant's independently BYOK-credentialed provider
+account for the rest of the day, even though they share nothing but the
+same worker process. `daily_spent_usd`/`allowance` now require
+`organization_id` and the query filters on it — the configured
+`daily_usd`/`per_lead_usd` figures themselves are unchanged; only the
+*scope* they are measured against moved from "the whole process" to "this
+one organization."
+
 **Known limit, stated rather than papered over: this is a soft cap under
-concurrency.** Two workers can both read "spent $1.99 of $2.00", both decide
-one $0.002 call fits, and both make it. The overshoot is bounded by
-(concurrent workers x per-call cost) — cents, at any plausible worker count —
-and the alternative, a serializing lock or an advisory-locked reservation
-table, buys exactness at the price of a new failure mode (a crashed worker
-holding a reservation) for a guarantee nobody needs at this precision. A cap
-that is occasionally $0.004 loose is doing its job; a cap that deadlocks the
-queue is not.
+concurrency.** Two workers processing the *same organization's* jobs can
+both read "spent $1.99 of $2.00", both decide one $0.002 call fits, and both
+make it. The overshoot is bounded by (that organization's concurrent worker
+count x per-call cost) — cents, at any plausible worker count — and the
+alternative, a serializing lock or an advisory-locked reservation table,
+buys exactness at the price of a new failure mode (a crashed worker holding
+a reservation) for a guarantee nobody needs at this precision. A cap that is
+occasionally $0.004 loose is doing its job; a cap that deadlocks the queue
+is not.
 
 **Failure is never silent.** A guard that cannot read the ledger raises rather
 than returning "permitted" — see :meth:`LiveSpendGuard.allowance`. Failing open
@@ -82,7 +95,8 @@ the strings."""
 _SELECT_DAILY_LIVE_SPEND = """
     SELECT COALESCE(SUM(cost_usd), 0) AS spent
     FROM provider_calls
-    WHERE provider = ANY(%(providers)s)
+    WHERE organization_id = %(organization_id)s
+      AND provider = ANY(%(providers)s)
       AND NOT cache_hit
       AND completed_at >= date_trunc('day', (now() AT TIME ZONE 'utc'))
 """
@@ -148,18 +162,32 @@ class LiveSpendGuard:
     def config(self) -> LiveBudgetConfig:
         return self._config
 
-    def daily_spent_usd(self) -> Decimal:
-        return self._scalar(_SELECT_DAILY_LIVE_SPEND, {"providers": list(LIVE_PROVIDER_NAMES)})
+    def daily_spent_usd(self, organization_id: UUID) -> Decimal:
+        return self._scalar(
+            _SELECT_DAILY_LIVE_SPEND,
+            {"organization_id": organization_id, "providers": list(LIVE_PROVIDER_NAMES)},
+        )
 
     def lead_spent_usd(self, lead_id: UUID) -> Decimal:
+        # Not organization-scoped, and correctly so: a `lead_id` already
+        # belongs to exactly one organization (it's a foreign key on one
+        # row), so filtering by it alone cannot leak another organization's
+        # spend the way the unscoped daily query could — see the module
+        # docstring.
         return self._scalar(_SELECT_LEAD_SPEND, {"lead_id": lead_id})
 
-    def allowance(self, *, lead_id: UUID, estimated_cost_usd: float | Decimal) -> SpendAllowance:
+    def allowance(
+        self, *, organization_id: UUID, lead_id: UUID, estimated_cost_usd: float | Decimal
+    ) -> SpendAllowance:
         """Decide whether a call costing ``estimated_cost_usd`` may proceed.
 
         Per-lead is checked before daily so the refusal names the *tighter*
         constraint — a lead that has exhausted its own budget should say so,
         not blame the account's.
+
+        ``organization_id`` scopes the daily check to this organization
+        alone (Productization M5) — required, not defaulted, so a caller
+        cannot accidentally reintroduce the cross-tenant leakage this fixed.
 
         Never swallows a database error: if the ledger cannot be read, the
         exception propagates and the job fails into the ordinary retry path.
@@ -167,9 +195,13 @@ class LiveSpendGuard:
         """
         estimate = usd(estimated_cost_usd)
 
-        with traced(_TRACER, "live.budget.allowance", attributes={"arie.lead_id": lead_id}) as span:
+        with traced(
+            _TRACER,
+            "live.budget.allowance",
+            attributes={"arie.lead_id": lead_id, "arie.organization_id": str(organization_id)},
+        ) as span:
             lead_spent = self.lead_spent_usd(lead_id)
-            daily_spent = self.daily_spent_usd()
+            daily_spent = self.daily_spent_usd(organization_id)
             lead_cap = usd(self._config.per_lead_usd)
             daily_cap = usd(self._config.daily_usd)
 

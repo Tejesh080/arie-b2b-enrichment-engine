@@ -140,7 +140,9 @@ def _guard(*, lead: float, daily: float, per_lead: float, daily_cap: float) -> L
 
 def test_a_call_within_both_caps_is_permitted() -> None:
     guard = _guard(lead=0.0, daily=0.0, per_lead=0.05, daily_cap=2.0)
-    allowance = guard.allowance(lead_id=uuid4(), estimated_cost_usd=0.00165)
+    allowance = guard.allowance(
+        organization_id=uuid4(), lead_id=uuid4(), estimated_cost_usd=0.00165
+    )
     assert allowance.permitted
     assert allowance.reason is None
 
@@ -150,27 +152,33 @@ def test_the_check_is_predictive_not_retrospective() -> None:
     over". For a metered API the second is discovered by exceeding it."""
     guard = _guard(lead=0.049, daily=0.0, per_lead=0.05, daily_cap=2.0)
     # 0.049 is under the cap; 0.049 + 0.002 is not.
-    assert not guard.allowance(lead_id=uuid4(), estimated_cost_usd=0.002).permitted
-    assert guard.allowance(lead_id=uuid4(), estimated_cost_usd=0.001).permitted
+    assert not guard.allowance(
+        organization_id=uuid4(), lead_id=uuid4(), estimated_cost_usd=0.002
+    ).permitted
+    assert guard.allowance(
+        organization_id=uuid4(), lead_id=uuid4(), estimated_cost_usd=0.001
+    ).permitted
 
 
 def test_a_call_landing_exactly_on_the_cap_is_permitted() -> None:
     """Boundary stated explicitly: the cap is a ceiling to reach, not to stay
     under. Spending exactly the budget is spending the budget."""
     guard = _guard(lead=0.048, daily=0.0, per_lead=0.05, daily_cap=2.0)
-    assert guard.allowance(lead_id=uuid4(), estimated_cost_usd=0.002).permitted
+    assert guard.allowance(
+        organization_id=uuid4(), lead_id=uuid4(), estimated_cost_usd=0.002
+    ).permitted
 
 
 def test_per_lead_exhaustion_is_reported_as_such() -> None:
     guard = _guard(lead=0.05, daily=0.0, per_lead=0.05, daily_cap=2.0)
-    allowance = guard.allowance(lead_id=uuid4(), estimated_cost_usd=0.002)
+    allowance = guard.allowance(organization_id=uuid4(), lead_id=uuid4(), estimated_cost_usd=0.002)
     assert not allowance.permitted
     assert allowance.reason == PER_LEAD_BUDGET_EXHAUSTED
 
 
 def test_daily_exhaustion_is_reported_as_such() -> None:
     guard = _guard(lead=0.0, daily=2.0, per_lead=0.05, daily_cap=2.0)
-    allowance = guard.allowance(lead_id=uuid4(), estimated_cost_usd=0.002)
+    allowance = guard.allowance(organization_id=uuid4(), lead_id=uuid4(), estimated_cost_usd=0.002)
     assert not allowance.permitted
     assert allowance.reason == DAILY_BUDGET_EXHAUSTED
 
@@ -180,19 +188,21 @@ def test_the_tighter_constraint_is_the_one_named() -> None:
     than the account's — the operator's next question is "why did this lead
     cost so much", and the reason code should point at it."""
     guard = _guard(lead=0.05, daily=2.0, per_lead=0.05, daily_cap=2.0)
-    assert guard.allowance(lead_id=uuid4(), estimated_cost_usd=0.002).reason == (
-        PER_LEAD_BUDGET_EXHAUSTED
-    )
+    assert guard.allowance(
+        organization_id=uuid4(), lead_id=uuid4(), estimated_cost_usd=0.002
+    ).reason == (PER_LEAD_BUDGET_EXHAUSTED)
 
 
 def test_a_zero_budget_blocks_every_call() -> None:
     guard = _guard(lead=0.0, daily=0.0, per_lead=0.0, daily_cap=0.0)
-    assert not guard.allowance(lead_id=uuid4(), estimated_cost_usd=0.00001).permitted
+    assert not guard.allowance(
+        organization_id=uuid4(), lead_id=uuid4(), estimated_cost_usd=0.00001
+    ).permitted
 
 
 def test_the_allowance_carries_the_full_arithmetic_for_the_audit_trail() -> None:
     guard = _guard(lead=0.01, daily=0.5, per_lead=0.05, daily_cap=2.0)
-    allowance = guard.allowance(lead_id=uuid4(), estimated_cost_usd=0.002)
+    allowance = guard.allowance(organization_id=uuid4(), lead_id=uuid4(), estimated_cost_usd=0.002)
 
     assert allowance.lead_spent_usd == Decimal("0.01")
     assert allowance.lead_cap_usd == Decimal("0.05")
@@ -210,7 +220,7 @@ def test_money_never_becomes_a_float_in_the_comparison() -> None:
     for reported cost. A float comparison here would let 0.1 + 0.2 > 0.3 refuse
     a call that fits."""
     guard = _guard(lead=0.1, daily=0.0, per_lead=0.3, daily_cap=2.0)
-    allowance = guard.allowance(lead_id=uuid4(), estimated_cost_usd=0.2)
+    allowance = guard.allowance(organization_id=uuid4(), lead_id=uuid4(), estimated_cost_usd=0.2)
     assert isinstance(allowance.lead_spent_usd, Decimal)
     assert allowance.permitted
 
@@ -227,7 +237,7 @@ def test_a_ledger_read_failure_propagates_rather_than_failing_open() -> None:
 
     guard = LiveSpendGuard(_BrokenPool(), LiveBudgetConfig())  # type: ignore[arg-type]
     with pytest.raises(RuntimeError, match="connection refused"):
-        guard.allowance(lead_id=uuid4(), estimated_cost_usd=0.002)
+        guard.allowance(organization_id=uuid4(), lead_id=uuid4(), estimated_cost_usd=0.002)
 
 
 def test_the_budget_stop_reasons_are_exactly_the_two_refusals() -> None:

@@ -17,6 +17,16 @@ cooldown window?" with one indexed query against the same table
 ``arie.live.budget`` already reads. Same table, same trust model, same
 cross-worker semantics — and nothing new to keep consistent.
 
+**Organization-scoped (Productization M5 corrective fix).** Before this fix
+the query was keyed only by provider name — one organization's own vendor
+account running dry cooled that provider down for *every* organization
+sharing the worker, even ones with their own separate, unexhausted BYOK
+credential for the same provider name. ``cooling_down_until`` now requires
+``organization_id`` and the query filters on it, so each organization's
+cooldown state is independent of every other's, exactly matching the
+tenant-isolation guarantee ``arie.live.outcome_cache.ProviderOutcomeGuard``
+already had.
+
 **What counts as a quota error.** ``quota_exhausted`` (Apollo 402, Hunter 429
 — Hunter's documented meaning for 429 *is* plan-quota exceeded) and
 ``insufficient_credits`` (Abstract 422). Deliberately not ``rate_limited``: a
@@ -36,6 +46,7 @@ than one that fails visibly.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from uuid import UUID
 
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -60,7 +71,8 @@ deliberately was not)."""
 _SELECT_LAST_QUOTA_ERROR = """
     SELECT max(completed_at) AS last_quota_error
     FROM provider_calls
-    WHERE provider = %(provider)s
+    WHERE organization_id = %(organization_id)s
+      AND provider = %(provider)s
       AND error_kind = ANY(%(kinds)s)
       AND completed_at > now() - make_interval(secs => %(window_seconds)s)
 """
@@ -82,15 +94,17 @@ class ProviderCooldownGuard:
     def cooldown_seconds(self) -> float:
         return self._config.quota_cooldown_seconds
 
-    def cooling_down_until(self, provider_name: str) -> datetime | None:
-        """When this provider becomes callable again, or ``None`` if it is now.
+    def cooling_down_until(self, provider_name: str, *, organization_id: UUID) -> datetime | None:
+        """When this provider becomes callable again for `organization_id`,
+        or ``None`` if it is now.
 
-        ``None`` whenever the cooldown is disabled (``0`` seconds) or no quota
-        error landed inside the window. Otherwise the last quota error's
-        timestamp plus the window — purely informational (the caller only
-        branches on truthiness), but putting a *time* on the skip is what lets
-        the audit trail say "Apollo returns at 14:32" instead of "Apollo is
-        off".
+        ``organization_id`` is required (Productization M5) — see the module
+        docstring's tenant-isolation note. ``None`` whenever the cooldown is
+        disabled (``0`` seconds) or no quota error landed inside the window
+        *for this organization*. Otherwise the last quota error's timestamp
+        plus the window — purely informational (the caller only branches on
+        truthiness), but putting a *time* on the skip is what lets the audit
+        trail say "Apollo returns at 14:32" instead of "Apollo is off".
         """
         window = self._config.quota_cooldown_seconds
         if window <= 0:
@@ -99,6 +113,7 @@ class ProviderCooldownGuard:
             cur.execute(
                 _SELECT_LAST_QUOTA_ERROR,
                 {
+                    "organization_id": organization_id,
                     "provider": provider_name,
                     "kinds": sorted(QUOTA_ERROR_KINDS),
                     "window_seconds": window,

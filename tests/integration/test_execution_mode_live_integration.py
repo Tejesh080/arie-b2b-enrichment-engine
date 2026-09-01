@@ -207,7 +207,7 @@ def _receipt_snapshot(db_conn: psycopg.Connection, lead_id: str) -> dict[str, ob
 # --------------------------------------------------------------------- simulated --
 
 
-def test_simulated_organization_makes_zero_real_calls_even_in_a_live_worker(
+def test_simulated_organization_runs_the_ordinary_simulated_path_in_a_live_worker(
     app_state_with_vault: AppState,
     live_pool: ConnectionPool,
     live_handlers: dict[str, JobHandler],
@@ -215,10 +215,16 @@ def test_simulated_organization_makes_zero_real_calls_even_in_a_live_worker(
     cleanup_ingest: IngestCleanup,
     mocked_abstract_adapter: None,
 ) -> None:
-    """Success criterion #1's live-path counterpart: an organization that
-    hasn't opted into live processing gets zero real provider calls even
-    while the worker process itself runs PROVIDER_MODE=live — the mocked
-    adapter above is never even constructed, let alone called."""
+    """Productization M5 corrective fix (Issue 1): an organization that
+    hasn't opted into live processing must get the *exact* ordinary
+    simulated acquisition/decision path — synthesized catalogue evidence,
+    `CalibratedBoundsPolicy.run`, autonomy allowed — not "zero evidence,
+    forced through the live autonomy guard" (the pre-fix behaviour this
+    test used to pin). The mocked live Abstract adapter is never even
+    constructed, let alone called, proving no live code path ran at all for
+    this organization even though the worker process itself is
+    PROVIDER_MODE=live.
+    """
     client, _org_id = _org_client(app_state_with_vault, db_conn, execution_mode="simulated")
     body = _ingest(client, cleanup_ingest)
     _take_ownership(db_conn, str(body["job_id"]))
@@ -226,17 +232,81 @@ def test_simulated_organization_makes_zero_real_calls_even_in_a_live_worker(
     _process(live_pool, live_handlers, body)
 
     rows = _provider_call_rows(db_conn, str(body["lead_id"]))
-    assert rows == []  # no ledger row at all - not even a suppressed/cache-hit one
+    real_provider_names = {
+        ABSTRACT_PROVIDER_NAME,
+        "hunter_combined_enrichment",
+        "apollo_person_enrichment",
+    }
+    assert {row[0] for row in rows}.isdisjoint(real_provider_names)
+    assert rows  # the simulated catalogue's synthesized providers DID run
 
     snapshot = _receipt_snapshot(db_conn, str(body["lead_id"]))
     assert snapshot["execution_mode"] == "simulated"
-    assert (
-        snapshot["provider_unavailability"][ABSTRACT_PROVIDER_NAME]
-        == "provider_mode_disallows_live"
-    )
+    # The live-only field: absent entirely on a genuinely simulated receipt,
+    # exactly as it always was on a pre-M5 (or a plain PROVIDER_MODE=
+    # simulated worker's) receipt.
+    assert "provider_unavailability" not in snapshot
 
     status = _lead_status(db_conn, str(body["lead_id"]))
-    assert status in (LeadStatus.AWAITING_HUMAN, LeadStatus.SHADOW_EVALUATED)
+    assert status is not LeadStatus.NEW  # reached a real terminal, not stuck
+
+
+def test_two_organizations_on_one_handler_set_behave_independently(
+    app_state_with_vault: AppState,
+    live_pool: ConnectionPool,
+    live_handlers: dict[str, JobHandler],
+    db_conn: psycopg.Connection,
+    cleanup_ingest: IngestCleanup,
+    mocked_abstract_adapter: None,
+) -> None:
+    """The exact scenario multi-tenant rollout needs: one registered
+    `compute_score` handler, shared by every organization on this worker,
+    processing a `simulated` organization's lead and a `live_shadow`
+    organization's lead back to back — zero real HTTP calls for the first,
+    one real (mocked-transport) acquisition for the second, each getting
+    its own organization's configured behaviour with no cross-talk.
+    """
+    sim_client, _sim_org_id = _org_client(app_state_with_vault, db_conn, execution_mode="simulated")
+    shadow_client, shadow_org_id = _org_client(
+        app_state_with_vault, db_conn, execution_mode="live_shadow"
+    )
+    set_provider_credential(
+        db_conn,
+        organization_id=shadow_org_id,
+        provider=ABSTRACT_PROVIDER_NAME,
+        raw_credential="org-b-secret",
+        actor_user_id=uuid.uuid4(),
+    )
+
+    sim_body = _ingest(sim_client, cleanup_ingest)
+    shadow_body = _ingest(shadow_client, cleanup_ingest)
+    _take_ownership(db_conn, str(sim_body["job_id"]))
+    _take_ownership(db_conn, str(shadow_body["job_id"]))
+
+    # Same handler set (`live_handlers`), same worker, processed one after
+    # the other - proves the dispatch is per-job, not per-process.
+    _process(live_pool, live_handlers, sim_body)
+    _process(live_pool, live_handlers, shadow_body)
+
+    real_provider_names = {
+        ABSTRACT_PROVIDER_NAME,
+        "hunter_combined_enrichment",
+        "apollo_person_enrichment",
+    }
+
+    sim_rows = _provider_call_rows(db_conn, str(sim_body["lead_id"]))
+    assert {row[0] for row in sim_rows}.isdisjoint(real_provider_names)
+    assert sim_rows  # synthesized simulated evidence, not silence
+    sim_snapshot = _receipt_snapshot(db_conn, str(sim_body["lead_id"]))
+    assert sim_snapshot["execution_mode"] == "simulated"
+
+    shadow_rows = _provider_call_rows(db_conn, str(shadow_body["lead_id"]))
+    assert len(shadow_rows) == 1
+    assert shadow_rows[0][0] == ABSTRACT_PROVIDER_NAME
+    assert shadow_rows[0][1] == "organization"  # credential_source
+    shadow_snapshot = _receipt_snapshot(db_conn, str(shadow_body["lead_id"]))
+    assert shadow_snapshot["execution_mode"] == "live_shadow"
+    assert _lead_status(db_conn, str(shadow_body["lead_id"])) == LeadStatus.SHADOW_EVALUATED
 
 
 # -------------------------------------------------------------------- live_shadow --

@@ -37,6 +37,7 @@ from arie.jobs.worker import JobContext, JobHandler
 from arie.live.budget import DAILY_BUDGET_EXHAUSTED, PER_LEAD_BUDGET_EXHAUSTED, LiveSpendGuard
 from arie.live.safety import FORBIDDEN_LIVE_STATUSES, LIVE_GUARD_REASON, PERMITTED_LIVE_STATUSES
 from arie.providers.live_abstract import AbstractCompanyEnrichmentProvider
+from arie.tenancy import LEGACY_ORGANIZATION_ID
 
 pytestmark = pytest.mark.integration
 
@@ -602,7 +603,7 @@ def test_an_exhausted_daily_budget_stops_before_the_call_is_made(
     that. A fresh lead has spent nothing, so the per-lead cap has room; the
     account has spent the whole day's allowance, so the daily cap does not.
     """
-    baseline = LiveSpendGuard(live_pool, LiveBudgetConfig()).daily_spent_usd()
+    baseline = LiveSpendGuard(live_pool, LiveBudgetConfig()).daily_spent_usd(LEGACY_ORGANIZATION_ID)
     spent_today = float(baseline)
     if spent_today < 0.002:
         # Nothing has been spent today yet on this database. Spend one call so
@@ -618,7 +619,9 @@ def test_an_exhausted_daily_budget_stops_before_the_call_is_made(
             _strong_lead,
             prefix="daily-seed",
         )
-        spent_today = float(LiveSpendGuard(live_pool, LiveBudgetConfig()).daily_spent_usd())
+        spent_today = float(
+            LiveSpendGuard(live_pool, LiveBudgetConfig()).daily_spent_usd(LEGACY_ORGANIZATION_ID)
+        )
 
     assert spent_today >= 0.002
     monkeypatch.setattr(
@@ -696,11 +699,13 @@ def test_the_spend_guard_reads_the_real_ledger(live_pool: ConnectionPool) -> Non
     arithmetic through a fake pool and cannot catch a broken query."""
     guard = LiveSpendGuard(live_pool, LiveBudgetConfig(daily_usd=2.0, per_lead_usd=0.05))
 
-    daily = guard.daily_spent_usd()
+    daily = guard.daily_spent_usd(LEGACY_ORGANIZATION_ID)
     assert daily >= 0
 
     # An unknown lead has spent nothing — COALESCE, not a None that would blow
     # up the comparison.
-    allowance = guard.allowance(lead_id=uuid.uuid4(), estimated_cost_usd=0.002)
+    allowance = guard.allowance(
+        organization_id=LEGACY_ORGANIZATION_ID, lead_id=uuid.uuid4(), estimated_cost_usd=0.002
+    )
     assert allowance.lead_spent_usd == 0
     assert allowance.daily_spent_usd == daily

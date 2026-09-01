@@ -587,3 +587,119 @@ def test_two_reviews_of_one_lead_are_two_overrides(
 
 def test_lead_cost_returns_none_for_an_unknown_lead(cost_ledger: PostgresCostLedger) -> None:
     assert cost_ledger.lead_cost(uuid.uuid4()) is None
+
+
+# ============================================ Productization M5 Issue 4 --
+# `actual_cost_usd` (migration 0028) must never be silently derived from
+# `credits_used`/`cost_basis` — it is the vendor's own explicitly-reported
+# billed dollar figure, or nothing at all. Every current call site
+# (`arie.jobs.handlers._ledger_live_call`, the only place a real provider
+# result is ledgered) omits it entirely; these tests pin that at the
+# ledger's own contract level so a future call site cannot regress it by
+# accident.
+
+
+def test_credits_used_is_never_implicitly_treated_as_actual_cost_usd(
+    cost_ledger: PostgresCostLedger, db_conn: psycopg.Connection, cleanup_ingest: IngestCleanup
+) -> None:
+    """The exact scenario a careless refactor could introduce: a caller
+    supplies `credits_used` (the vendor's own metering unit, e.g. Hunter's
+    0.2 credits) and a `cost_basis` describing a *modeled* conversion, but
+    never an explicit `actual_cost_usd` — the row must record the modeled
+    `cost_usd` and the credits separately, and leave `actual_cost_usd`
+    NULL, never silently computed from either.
+    """
+    lead_id = _make_lead(db_conn, cleanup_ingest)
+
+    cost_ledger.record_provider_call(
+        idempotency_key=_key(cleanup_ingest),
+        provider="hunter_combined_enrichment",
+        entity_type="person",
+        entity_id=uuid.uuid4(),
+        status=ProviderStatus.SUCCESS,
+        cost_usd=0.0049,
+        latency_ms=500,
+        organization_id=ORG,
+        lead_id=lead_id,
+        credits_used=0.2,
+        cost_basis="modelled_credit_equivalent",
+    )
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT cost_usd, credits_used, cost_basis, actual_cost_usd "
+            "FROM provider_calls WHERE lead_id = %s",
+            (lead_id,),
+        )
+        row = cur.fetchone()
+    assert row is not None
+    cost_usd, credits_used, cost_basis, actual_cost_usd = row
+    assert cost_usd == Decimal("0.0049")
+    assert credits_used == Decimal("0.2")
+    assert cost_basis == "modelled_credit_equivalent"
+    assert actual_cost_usd is None
+
+
+def test_actual_cost_usd_defaults_to_null_when_omitted(
+    cost_ledger: PostgresCostLedger, db_conn: psycopg.Connection, cleanup_ingest: IngestCleanup
+) -> None:
+    lead_id = _make_lead(db_conn, cleanup_ingest)
+
+    cost_ledger.record_provider_call(
+        idempotency_key=_key(cleanup_ingest),
+        provider="abstract_company_enrichment",
+        entity_type="company",
+        entity_id=uuid.uuid4(),
+        status=ProviderStatus.SUCCESS,
+        cost_usd=0.00165,
+        latency_ms=300,
+        organization_id=ORG,
+        lead_id=lead_id,
+        # actual_cost_usd deliberately not passed - every real call site
+        # omits it, since none of Abstract/Hunter/Apollo report a billed
+        # dollar figure (see the module docstring's own citation).
+    )
+
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT actual_cost_usd FROM provider_calls WHERE lead_id = %s", (lead_id,))
+        row = cur.fetchone()
+    assert row is not None
+    assert row[0] is None
+
+
+def test_actual_cost_usd_is_only_ever_populated_when_a_caller_explicitly_states_it(
+    cost_ledger: PostgresCostLedger, db_conn: psycopg.Connection, cleanup_ingest: IngestCleanup
+) -> None:
+    """The one legitimate way this column is ever non-NULL: a caller that
+    itself received an explicit, deterministic billed-dollar figure from
+    the vendor's own response and passes it through verbatim. Proven here
+    with a synthetic value (no such vendor exists in this codebase today —
+    see `migrations/0028_...sql`'s own docstring) purely to confirm the
+    column is plumbed through correctly for the day a provider that does
+    report one is added, and does not silently collide with `cost_usd`
+    (the modeled figure, which stays independent).
+    """
+    lead_id = _make_lead(db_conn, cleanup_ingest)
+
+    cost_ledger.record_provider_call(
+        idempotency_key=_key(cleanup_ingest),
+        provider="abstract_company_enrichment",
+        entity_type="company",
+        entity_id=uuid.uuid4(),
+        status=ProviderStatus.SUCCESS,
+        cost_usd=0.00165,  # ARIE's own modeled figure - unaffected
+        latency_ms=300,
+        organization_id=ORG,
+        lead_id=lead_id,
+        actual_cost_usd=0.00201,  # a hypothetical vendor-stated billed figure
+    )
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT cost_usd, actual_cost_usd FROM provider_calls WHERE lead_id = %s", (lead_id,)
+        )
+        row = cur.fetchone()
+    assert row is not None
+    assert row[0] == Decimal("0.00165")
+    assert row[1] == Decimal("0.00201")
+    assert row[0] != row[1]  # the two figures are never conflated

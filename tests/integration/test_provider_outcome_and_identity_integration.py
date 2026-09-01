@@ -643,3 +643,251 @@ def test_outcome_guard_ttl_expiry_makes_the_provider_askable_again(
 
     guard_expired = ProviderOutcomeGuard(live_pool, LiveOutcomeCacheConfig(miss_ttl_seconds=0.0))
     assert guard_expired.recent_miss(HUNTER, "person", entity_id, organization_id=ORG) is None
+
+
+# ============================================ Productization M5 Issue 3 --
+# Paid-call unknown-outcome / retry safety: a genuine timeout or transport-
+# level failure — where ARIE cannot tell whether the vendor received (and
+# possibly began billing for) the request — must not be blindly re-issued
+# by a worker retry, unlike a settled miss (which is free to re-check
+# quickly) or a definite rejection like a 503 (scenario E above, which
+# stays retryable — the cooldown/backoff machinery governs that, not this
+# guard).
+
+
+def _hunter_timeout(request: httpx.Request) -> httpx.Response:
+    raise httpx.TimeoutException("simulated vendor timeout", request=request)
+
+
+def test_a_genuine_timeout_suppresses_an_identical_retry_and_never_settles_as_a_miss(
+    api_client: TestClient,
+    cleanup_ingest: IngestCleanup,
+    cleanup_evidence: list[uuid.UUID],
+    db_conn: psycopg.Connection,
+    live_pool: ConnectionPool,
+    runtime: SimulatedEnrichmentRuntime,
+) -> None:
+    """The crash/retry scenario Issue 3 exists for: the first attempt times
+    out (uncertain — the vendor may have received the request), the job is
+    retried (a second, independent job processing run against the exact
+    same lead/company/person, exactly what `arie.jobs.worker`'s own retry
+    path does), and the retry must NOT blindly re-issue the same paid call.
+    """
+    domain = f"co-{uuid.uuid4().hex[:8]}.test"
+    email = f"nobody@{domain}"
+    counter = [0]
+    hunter = _hunter_provider(_counting(_hunter_timeout, counter))
+    handlers = _handlers_for(live_pool, runtime, hunter)
+
+    first = _run(
+        api_client,
+        cleanup_ingest,
+        cleanup_evidence,
+        db_conn,
+        live_pool,
+        handlers,
+        domain=domain,
+        email=email,
+    )
+    assert counter[0] == 1
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT status, error_kind, cost_usd FROM provider_calls "
+            "WHERE lead_id = %s AND provider = %s",
+            (first["lead_id"], HUNTER),
+        )
+        first_row = cur.fetchone()
+    assert first_row is not None
+    assert first_row[0] == str(ProviderStatus.TIMEOUT)
+    assert first_row[1] == "timeout"
+    assert first_row[2] == 0  # never fabricate a cost for an unresolved attempt
+
+    # Simulates a worker-level job retry for the same lead: a second,
+    # independent `compute_score` run against the same company/person
+    # entities — not the same job row, which is the point: even a
+    # *different* job re-processing this identity must not repurchase.
+    second = _run(
+        api_client,
+        cleanup_ingest,
+        cleanup_evidence,
+        db_conn,
+        live_pool,
+        handlers,
+        domain=domain,
+        email=email,
+    )
+    assert counter[0] == 1, "an uncertain (timeout) outcome must suppress the identical retry"
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT suppressed_reason, status FROM provider_calls "
+            "WHERE lead_id = %s AND provider = %s",
+            (second["lead_id"], HUNTER),
+        )
+        second_rows = cur.fetchall()
+    assert any(row[0] == "uncertain_outcome" for row in second_rows)
+    # Never recorded as a settled MISS — that would be a fabricated fact
+    # about a vendor that was never actually confirmed to have answered.
+    assert all(row[1] != str(ProviderStatus.MISS) for row in second_rows)
+
+
+def test_a_transport_level_error_is_also_treated_as_uncertain(
+    api_client: TestClient,
+    cleanup_ingest: IngestCleanup,
+    cleanup_evidence: list[uuid.UUID],
+    db_conn: psycopg.Connection,
+    live_pool: ConnectionPool,
+    runtime: SimulatedEnrichmentRuntime,
+) -> None:
+    """Not only `httpx.TimeoutException` — any connection-level
+    `httpx.HTTPError` (`error_kind` prefixed `transport_error:`, every live
+    adapter's shared vocabulary) means "no response was ever received" and
+    is exactly as uncertain as a timeout."""
+
+    def _connect_error(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("simulated connection failure", request=request)
+
+    domain = f"co-{uuid.uuid4().hex[:8]}.test"
+    email = f"nobody@{domain}"
+    counter = [0]
+    hunter = _hunter_provider(_counting(_connect_error, counter))
+    handlers = _handlers_for(live_pool, runtime, hunter)
+
+    _run(
+        api_client,
+        cleanup_ingest,
+        cleanup_evidence,
+        db_conn,
+        live_pool,
+        handlers,
+        domain=domain,
+        email=email,
+    )
+    assert counter[0] == 1
+
+    second = _run(
+        api_client,
+        cleanup_ingest,
+        cleanup_evidence,
+        db_conn,
+        live_pool,
+        handlers,
+        domain=domain,
+        email=email,
+    )
+    assert counter[0] == 1, "a connection-level failure must also suppress the identical retry"
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT suppressed_reason FROM provider_calls WHERE lead_id = %s AND provider = %s",
+            (second["lead_id"], HUNTER),
+        )
+        rows = [row[0] for row in cur.fetchall()]
+    assert "uncertain_outcome" in rows
+
+
+def test_a_503_server_error_is_not_treated_as_uncertain_and_stays_retryable(
+    live_pool: ConnectionPool, cleanup_evidence: list[uuid.UUID]
+) -> None:
+    """The other half of the classification (Issue 4-adjacent precision):
+    a *definite* HTTP response — even a failing one — means the vendor was
+    reached, so it is never suppressed by this guard. Scenario E above
+    already proves this behaviourally through the full acquisition loop;
+    this pins the guard's own classification directly."""
+    from arie.ledger.store import PostgresCostLedger
+
+    ledger = PostgresCostLedger(live_pool)
+    entity_id = uuid.uuid4()
+    cleanup_evidence.append(entity_id)
+    ledger.record_provider_call(
+        idempotency_key=f"outcome-uncertain-{uuid.uuid4().hex}",
+        provider=HUNTER,
+        entity_type="person",
+        entity_id=entity_id,
+        status=ProviderStatus.ERROR,
+        cost_usd=0.0,
+        latency_ms=10.0,
+        organization_id=ORG,
+        error_kind="server_error",
+    )
+
+    guard = ProviderOutcomeGuard(
+        live_pool, LiveOutcomeCacheConfig(uncertain_outcome_ttl_seconds=3600.0)
+    )
+    assert guard.recent_uncertain_outcome(HUNTER, "person", entity_id, organization_id=ORG) is None
+
+
+def test_uncertain_outcome_guard_ttl_expiry_makes_the_provider_askable_again(
+    live_pool: ConnectionPool, cleanup_evidence: list[uuid.UUID]
+) -> None:
+    from arie.ledger.store import PostgresCostLedger
+
+    ledger = PostgresCostLedger(live_pool)
+    entity_id = uuid.uuid4()
+    cleanup_evidence.append(entity_id)
+    ledger.record_provider_call(
+        idempotency_key=f"outcome-uncertain-ttl-{uuid.uuid4().hex}",
+        provider=HUNTER,
+        entity_type="person",
+        entity_id=entity_id,
+        status=ProviderStatus.TIMEOUT,
+        cost_usd=0.0,
+        latency_ms=10.0,
+        organization_id=ORG,
+        error_kind="timeout",
+    )
+
+    guard_within_ttl = ProviderOutcomeGuard(
+        live_pool, LiveOutcomeCacheConfig(uncertain_outcome_ttl_seconds=3600.0)
+    )
+    assert (
+        guard_within_ttl.recent_uncertain_outcome(HUNTER, "person", entity_id, organization_id=ORG)
+        is not None
+    )
+
+    guard_expired = ProviderOutcomeGuard(
+        live_pool, LiveOutcomeCacheConfig(uncertain_outcome_ttl_seconds=0.0)
+    )
+    assert (
+        guard_expired.recent_uncertain_outcome(HUNTER, "person", entity_id, organization_id=ORG)
+        is None
+    )
+
+
+def test_uncertain_outcome_suppression_is_organization_scoped(
+    live_pool: ConnectionPool, cleanup_evidence: list[uuid.UUID], db_conn: psycopg.Connection
+) -> None:
+    from tests.integration.test_provider_configs_integration import _insert_org
+
+    from arie.ledger.store import PostgresCostLedger
+
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    _insert_org(db_conn, org_a)
+    _insert_org(db_conn, org_b)
+
+    ledger = PostgresCostLedger(live_pool)
+    entity_id = uuid.uuid4()
+    cleanup_evidence.append(entity_id)
+    ledger.record_provider_call(
+        idempotency_key=f"outcome-uncertain-tenancy-{uuid.uuid4().hex}",
+        provider=HUNTER,
+        entity_type="person",
+        entity_id=entity_id,
+        status=ProviderStatus.TIMEOUT,
+        cost_usd=0.0,
+        latency_ms=10.0,
+        organization_id=org_a,
+        error_kind="timeout",
+    )
+
+    guard = ProviderOutcomeGuard(
+        live_pool, LiveOutcomeCacheConfig(uncertain_outcome_ttl_seconds=3600.0)
+    )
+    assert (
+        guard.recent_uncertain_outcome(HUNTER, "person", entity_id, organization_id=org_a)
+        is not None
+    )
+    assert (
+        guard.recent_uncertain_outcome(HUNTER, "person", entity_id, organization_id=org_b) is None
+    )

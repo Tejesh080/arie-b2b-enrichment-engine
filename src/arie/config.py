@@ -503,8 +503,9 @@ class LiveStrategyConfig:
 
 @dataclass(frozen=True)
 class LiveOutcomeCacheConfig:
-    """How long a *settled* provider outcome — a miss, or a success that left
-    some declared field genuinely unmapped — is trusted without asking again.
+    """How long a *settled* provider outcome — a miss, a success that left
+    some declared field genuinely unmapped, or an uncertain paid-call
+    outcome — is trusted without asking again.
 
     Distinct from ``ttl_for_field`` (``arie.evidence.ttl_policy``), which
     governs how long an actual *value* stays fresh once a provider supplies
@@ -526,6 +527,23 @@ class LiveOutcomeCacheConfig:
     a *belief*, not a fact, and a short window bounds how long ARIE can be
     wrong about a vendor that just started indexing a new record. ``0``
     disables miss suppression entirely (every request re-asks)."""
+
+    uncertain_outcome_ttl_seconds: float = field(
+        default_factory=lambda: _env_float("PROVIDER_UNCERTAIN_OUTCOME_CACHE_TTL_SECONDS", 3600.0)
+    )
+    """Productization M5 Part 7 (retry safety). A provider call whose
+    transport outcome was genuinely uncertain — a timeout, or a connection-
+    level error, where ARIE cannot tell whether the vendor received (and
+    possibly began billing-relevant processing of) the request — is not
+    automatically re-attempted for this long. Deliberately much longer than
+    ``miss_ttl_seconds``: a miss is a known, settled, cheap-to-repeat fact;
+    an uncertain outcome might already have cost money, so the bar for
+    letting a worker retry blindly re-issue it is the same order of
+    magnitude as the quota cooldown, not the 30-second miss window. ``0``
+    disables this suppression entirely (every retry re-asks, the pre-M5
+    behaviour). This does not affect a *definite* result (a real HTTP
+    response, success/miss/rejection alike) — only genuinely ambiguous
+    transport failures."""
 
 
 @dataclass(frozen=True)

@@ -83,6 +83,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import psycopg
+from opentelemetry.trace import Span
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
@@ -114,7 +115,12 @@ from arie.live.budget import LiveSpendGuard
 from arie.live.cooldown import PROVIDER_UNAVAILABLE, ProviderCooldownGuard
 from arie.live.evaluation import classify_agreement, overall_agreement
 from arie.live.org_budget import OrganizationSpendGuard
-from arie.live.outcome_cache import RECENT_MISS, RECENT_PARTIAL, ProviderOutcomeGuard
+from arie.live.outcome_cache import (
+    RECENT_MISS,
+    RECENT_PARTIAL,
+    UNCERTAIN_OUTCOME,
+    ProviderOutcomeGuard,
+)
 from arie.live.person_relevance import person_evidence_is_decision_relevant
 from arie.live.provider_availability import (
     CREDENTIAL_SOURCE_ORGANIZATION,
@@ -700,13 +706,195 @@ def build_handlers(
     )
 
 
+def _run_simulated_acquisition(
+    ctx: JobContext,
+    resolved_runtime: SimulatedEnrichmentRuntime,
+    evidence_store: PostgresEvidenceStore,
+    cost_ledger: PostgresCostLedger,
+    span: Span,
+) -> LeadStatus:
+    """The full ``PROVIDER_MODE=simulated`` acquisition/decision path for one
+    job: frozen-corpus replay or synthesized evidence (``arie.providers.
+    synthetic``), ``CalibratedBoundsPolicy.run``, and finalization. Unchanged
+    logic — this is ``_build_simulated_handlers``'s own inline body before
+    Productization M5, extracted so it has a second caller.
+
+    **The second caller (Productization M5 Part 1's corrective fix).**
+    ``_build_live_handlers`` calls this too, for any job whose *own
+    organization* has ``execution_mode=SIMULATED`` — even while the worker
+    process itself runs ``PROVIDER_MODE=live``. ``PROVIDER_MODE`` is a
+    deployment-level gate on whether the live acquisition code path exists in
+    this process at all; it was never meant to be read as "every job this
+    process handles is live," and before this fix a simulated organization
+    sharing a live worker with a live_shadow/live_human_only organization got
+    zero evidence and the live autonomy guard's forced escalation instead of
+    its own ordinary simulated decision — a correctness regression for that
+    organization, not a safety one, but a real behavioural difference from
+    running on a simulated-only worker that multi-tenant rollout cannot
+    accept. Calling this exact function from both builders is what makes
+    "simulated organizations behave identically regardless of which other
+    organizations share their worker" true by construction rather than by
+    two implementations staying in sync.
+    """
+    job = ctx.job
+    assert job.lead_id is not None  # every caller already validated this
+    identity = _load_identity(ctx.conn, job.lead_id)
+    try:
+        corpus_lead = resolved_runtime.corpus_lead_for(
+            identity.canonical_email, identity.canonical_domain
+        )
+        registry = resolved_runtime.registry
+        synthetic = False
+    except UnknownCorpusIdentityError:
+        # Out-of-corpus identity — synthesize deterministic simulated
+        # evidence instead of dead-lettering. Corpus identities never
+        # reach this branch, so the frozen replay is untouched; see
+        # arie.providers.synthetic for the determinism contract that
+        # keeps the durable evidence cache coherent across contacts.
+        domain = identity.canonical_domain or domain_from_email(identity.canonical_email)
+        if domain is None:
+            # Unreachable for ingested leads (a canonical email always
+            # carries a domain), but if it ever happens, fail into the
+            # ordinary dead-letter path — which now marks the lead —
+            # rather than synthesizing from nothing.
+            raise UnknownCorpusIdentityError(
+                f"lead {job.lead_id} has no company domain to synthesize from"
+            ) from None
+        corpus_lead = synthesize_corpus_lead(
+            canonical_email=identity.canonical_email,
+            canonical_domain=domain,
+            full_name=identity.full_name,
+            company_name=identity.company_name,
+        )
+        _, registry = build_from_leads([corpus_lead])
+        synthetic = True
+    entities: dict[str, tuple[EntityType, UUID]] = {
+        corpus_lead.company.canonical_domain: ("company", identity.company_id),
+        corpus_lead.person.email: ("person", identity.person_id),
+    }
+
+    run_ctx = RunContext(
+        registry=registry,
+        ledger=_DurableCallLedger(
+            cost_ledger,
+            lead_id=job.lead_id,
+            job_id=job.job_id,
+            organization_id=identity.organization_id,
+            entities=entities,
+        ),
+        cache=_DurableEvidenceCache(
+            evidence_store, entities, organization_id=identity.organization_id
+        ),
+    )
+    # Productization M3: score/decide against this organization's
+    # active ICP profile, or the reference config unchanged if it has
+    # none — see `arie.scoring.rules.use_scoring_config`'s own
+    # docstring for why this needs no change to `CalibratedBoundsPolicy`
+    # or anything else `policy.run` calls internally.
+    scoring_config = resolve_scoring_config(ctx.conn, organization_id=identity.organization_id)
+    with use_scoring_config(scoring_config):
+        outcome = resolved_runtime.policy.run(corpus_lead, run_ctx)
+    tau = resolved_runtime.policy.model.tau
+
+    # Walk the scaffold NEW -> ... -> DECISION as the graph defines it,
+    # one audited transition per hop, all inside the work transaction.
+    payloads = _scaffold_payloads(outcome, tau)
+    version = ctx.lead_version
+    assert version is not None  # the caller already asserted lead_status is NEW
+    status = LeadStatus.NEW
+    while status is not LeadStatus.DECISION:
+        advanced = next_status(status)
+        assert advanced is not None  # NEW..INTEGRATING always advance; see transitions.py
+        status = advanced
+        version = apply_transition(
+            ctx.conn,
+            lead_id=job.lead_id,
+            expected_version=version,
+            new_status=status,
+            event_type=f"policy:{status.lower()}",
+            payload=payloads.get(str(status), {}),
+        ).new_version
+
+    with ctx.conn.cursor() as cur:
+        cur.execute(
+            _INSERT_SCORE,
+            {
+                "organization_id": identity.organization_id,
+                "lead_id": job.lead_id,
+                "total_score": outcome.scoring.breakdown.total_score,
+                "decision_confidence": outcome.confidence,
+                "component_breakdown": Jsonb(outcome.scoring.breakdown.components),
+                "model_version": outcome.scoring.breakdown.model_version,
+            },
+        )
+        cur.execute(
+            _INSERT_DECISION_RECEIPT,
+            {
+                "organization_id": identity.organization_id,
+                "lead_id": job.lead_id,
+                "decision": str(outcome.decision),
+                "autonomous": outcome.autonomous,
+                "confidence": outcome.confidence,
+                "tau": tau,
+                "score_value": outcome.scoring.bounds.current,
+                "score_lower": outcome.scoring.bounds.lower,
+                "score_upper": outcome.scoring.bounds.upper,
+                "stop_reason": outcome.stop_reason,
+                "policy_name": resolved_runtime.policy.name,
+                "scorer_version": outcome.scoring.breakdown.model_version,
+                "confidence_calibration": resolved_runtime.policy.model.method,
+                "evidence_snapshot": Jsonb(
+                    {
+                        **_evidence_snapshot(outcome.scoring),
+                        # Productization M5 Part 13 — symmetric with the
+                        # live handler's own `execution_mode` key
+                        # (arie.organizations.EXECUTION_MODES), so every
+                        # receipt, simulated or live, carries one honest
+                        # label a viewer can render without special-casing
+                        # "key absent means simulated."
+                        "execution_mode": SIMULATED,
+                    }
+                ),
+                "icp_profile_id": scoring_config.profile_id,
+                "icp_profile_version": scoring_config.profile_version,
+            },
+        )
+
+    final = _finalize_decision(
+        ctx.conn,
+        lead_id=job.lead_id,
+        organization_id=identity.organization_id,
+        version=version,
+        decision=outcome.decision,
+        autonomous=outcome.autonomous,
+        is_shadow=identity.is_shadow,
+    )
+
+    set_attributes(
+        span,
+        {
+            "arie.decision": str(outcome.decision),
+            "arie.confidence": outcome.confidence,
+            "arie.autonomous": outcome.autonomous,
+            "arie.lead.final_status": str(final),
+            "arie.cost_usd": outcome.cost_usd,
+            "arie.stop_reason": outcome.stop_reason,
+            "arie.shadow": identity.is_shadow,
+            "arie.synthetic_identity": synthetic,
+        },
+    )
+    return final
+
+
 def _build_simulated_handlers(
     pool: ConnectionPool, resolved_runtime: SimulatedEnrichmentRuntime
 ) -> dict[str, JobHandler]:
     """``PROVIDER_MODE=simulated`` — replays the frozen corpus for identities
     in ``resolved_runtime.corpus_by_email`` (unchanged from before P5), and
     synthesizes deterministic simulated evidence for everything else (see
-    ``arie.providers.synthetic``)."""
+    ``arie.providers.synthetic``). The per-job logic itself lives in
+    :func:`_run_simulated_acquisition`, shared with ``_build_live_handlers``
+    — see that function's own docstring."""
     evidence_store = PostgresEvidenceStore(pool)
     cost_ledger = PostgresCostLedger(pool)
 
@@ -724,155 +912,9 @@ def _build_simulated_handlers(
             "handler.compute_score",
             attributes={"arie.lead_id": job.lead_id, "arie.provider_mode": "simulated"},
         ) as span:
-            identity = _load_identity(ctx.conn, job.lead_id)
-            try:
-                corpus_lead = resolved_runtime.corpus_lead_for(
-                    identity.canonical_email, identity.canonical_domain
-                )
-                registry = resolved_runtime.registry
-                synthetic = False
-            except UnknownCorpusIdentityError:
-                # Out-of-corpus identity — synthesize deterministic simulated
-                # evidence instead of dead-lettering. Corpus identities never
-                # reach this branch, so the frozen replay is untouched; see
-                # arie.providers.synthetic for the determinism contract that
-                # keeps the durable evidence cache coherent across contacts.
-                domain = identity.canonical_domain or domain_from_email(identity.canonical_email)
-                if domain is None:
-                    # Unreachable for ingested leads (a canonical email always
-                    # carries a domain), but if it ever happens, fail into the
-                    # ordinary dead-letter path — which now marks the lead —
-                    # rather than synthesizing from nothing.
-                    raise UnknownCorpusIdentityError(
-                        f"lead {job.lead_id} has no company domain to synthesize from"
-                    ) from None
-                corpus_lead = synthesize_corpus_lead(
-                    canonical_email=identity.canonical_email,
-                    canonical_domain=domain,
-                    full_name=identity.full_name,
-                    company_name=identity.company_name,
-                )
-                _, registry = build_from_leads([corpus_lead])
-                synthetic = True
-            entities: dict[str, tuple[EntityType, UUID]] = {
-                corpus_lead.company.canonical_domain: ("company", identity.company_id),
-                corpus_lead.person.email: ("person", identity.person_id),
-            }
-
-            run_ctx = RunContext(
-                registry=registry,
-                ledger=_DurableCallLedger(
-                    cost_ledger,
-                    lead_id=job.lead_id,
-                    job_id=job.job_id,
-                    organization_id=identity.organization_id,
-                    entities=entities,
-                ),
-                cache=_DurableEvidenceCache(
-                    evidence_store, entities, organization_id=identity.organization_id
-                ),
-            )
-            # Productization M3: score/decide against this organization's
-            # active ICP profile, or the reference config unchanged if it has
-            # none — see `arie.scoring.rules.use_scoring_config`'s own
-            # docstring for why this needs no change to `CalibratedBoundsPolicy`
-            # or anything else `policy.run` calls internally.
-            scoring_config = resolve_scoring_config(
-                ctx.conn, organization_id=identity.organization_id
-            )
-            with use_scoring_config(scoring_config):
-                outcome = resolved_runtime.policy.run(corpus_lead, run_ctx)
-            tau = resolved_runtime.policy.model.tau
-
-            # Walk the scaffold NEW -> ... -> DECISION as the graph defines it,
-            # one audited transition per hop, all inside the work transaction.
-            payloads = _scaffold_payloads(outcome, tau)
-            version = ctx.lead_version
-            status = LeadStatus.NEW
-            while status is not LeadStatus.DECISION:
-                advanced = next_status(status)
-                assert advanced is not None  # NEW..INTEGRATING always advance; see transitions.py
-                status = advanced
-                version = apply_transition(
-                    ctx.conn,
-                    lead_id=job.lead_id,
-                    expected_version=version,
-                    new_status=status,
-                    event_type=f"policy:{status.lower()}",
-                    payload=payloads.get(str(status), {}),
-                ).new_version
-
-            with ctx.conn.cursor() as cur:
-                cur.execute(
-                    _INSERT_SCORE,
-                    {
-                        "organization_id": identity.organization_id,
-                        "lead_id": job.lead_id,
-                        "total_score": outcome.scoring.breakdown.total_score,
-                        "decision_confidence": outcome.confidence,
-                        "component_breakdown": Jsonb(outcome.scoring.breakdown.components),
-                        "model_version": outcome.scoring.breakdown.model_version,
-                    },
-                )
-                cur.execute(
-                    _INSERT_DECISION_RECEIPT,
-                    {
-                        "organization_id": identity.organization_id,
-                        "lead_id": job.lead_id,
-                        "decision": str(outcome.decision),
-                        "autonomous": outcome.autonomous,
-                        "confidence": outcome.confidence,
-                        "tau": tau,
-                        "score_value": outcome.scoring.bounds.current,
-                        "score_lower": outcome.scoring.bounds.lower,
-                        "score_upper": outcome.scoring.bounds.upper,
-                        "stop_reason": outcome.stop_reason,
-                        "policy_name": resolved_runtime.policy.name,
-                        "scorer_version": outcome.scoring.breakdown.model_version,
-                        "confidence_calibration": resolved_runtime.policy.model.method,
-                        "evidence_snapshot": Jsonb(
-                            {
-                                **_evidence_snapshot(outcome.scoring),
-                                # Productization M5 Part 13 — symmetric with
-                                # the live handler's own `execution_mode` key
-                                # (arie.organizations.EXECUTION_MODES), so
-                                # every receipt, simulated or live, carries
-                                # one honest label a viewer can render
-                                # without special-casing "key absent means
-                                # simulated."
-                                "execution_mode": SIMULATED,
-                            }
-                        ),
-                        "icp_profile_id": scoring_config.profile_id,
-                        "icp_profile_version": scoring_config.profile_version,
-                    },
-                )
-
-            final = _finalize_decision(
-                ctx.conn,
-                lead_id=job.lead_id,
-                organization_id=identity.organization_id,
-                version=version,
-                decision=outcome.decision,
-                autonomous=outcome.autonomous,
-                is_shadow=identity.is_shadow,
-            )
-
-            set_attributes(
-                span,
-                {
-                    "arie.decision": str(outcome.decision),
-                    "arie.confidence": outcome.confidence,
-                    "arie.autonomous": outcome.autonomous,
-                    "arie.lead.final_status": str(final),
-                    "arie.cost_usd": outcome.cost_usd,
-                    "arie.stop_reason": outcome.stop_reason,
-                    "arie.shadow": identity.is_shadow,
-                    "arie.synthetic_identity": synthetic,
-                },
-            )
-        # Transitions were applied here, hop by hop; None tells the worker
-        # there is no further transition for it to apply.
+            _run_simulated_acquisition(ctx, resolved_runtime, evidence_store, cost_ledger, span)
+        # Transitions were applied inside `_run_simulated_acquisition`, hop by
+        # hop; None tells the worker there is no further transition to apply.
         return None
 
     return {"compute_score": compute_score}
@@ -1337,6 +1379,26 @@ def _acquire_live_evidence(
             cache_hits.append(provider.name)
             continue
 
+        recent_uncertain = outcome_guard.recent_uncertain_outcome(
+            provider.name, ref.entity_type, ref.entity_id, organization_id=organization_id
+        )
+        if recent_uncertain is not None:
+            cost_ledger.record_provider_call(
+                idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
+                provider=provider.name,
+                entity_type=ref.entity_type,
+                entity_id=ref.entity_id,
+                status=ProviderStatus.ERROR,
+                cost_usd=0.0,
+                latency_ms=0.0,
+                organization_id=organization_id,
+                lead_id=lead_id,
+                cache_hit=True,
+                suppressed_reason=UNCERTAIN_OUTCOME,
+            )
+            cache_hits.append(provider.name)
+            continue
+
         # Cooldown before budget: a provider whose quota is spent should not
         # consume a budget-allowance ledger read per lead, and the two skips
         # mean different things — "the account cannot afford it" versus "the
@@ -1344,12 +1406,17 @@ def _acquire_live_evidence(
         # checks stay above this line on purpose: serving already-held
         # evidence, or recognising a still-fresh miss, during a cooldown is
         # free and correct.
-        if cooldown_guard.cooling_down_until(provider.name) is not None:
+        if (
+            cooldown_guard.cooling_down_until(provider.name, organization_id=organization_id)
+            is not None
+        ):
             unavailable.append(provider.name)
             continue
 
         allowance = spend_guard.allowance(
-            lead_id=lead_id, estimated_cost_usd=provider.base_cost_usd
+            organization_id=organization_id,
+            lead_id=lead_id,
+            estimated_cost_usd=provider.base_cost_usd,
         )
         if not allowance.permitted:
             assert allowance.reason is not None  # set whenever not permitted
@@ -1730,11 +1797,36 @@ def _acquire_evaluation_parallel(
             )
             cache_hits.append(provider.name)
             continue
-        if cooldown_guard.cooling_down_until(provider.name) is not None:
+
+        recent_uncertain = outcome_guard.recent_uncertain_outcome(
+            provider.name, ref.entity_type, ref.entity_id, organization_id=organization_id
+        )
+        if recent_uncertain is not None:
+            cost_ledger.record_provider_call(
+                idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
+                provider=provider.name,
+                entity_type=ref.entity_type,
+                entity_id=ref.entity_id,
+                status=ProviderStatus.ERROR,
+                cost_usd=0.0,
+                latency_ms=0.0,
+                organization_id=organization_id,
+                lead_id=lead_id,
+                cache_hit=True,
+                suppressed_reason=UNCERTAIN_OUTCOME,
+            )
+            cache_hits.append(provider.name)
+            continue
+        if (
+            cooldown_guard.cooling_down_until(provider.name, organization_id=organization_id)
+            is not None
+        ):
             unavailable.append(provider.name)
             continue
         allowance = spend_guard.allowance(
-            lead_id=lead_id, estimated_cost_usd=provider.base_cost_usd
+            organization_id=organization_id,
+            lead_id=lead_id,
+            estimated_cost_usd=provider.base_cost_usd,
         )
         if not allowance.permitted:
             assert allowance.reason is not None  # set whenever not permitted
@@ -1855,7 +1947,33 @@ def _acquire_evaluation_parallel(
                 "cost_usd": 0.0,
             }
             continue
-        until = cooldown_guard.cooling_down_until(provider.name)
+
+        recent_uncertain = outcome_guard.recent_uncertain_outcome(
+            provider.name, ref.entity_type, ref.entity_id, organization_id=organization_id
+        )
+        if recent_uncertain is not None:
+            cost_ledger.record_provider_call(
+                idempotency_key=_live_idempotency_key(job_id, provider.name, ref),
+                provider=provider.name,
+                entity_type=ref.entity_type,
+                entity_id=ref.entity_id,
+                status=ProviderStatus.ERROR,
+                cost_usd=0.0,
+                latency_ms=0.0,
+                organization_id=organization_id,
+                lead_id=lead_id,
+                cache_hit=True,
+                suppressed_reason=UNCERTAIN_OUTCOME,
+            )
+            cache_hits.append(provider.name)
+            person_records[provider.name] = {
+                "served_from": "suppressed_uncertain_outcome",
+                "status": str(ProviderStatus.ERROR),
+                "fields": {},
+                "cost_usd": 0.0,
+            }
+            continue
+        until = cooldown_guard.cooling_down_until(provider.name, organization_id=organization_id)
         if until is not None:
             unavailable.append(provider.name)
             person_records[provider.name] = {
@@ -1864,7 +1982,9 @@ def _acquire_evaluation_parallel(
             }
             continue
         allowance = spend_guard.allowance(
-            lead_id=lead_id, estimated_cost_usd=provider.base_cost_usd + pending_estimate
+            organization_id=organization_id,
+            lead_id=lead_id,
+            estimated_cost_usd=provider.base_cost_usd + pending_estimate,
         )
         if not allowance.permitted:
             assert allowance.reason is not None  # set whenever not permitted
@@ -2214,16 +2334,38 @@ def _build_live_handlers(
             attributes={"arie.lead_id": job.lead_id, "arie.provider_mode": "live"},
         ) as span:
             identity = _load_identity(ctx.conn, job.lead_id)
+
+            # Productization M5 Parts 1-4: which adapters (if any) this job
+            # may use, and whether this organization has opted into live
+            # processing at all. Injected providers (tests, the smoke
+            # script) bypass organization credential/execution-mode
+            # resolution entirely — see this function's own docstring — and
+            # own nothing this handler must close.
+            #
+            # Checked BEFORE `_walk_to_decision` on purpose (M5 corrective
+            # fix): an organization whose own `execution_mode` is
+            # `SIMULATED` must get the *exact* simulated acquisition/
+            # decision path (`_run_simulated_acquisition`, shared with
+            # `_build_simulated_handlers`) rather than "zero live evidence,
+            # forced through the live autonomy guard" — see that function's
+            # own docstring for why. That path does its own complete
+            # NEW->DECISION walk (with richer per-hop payloads) starting
+            # from `ctx.lead_version`; calling `_walk_to_decision` first
+            # would advance the lead out from under it and fail the second
+            # walk's own optimistic-concurrency check.
+            execution_mode: str | None = None
+            if injected_providers is None:
+                execution_mode = get_execution_mode(
+                    ctx.conn, organization_id=identity.organization_id
+                )
+                if execution_mode == SIMULATED:
+                    _run_simulated_acquisition(
+                        ctx, resolved_runtime, evidence_store, cost_ledger, span
+                    )
+                    return None
+
             version = _walk_to_decision(ctx.conn, lead_id=job.lead_id, version=ctx.lead_version)
 
-            # Productization M5 Parts 1-4: resolve which adapters this job may
-            # use. Injected providers (tests, the smoke script) bypass
-            # organization credential/execution-mode resolution entirely —
-            # see this function's own docstring — and own nothing this
-            # handler must close. The default (production) path resolves
-            # fresh, organization-scoped adapters every job and owns closing
-            # them.
-            execution_mode: str | None = None
             provider_unavailability: dict[str, str] = {}
             active_org_spend_guard: OrganizationSpendGuard | None = None
             credential_source: str | None = None
@@ -2232,9 +2374,10 @@ def _build_live_handlers(
                 active_providers = injected_providers
                 effective_is_shadow = identity.is_shadow
             else:
-                execution_mode = get_execution_mode(
-                    ctx.conn, organization_id=identity.organization_id
-                )
+                # execution_mode was already resolved above, and is
+                # LIVE_SHADOW or LIVE_HUMAN_ONLY here (SIMULATED returned
+                # early).
+                assert execution_mode is not None
                 built_providers, provider_unavailability = resolve_organization_providers(
                     ctx.conn,
                     organization_id=identity.organization_id,
