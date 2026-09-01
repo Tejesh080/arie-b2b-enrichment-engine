@@ -84,6 +84,34 @@ job — the worker loop routes every exception through the same retry/backoff/
 dead-letter path, regardless of job_type."""
 
 
+_MAY_HAVE_OPENED_A_REVIEW: frozenset[LeadStatus | None] = frozenset(
+    {LeadStatus.AWAITING_HUMAN, None}
+)
+"""When to ask whether this job left a human review waiting.
+
+A handler's return value is *the transition it wants applied*, so when it
+returns `AWAITING_HUMAN` the worker knows exactly where the lead landed.
+`None` means something different and easy to misread: the handler applied its
+own transitions and the worker has **no idea** what status the lead ended on.
+
+That distinction was a real production bug. The condition here used to be
+`new_status is AWAITING_HUMAN` alone, which silently excluded the entire
+simulated path — `arie.jobs.handlers`' `compute_score` walks the state
+machine hop by hop and returns `None` by design — and simulated is the only
+mode the deployment runs. Leads reached `AWAITING_HUMAN` with a pending
+`human_reviews` row while the notification never fired, with nothing in the
+logs to say so.
+
+Including `None` is not a widened net so much as an admission of ignorance:
+the worker cannot answer the question from a return value, so it asks the
+database. `arie.review_notifications.notify_review_required` is built to be
+asked — it no-ops when there is no pending review, and its dedup insert makes
+a second ask (a retry, a reclaimed lease) send nothing. The cost of asking
+unnecessarily is one indexed lookup that returns no rows; the cost of not
+asking was a feature that never ran.
+"""
+
+
 @dataclass(frozen=True)
 class CycleResult:
     job_id: uuid.UUID
@@ -239,7 +267,7 @@ def _process_one(
 
                 conn.commit()
 
-            if new_status is LeadStatus.AWAITING_HUMAN and job.lead_id is not None:
+            if job.lead_id is not None and new_status in _MAY_HAVE_OPENED_A_REVIEW:
                 # Best-effort, after the transaction that opened the review
                 # has actually committed — see arie.review_notifications'
                 # own docstring for why this can never run inside it.
