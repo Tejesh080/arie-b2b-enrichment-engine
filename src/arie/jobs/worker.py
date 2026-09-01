@@ -24,16 +24,19 @@ import contextlib
 import signal
 import socket
 import threading
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from types import FrameType
 
 import psycopg
 from psycopg_pool import ConnectionPool
 
-from arie.config import DATABASE, RUNTIME
+from arie.config import DATABASE, RUNTIME, WORKER_HEARTBEAT
 from arie.core.types import LeadStatus
+from arie.jobs.heartbeat import beat, new_worker_instance_id
 from arie.jobs.queue import ClaimedJob, JobOwnershipError, PostgresJobQueue
 from arie.observability.tracing import (
     configure_tracing,
@@ -44,6 +47,7 @@ from arie.observability.tracing import (
     shutdown_tracing,
     traced,
 )
+from arie.review_notifications import notify_review_required
 from arie.statemachine.apply import OptimisticConcurrencyError, apply_transition
 from arie.statemachine.transitions import job_type_for
 
@@ -235,6 +239,12 @@ def _process_one(
 
                 conn.commit()
 
+            if new_status is LeadStatus.AWAITING_HUMAN and job.lead_id is not None:
+                # Best-effort, after the transaction that opened the review
+                # has actually committed — see arie.review_notifications'
+                # own docstring for why this can never run inside it.
+                notify_review_required(pool, lead_id=job.lead_id)
+
             span.set_attribute("arie.job.outcome", "done")
             return CycleResult(job_id=job.job_id, job_type=job.job_type, outcome="done")
 
@@ -381,11 +391,25 @@ def main() -> int:
     stop = threading.Event()
     install_graceful_shutdown(stop)
 
+    worker_instance_id = new_worker_instance_id()
+    started_at = datetime.now(UTC)
+    beat(pool, worker_instance_id=worker_instance_id, started_at=started_at)
+    last_heartbeat = time.monotonic()
+
     try:
         while not stop.is_set():
             for result in run_worker_cycle(queue, pool, handlers):
                 suffix = f" ({result.detail})" if result.detail else ""
                 print(f"{result.job_type} {result.job_id}: {result.outcome}{suffix}")
+
+            # Throttled independently of the poll interval (which can be as
+            # tight as 2s) so a busy worker doesn't hammer the heartbeat
+            # table every cycle — see arie.config.WorkerHeartbeatConfig.
+            now = time.monotonic()
+            if now - last_heartbeat >= WORKER_HEARTBEAT.interval_seconds:
+                beat(pool, worker_instance_id=worker_instance_id, started_at=started_at)
+                last_heartbeat = now
+
             # Interruptible: returns as soon as a signal sets `stop`, instead
             # of finishing out the full poll interval before noticing.
             stop.wait(RUNTIME.worker_poll_interval_sec)

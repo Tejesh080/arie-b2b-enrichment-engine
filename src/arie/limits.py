@@ -30,6 +30,7 @@ __all__ = [
     "enforce_lead_quota",
     "get_limits",
     "get_usage_against_limits",
+    "set_limits",
 ]
 
 
@@ -81,6 +82,40 @@ def get_limits(conn: psycopg.Connection, *, organization_id: UUID) -> Organizati
         max_csv_rows_per_upload=row[1],
         max_modeled_spend_usd_per_month=float(row[2]),
     )
+
+
+_SET_LIMITS = """
+    UPDATE organizations
+    SET max_leads_per_month = %(max_leads_per_month)s,
+        max_csv_rows_per_upload = %(max_csv_rows_per_upload)s,
+        max_modeled_spend_usd_per_month = %(max_modeled_spend_usd_per_month)s,
+        updated_at = now()
+    WHERE organization_id = %(organization_id)s
+"""
+
+
+def set_limits(
+    conn: psycopg.Connection, *, organization_id: UUID, limits: OrganizationLimits
+) -> None:
+    """Overwrite this organization's ceilings and commit. The one write path
+    onto these three columns other than the M4 defaults every organization
+    row is created with — Productization M6's
+    `arie.billing.plans.sync_organization_limits` calls this every time
+    billing state changes, so a plan's numbers (`arie.billing.plans
+    .PLAN_DEFINITIONS`) become the actual enforced ceiling without this
+    module's own enforcement functions changing at all.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            _SET_LIMITS,
+            {
+                "organization_id": organization_id,
+                "max_leads_per_month": limits.max_leads_per_month,
+                "max_csv_rows_per_upload": limits.max_csv_rows_per_upload,
+                "max_modeled_spend_usd_per_month": limits.max_modeled_spend_usd_per_month,
+            },
+        )
+    conn.commit()
 
 
 def _calendar_month_bounds(now: datetime) -> tuple[datetime, datetime]:

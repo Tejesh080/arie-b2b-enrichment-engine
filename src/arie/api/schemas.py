@@ -22,6 +22,7 @@ from arie.api.receipt import DecisionReceipt
 from arie.apikeys import SCOPES
 from arie.approval.workflow import ReviewAction
 from arie.auth import ROLES
+from arie.billing.service import PURCHASABLE_PLANS
 from arie.core.types import LeadStatus
 from arie.icp_profiles import InvalidICPConfigError, validate_config
 from arie.identity.normalize import normalize_domain, normalize_email
@@ -153,6 +154,19 @@ class HealthResponse(BaseModel):
     row. False while a deploy's migration step is still running, or hasn't
     run — a state that looks identical to ``database: True`` alone but needs
     a different fix (wait for migrations, not restart the process)."""
+
+
+class WorkerHealthResponse(BaseModel):
+    """`GET /healthz/worker` (Productization M6 Part 28). Deliberately
+    separate from `HealthResponse` — a worker fleet being down must never
+    change `/healthz`'s own status code, or a Better Stack monitor on the
+    API's liveness would flap for a problem the API process cannot fix."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    healthy: bool
+    active_workers: int
+    most_recent_heartbeat_at: datetime | None
 
 
 class ReviewResponse(BaseModel):
@@ -524,6 +538,116 @@ class OrganizationResponse(BaseModel):
     updated_at: datetime
 
 
+class CreateOrganizationRequest(BaseModel):
+    """`POST /organizations` (Productization M6 Part 10) — self-service
+    provisioning for an already-authenticated, already email-verified
+    Supabase user with no organization yet. Deliberately takes only a display
+    name: `organization_id`/`slug` are always server-generated
+    (`arie.provisioning.create_customer_organization`), so there is no field
+    here through which a caller could attach themselves to an existing
+    organization.
+    """
+
+    name: Annotated[str, Field(min_length=1, max_length=200)]
+    turnstile_token: str | None = None
+    """Cloudflare Turnstile response token (Part 12) — verified server-side
+    via `arie.turnstile.verify_turnstile_token`. `None` is accepted
+    unconditionally only when Turnstile isn't configured at all (dev/CI); see
+    that module's own docstring."""
+
+
+class CreateOrganizationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    organization_id: UUID
+    slug: str
+
+
+# --------------------------------------------------------------------- billing --
+#
+# Productization M6 Parts 2-9, 17-19. `GET /billing` and the Checkout/Portal
+# routes require an owner/admin JWT session (`_require_org_admin`) — Part 37's
+# "viewing billing: owner/admin by default" — and are refused for an API key
+# outright the same way `_require_org_admin` already refuses API keys for
+# every organization-management action.
+
+
+class EffectiveEntitlementsResponse(BaseModel):
+    """Mirrors `arie.billing.plans.EffectiveEntitlements` field for field."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    plan: str
+    max_leads_per_month: int
+    max_csv_rows_per_upload: int
+    max_modeled_spend_usd_per_month: float
+    max_members: int
+    live_provider_feature_allowed: bool
+
+
+class OrganizationBillingResponse(BaseModel):
+    """Mirrors `arie.billing.models.OrganizationBillingRecord`, minus
+    `last_event_created_at` (internal webhook-ordering bookkeeping — not
+    useful to a frontend)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    organization_id: UUID
+    stripe_customer_id: str | None
+    stripe_subscription_id: str | None
+    plan: str
+    status: str
+    current_period_start: datetime | None
+    current_period_end: datetime | None
+    cancel_at_period_end: bool
+    canceled_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class BillingResponse(BaseModel):
+    """`GET /billing`'s response — the raw Stripe-mirrored subscription state
+    alongside the resolved entitlements it currently maps to (Part 18: plan,
+    status, period dates, cancel-at-period-end, effective entitlements)."""
+
+    billing: OrganizationBillingResponse
+    entitlements: EffectiveEntitlementsResponse
+
+
+class StartCheckoutRequest(BaseModel):
+    """`POST /billing/checkout`. `plan` is validated against
+    `arie.billing.service.PURCHASABLE_PLANS` here so a client sending an
+    unpurchasable value (`internal`, or garbage) gets a clean 422 rather than
+    reaching `arie.billing.service.start_checkout`'s own runtime check. The
+    actual Stripe Price id is never client-supplied — see
+    `arie.billing.stripe_gateway`'s own docstring."""
+
+    plan: str
+    success_url: Annotated[str, Field(min_length=1, max_length=2000)]
+    cancel_url: Annotated[str, Field(min_length=1, max_length=2000)]
+
+    @field_validator("plan")
+    @classmethod
+    def _plan_is_purchasable(cls, value: str) -> str:
+        if value not in PURCHASABLE_PLANS:
+            raise ValueError(
+                f"unknown purchasable plan {value!r} — must be one of {list(PURCHASABLE_PLANS)}"
+            )
+        return value
+
+
+class CheckoutSessionResponse(BaseModel):
+    checkout_url: str
+
+
+class BillingPortalRequest(BaseModel):
+    return_url: Annotated[str, Field(min_length=1, max_length=2000)] | None = None
+
+
+class BillingPortalResponse(BaseModel):
+    portal_url: str
+
+
 class UpdateOrganizationRequest(BaseModel):
     """`PATCH /organization`. Every field is optional and, via
     `exclude_unset`, only the fields actually present in the request body
@@ -657,6 +781,13 @@ class InvitationResponse(BaseModel):
     expires_at: datetime
     accepted_at: datetime | None
     revoked_at: datetime | None
+    email_status: str
+    """Productization M6 Part 14 — `pending`/`sent`/`failed`, the delivery
+    status of the invitation email itself. Independent of `status`: an
+    invitation with `email_status == 'failed'` is still fully acceptable via
+    its accept URL."""
+    email_error: str | None
+    email_sent_at: datetime | None
 
 
 class InvitationCreatedResponse(InvitationResponse):
@@ -751,9 +882,12 @@ class OnboardingStatusResponse(BaseModel):
 
 
 class UsageAgainstLimitsResponse(BaseModel):
-    """Mirrors `arie.limits.UsageAgainstLimits` field for field."""
-
-    model_config = ConfigDict(from_attributes=True)
+    """`arie.limits.UsageAgainstLimits` plus plan/member context
+    (Productization M6 Part 23) — built explicitly in the route handler
+    (`GET /organization/limits`) from that dataclass and a freshly resolved
+    `arie.billing.plans.EffectiveEntitlements`, rather than
+    `model_validate`d off either alone, since no single object carries both.
+    """
 
     leads_used: int
     leads_limit: int
@@ -764,6 +898,9 @@ class UsageAgainstLimitsResponse(BaseModel):
     max_csv_rows_per_upload: int
     period_start: datetime
     period_end: datetime
+    plan: str
+    members_used: int
+    members_limit: int
 
 
 # --------------------------------------------------------------- CSV batches --

@@ -30,6 +30,7 @@ service = [
     "opentelemetry-instrumentation-fastapi>=0.46b0",
     "pyjwt[crypto]>=2.8",  # [crypto] pulls in `cryptography`, required for ES256 (Supabase's current signing-key algorithm)
     "python-multipart>=0.0.9",  # required by FastAPI for UploadFile/form parsing (POST /batches)
+    "stripe>=11.0",  # Productization M6 — the only module that imports this is arie.billing.stripe_gateway
 ]
 dev = [
     "pytest>=8.2",

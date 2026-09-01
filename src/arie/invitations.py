@@ -35,6 +35,7 @@ from psycopg.rows import dict_row
 
 from arie.audit import record_event
 from arie.auth import ROLES
+from arie.billing.plans import MemberQuotaExceededError, enforce_member_quota
 from arie.identity.normalize import normalize_email
 
 __all__ = [
@@ -45,11 +46,14 @@ __all__ = [
     "InvitationExpiredError",
     "InvitationNotFoundError",
     "InvitationRecord",
+    "MemberQuotaExceededError",
     "MismatchedInvitationEmailError",
     "accept_invitation",
     "create_invitation",
     "list_invitations",
+    "mark_invitation_email_status",
     "revoke_invitation",
+    "send_invitation_email",
 ]
 
 DEFAULT_EXPIRY = timedelta(days=7)
@@ -111,6 +115,13 @@ class InvitationRecord:
     expires_at: datetime
     accepted_at: datetime | None
     revoked_at: datetime | None
+    email_status: str
+    """`pending`/`sent`/`failed` — the *delivery* status of the invitation
+    email, independent of `status` (the invitation's own accept/revoke/expire
+    lifecycle). An invitation is fully usable even if `email_status ==
+    'failed'`; see :func:`send_invitation_email`."""
+    email_error: str | None
+    email_sent_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -132,6 +143,9 @@ def _row_to_record(row: Mapping[str, Any]) -> InvitationRecord:
         expires_at=row["expires_at"],
         accepted_at=row["accepted_at"],
         revoked_at=row["revoked_at"],
+        email_status=row["email_status"],
+        email_error=row["email_error"],
+        email_sent_at=row["email_sent_at"],
     )
 
 
@@ -147,7 +161,8 @@ _SELECT_PENDING_FOR_EMAIL = """
 
 _INVITATION_COLUMNS = """
     invitation_id, organization_id, email_normalized, role, status,
-    invited_by_user_id, created_at, expires_at, accepted_at, revoked_at
+    invited_by_user_id, created_at, expires_at, accepted_at, revoked_at,
+    email_status, email_error, email_sent_at
 """
 
 _INSERT_INVITATION = f"""
@@ -195,6 +210,11 @@ _MARK_EXPIRED = """
     WHERE invitation_id = %(invitation_id)s
 """
 
+_SELECT_ACTIVE_MEMBERSHIP = """
+    SELECT 1 FROM organization_members
+    WHERE organization_id = %(organization_id)s AND user_id = %(user_id)s AND status = 'active'
+"""
+
 _UPSERT_MEMBERSHIP = """
     INSERT INTO organization_members (organization_id, user_id, role, status, updated_at)
     VALUES (%(organization_id)s, %(user_id)s, %(role)s, 'active', now())
@@ -216,15 +236,20 @@ def create_invitation(
     role: str,
 ) -> GeneratedInvitation:
     """Validate, create, and commit. Raises :class:`InvalidInvitationRoleError`
-    for an unrecognised role and :class:`DuplicateInvitationError` if a
-    pending invitation already exists for this address — checked twice, once
-    as a pre-check (the common case, a clean error with no wasted round
-    trip) and once by catching the partial unique index's own violation (the
-    concurrent-request race the pre-check alone cannot close).
+    for an unrecognised role, :class:`~arie.billing.plans.MemberQuotaExceededError`
+    if this organization's plan is already at its member ceiling (Productization
+    M6 Part 21 — an invitation still counts against the ceiling even before
+    it's accepted, since accepting is normally a formality once invited), and
+    :class:`DuplicateInvitationError` if a pending invitation already exists
+    for this address — checked twice, once as a pre-check (the common case, a
+    clean error with no wasted round trip) and once by catching the partial
+    unique index's own violation (the concurrent-request race the pre-check
+    alone cannot close).
     """
     if role not in ROLES:
         raise InvalidInvitationRoleError(f"unknown role: {role!r}")
     email_normalized = normalize_email(email)
+    enforce_member_quota(conn, organization_id=organization_id)
 
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -325,8 +350,12 @@ def accept_invitation(
 
     Raises :class:`InvitationNotFoundError` (no matching / already-resolved
     token), :class:`InvitationExpiredError` (real, was pending, expired —
-    opportunistically marks it `expired` before raising), or
-    :class:`MismatchedInvitationEmailError` (real, live, wrong email).
+    opportunistically marks it `expired` before raising),
+    :class:`MismatchedInvitationEmailError` (real, live, wrong email), or
+    :class:`~arie.billing.plans.MemberQuotaExceededError` if accepting would
+    exceed the organization's plan (Productization M6 Part 21) — skipped for
+    a user who already holds an *active* membership (a re-invite/role-change
+    accept never consumes a new seat).
     """
     token_hash = _hash_token(raw_token)
     with conn.cursor(row_factory=dict_row) as cur:
@@ -346,6 +375,14 @@ def accept_invitation(
 
         if normalize_email(verified_email) != invitation.email_normalized:
             raise MismatchedInvitationEmailError()
+
+        cur.execute(
+            _SELECT_ACTIVE_MEMBERSHIP,
+            {"organization_id": invitation.organization_id, "user_id": user_id},
+        )
+        already_active_member = cur.fetchone() is not None
+        if not already_active_member:
+            enforce_member_quota(conn, organization_id=invitation.organization_id)
 
         cur.execute(
             _UPSERT_MEMBERSHIP,
@@ -377,3 +414,77 @@ def accept_invitation(
         final_row = cur.fetchone()
     assert final_row is not None
     return _row_to_record(final_row)
+
+
+_MARK_EMAIL_STATUS = """
+    UPDATE organization_invitations
+    SET email_status = %(email_status)s, email_error = %(email_error)s,
+        email_sent_at = CASE WHEN %(email_status)s = 'sent' THEN now() ELSE email_sent_at END
+    WHERE invitation_id = %(invitation_id)s
+"""
+
+
+def mark_invitation_email_status(
+    conn: psycopg.Connection, *, invitation_id: UUID, email_status: str, email_error: str | None
+) -> None:
+    """Record the outcome of one delivery attempt. Does not commit (matches
+    `arie.audit.record_event`'s own "always inside a caller's transaction"
+    contract) — :func:`send_invitation_email` is the one caller, and commits
+    once after this and its audit event land together.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            _MARK_EMAIL_STATUS,
+            {
+                "invitation_id": invitation_id,
+                "email_status": email_status,
+                "email_error": email_error,
+            },
+        )
+
+
+def send_invitation_email(
+    conn: psycopg.Connection,
+    *,
+    invitation: InvitationRecord,
+    organization_name: str,
+    inviter_email: str,
+    accept_url: str,
+) -> None:
+    """Send the invitation email and record delivery status + an audit event
+    (Productization M6 Part 14). Commits. **Never raises for a delivery
+    failure** — Part 14's explicit contract is "invitation may exist even if
+    email delivery fails"; the invitation itself was already created and
+    committed by :func:`create_invitation` before this is ever called, so a
+    failure here only means `email_status` ends up `'failed'` rather than
+    `'sent'`, with the raw token already gone (never touched by this
+    function — see the module docstring) and the invitation otherwise fully
+    usable via a resend or by sharing the accept URL out of band.
+    """
+    from arie.email import get_notifier  # local: keeps this table-owning module's
+
+    # import surface free of the email package for every caller that never
+    # sends (list/revoke/accept), matching arie.billing.service's own
+    # local-import discipline for optional side effects.
+    notifier = get_notifier()
+    result = notifier.send_invitation(
+        to_email=invitation.email_normalized,
+        organization_name=organization_name,
+        inviter_email=inviter_email,
+        role=invitation.role,
+        accept_url=accept_url,
+    )
+    mark_invitation_email_status(
+        conn,
+        invitation_id=invitation.invitation_id,
+        email_status="sent" if result.delivered else "failed",
+        email_error=None if result.delivered else result.error,
+    )
+    record_event(
+        conn,
+        organization_id=invitation.organization_id,
+        actor_user_id=invitation.invited_by_user_id,
+        event_type="invitation.email_sent" if result.delivered else "invitation.email_failed",
+        payload={"invitation_id": str(invitation.invitation_id)},
+    )
+    conn.commit()

@@ -23,7 +23,19 @@ from uuid import UUID
 import psycopg
 from psycopg.types.json import Jsonb
 
-__all__ = ["record_event"]
+__all__ = ["SYSTEM_ACTOR_ID", "record_event"]
+
+SYSTEM_ACTOR_ID: UUID = UUID("00000000-0000-0000-0000-000000000000")
+"""The nil UUID, standing in for `actor_user_id` on an event with no human
+behind it — Productization M6's Stripe webhook processing is the first
+caller (`arie.billing.service`): a `checkout.session.completed` or
+`customer.subscription.updated` delivery has no request-scoped user, only an
+already-authorized Stripe account acting on a subscription a real owner
+started. `actor_user_id` stays `NOT NULL` (`migrations/0024_organization
+_invitations.sql`) rather than becoming nullable — a fixed, recognizable
+sentinel is easier for an owner reading their own audit log to spot than a
+`NULL` that could otherwise be read as "unknown," and it never collides with
+a real Supabase `auth.users` id (all v4 UUIDs)."""
 
 _INSERT_EVENT = """
     INSERT INTO organization_audit_events (organization_id, actor_user_id, event_type, payload)

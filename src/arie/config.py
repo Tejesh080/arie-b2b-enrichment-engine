@@ -175,6 +175,14 @@ class SupabaseAuthConfig:
     """
 
     url: str = field(default_factory=lambda: os.getenv("SUPABASE_URL", "").rstrip("/"))
+    service_role_key: str = field(
+        default_factory=lambda: os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    )
+    """Used only by `arie.supabase_admin` (Productization M6) to resolve a
+    member's `user_id` to their account email for transactional notifications
+    — the Supabase Auth Admin API is the only source for that, since no table
+    in this database stores it. Never sent to a frontend, never logged; see
+    that module's own docstring."""
 
     @property
     def jwks_url(self) -> str:
@@ -666,6 +674,125 @@ class RuntimeConfig:
     job waits a few extra minutes to be reclaimed)."""
 
 
+@dataclass(frozen=True)
+class StripeConfig:
+    """Stripe payment/subscription authority config (Productization M6).
+
+    Nothing here is ever echoed by an API response or a frontend
+    `NEXT_PUBLIC_` variable — see `arie.billing.stripe_gateway`'s own
+    docstring for why every Stripe call is made from this server process
+    only, never the browser.
+    """
+
+    secret_key: str = field(default_factory=lambda: os.getenv("STRIPE_SECRET_KEY", ""))
+    webhook_secret: str = field(default_factory=lambda: os.getenv("STRIPE_WEBHOOK_SECRET", ""))
+    price_starter: str = field(default_factory=lambda: os.getenv("STRIPE_PRICE_STARTER", ""))
+    price_growth: str = field(default_factory=lambda: os.getenv("STRIPE_PRICE_GROWTH", ""))
+    price_pro: str = field(default_factory=lambda: os.getenv("STRIPE_PRICE_PRO", ""))
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.secret_key)
+
+    @property
+    def webhook_configured(self) -> bool:
+        return bool(self.webhook_secret)
+
+    def price_id_for_plan(self, plan: str) -> str | None:
+        """The env-configured Stripe Price id for an internal plan name, or
+        `None` if unset. **The only place a browser-submitted plan name is
+        ever translated into a Stripe price id** — see
+        `arie.billing.service.start_checkout`'s own docstring for why a
+        client-supplied price id is never trusted directly."""
+        return {
+            "starter": self.price_starter,
+            "growth": self.price_growth,
+            "pro": self.price_pro,
+        }.get(plan) or None
+
+
+@dataclass(frozen=True)
+class EmailConfig:
+    """Transactional email provider config (Productization M6 Part 13) —
+    AhaSend (`https://api.ahasend.com/v2/`). See `arie.email.ahasend` for the
+    HTTP client; `configured` gates whether it is used at all versus
+    `arie.email.fake.FakeEmailSender` (the default absent both values, safe
+    for local dev and CI — no email ever leaves the process)."""
+
+    ahasend_api_key: str = field(default_factory=lambda: os.getenv("AHASEND_API_KEY", ""))
+    ahasend_account_id: str = field(default_factory=lambda: os.getenv("AHASEND_ACCOUNT_ID", ""))
+    from_email: str = field(
+        default_factory=lambda: os.getenv("EMAIL_FROM_ADDRESS", "notifications@arie.invalid")
+    )
+    from_name: str = field(default_factory=lambda: os.getenv("EMAIL_FROM_NAME", "ARIE"))
+    timeout_seconds: float = field(
+        default_factory=lambda: _env_float("AHASEND_TIMEOUT_SECONDS", 10.0)
+    )
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.ahasend_api_key and self.ahasend_account_id)
+
+
+@dataclass(frozen=True)
+class TurnstileConfig:
+    """Cloudflare Turnstile config (Productization M6 Part 12) — abuse
+    protection for self-service organization provisioning. `site_key` is
+    public (safe for the frontend widget); `secret_key` never is.
+    `configured` being `False` (no account set up yet) is a deliberate,
+    documented dev/CI bypass — see `arie.turnstile`'s own docstring — never a
+    silent bypass in an environment where it *is* configured."""
+
+    secret_key: str = field(default_factory=lambda: os.getenv("TURNSTILE_SECRET_KEY", ""))
+    site_key: str = field(default_factory=lambda: os.getenv("TURNSTILE_SITE_KEY", ""))
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.secret_key)
+
+
+@dataclass(frozen=True)
+class FrontendConfig:
+    """Where the customer-facing console is hosted — used only to build
+    absolute links in transactional email (an invitation accept URL, a
+    review-required URL) when the caller doesn't supply its own return URL.
+    Not a secret; not read by any provider-selection or scoring code."""
+
+    base_url: str = field(default_factory=lambda: os.getenv("FRONTEND_BASE_URL", "").rstrip("/"))
+
+
+@dataclass(frozen=True)
+class NotificationConfig:
+    """Thresholds/cadence for `arie.email` notification triggers — centralized
+    per Productization M6 Part 15's "pick a sensible threshold... but
+    centralize/configure it" instruction."""
+
+    usage_warning_threshold: float = field(
+        default_factory=lambda: _env_float("USAGE_WARNING_THRESHOLD_PCT", 0.8)
+    )
+    """Fraction of a monthly limit (leads or modeled spend) that triggers one
+    `send_usage_warning` email per organization per calendar month — see
+    `arie.billing.notifications` for the dedup rule."""
+
+
+@dataclass(frozen=True)
+class WorkerHeartbeatConfig:
+    """Productization M6 Part 28 — a lightweight, DB-backed "is a worker
+    process actually alive" signal, independent of `/healthz` (which only
+    proves the API can reach the database, not that anything is consuming
+    the job queue)."""
+
+    interval_seconds: float = field(
+        default_factory=lambda: _env_float("WORKER_HEARTBEAT_INTERVAL_SECONDS", 15.0)
+    )
+    stale_after_seconds: float = field(
+        default_factory=lambda: _env_float("WORKER_HEARTBEAT_STALE_AFTER_SECONDS", 60.0)
+    )
+    """How long since the last heartbeat before `GET /healthz/worker` reports
+    the worker as down. Generous relative to `interval_seconds` (4x default)
+    so one slow poll cycle under load doesn't flap the monitor."""
+
+
 # Module-level singletons for convenience. Construct fresh instances directly
 # (e.g. `PolicyConfig()`) when a test needs to observe patched environment values.
 POLICY = PolicyConfig()
@@ -680,3 +807,9 @@ HUNTER = HunterConfig()
 LIVE_STRATEGY = LiveStrategyConfig()
 LIVE_OUTCOME_CACHE = LiveOutcomeCacheConfig()
 LIVE_BUDGET = LiveBudgetConfig()
+STRIPE = StripeConfig()
+EMAIL = EmailConfig()
+TURNSTILE = TurnstileConfig()
+FRONTEND = FrontendConfig()
+NOTIFICATIONS = NotificationConfig()
+WORKER_HEARTBEAT = WorkerHeartbeatConfig()

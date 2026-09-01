@@ -46,9 +46,16 @@ from arie.api.schemas import (
     BatchResponse,
     BatchRowResponse,
     BatchRowsPageResponse,
+    BillingPortalRequest,
+    BillingPortalResponse,
+    BillingResponse,
+    CheckoutSessionResponse,
     CreateApiKeyRequest,
     CreateICPProfileRequest,
     CreateInvitationRequest,
+    CreateOrganizationRequest,
+    CreateOrganizationResponse,
+    EffectiveEntitlementsResponse,
     HealthResponse,
     ICPProfileResponse,
     IngestLeadRequest,
@@ -59,6 +66,7 @@ from arie.api.schemas import (
     LeadResponse,
     MemberResponse,
     OnboardingStatusResponse,
+    OrganizationBillingResponse,
     OrganizationResponse,
     ProviderStatusResponse,
     ReceiptResponse,
@@ -67,11 +75,13 @@ from arie.api.schemas import (
     ReviewResponse,
     SetProviderCredentialRequest,
     SetProviderEnabledRequest,
+    StartCheckoutRequest,
     UpdateExecutionModeRequest,
     UpdateMemberRoleRequest,
     UpdateOrganizationRequest,
     UsageAgainstLimitsResponse,
     UsageSummaryResponse,
+    WorkerHealthResponse,
 )
 from arie.apikeys import create_api_key, list_api_keys, looks_like_api_key, revoke_api_key
 from arie.approval.workflow import (
@@ -103,7 +113,20 @@ from arie.batches import (
     list_batches,
     parse_csv,
 )
-from arie.config import DATABASE, OBSERVABILITY
+from arie.billing.plans import (
+    MemberQuotaExceededError,
+    resolve_organization_entitlements,
+)
+from arie.billing.repository import get_billing
+from arie.billing.service import (
+    NoStripeCustomerError,
+    PurchasableUnknownPlanError,
+    open_billing_portal,
+    process_webhook_event,
+    start_checkout,
+)
+from arie.billing.stripe_gateway import StripeNotConfiguredError, UnknownPlanError
+from arie.config import DATABASE, FRONTEND, OBSERVABILITY
 from arie.credential_resolver import resolve_provider_credential
 from arie.icp_profiles import (
     create_profile as create_icp_profile_row,
@@ -116,6 +139,7 @@ from arie.icp_profiles import (
 from arie.identity.resolver import IdentityResolver
 from arie.invitations import (
     DuplicateInvitationError,
+    GeneratedInvitation,
     InvalidInvitationRoleError,
     InvitationExpiredError,
     InvitationNotFoundError,
@@ -124,7 +148,9 @@ from arie.invitations import (
     create_invitation,
     list_invitations,
     revoke_invitation,
+    send_invitation_email,
 )
+from arie.jobs.heartbeat import fleet_status
 from arie.jobs.queue import PostgresJobQueue
 from arie.ledger.store import PostgresCostLedger
 from arie.limits import (
@@ -162,8 +188,16 @@ from arie.provider_configs import (
     set_provider_enabled,
 )
 from arie.provider_testing import ConnectionTestResult, test_connection
+from arie.provisioning import (
+    InvalidOrganizationNameError,
+    SlugGenerationExhaustedError,
+    create_customer_organization,
+)
 from arie.statemachine.apply import OptimisticConcurrencyError
+from arie.supabase_admin import get_user_email
+from arie.turnstile import verify_turnstile_token
 from arie.usage import get_usage_summary
+from arie.usage_notifications import check_and_notify_usage
 
 _LOGGER = logging.getLogger("arie.api")
 
@@ -469,6 +503,31 @@ def _to_batch_response(record: BatchRecord, progress: BatchProgress) -> BatchRes
     )
 
 
+def _dispatch_invitation_email(
+    state: AppState, auth: AuthContext, generated: GeneratedInvitation
+) -> None:
+    """Best-effort side effect after `create_invitation`/`resend_invitation
+    _endpoint`'s own transaction has already committed the invitation row
+    itself (Productization M6 Part 14 — the invitation must exist regardless
+    of whether the email attempt succeeds). `send_invitation_email` never
+    raises for a delivery failure; this wrapper exists only to resolve the
+    organization name and inviter email the route handlers don't otherwise
+    need."""
+    assert auth.user_id is not None  # every caller is _require_org_admin-gated
+    with state.pool.connection() as conn:
+        organization = get_organization(conn, organization_id=auth.organization_id)
+        assert organization is not None
+        inviter_email = get_user_email(auth.user_id) or "An ARIE administrator"
+        accept_url = f"{FRONTEND.base_url}/invitations/accept?token={generated.raw_token}"
+        send_invitation_email(
+            conn,
+            invitation=generated.record,
+            organization_name=organization.name,
+            inviter_email=inviter_email,
+            accept_url=accept_url,
+        )
+
+
 def register_routes(app: FastAPI) -> None:
     @app.get("/healthz", response_model=HealthResponse)
     def healthz(state: StateDep) -> Response:
@@ -517,6 +576,20 @@ def register_routes(app: FastAPI) -> None:
             content=body.model_dump_json(), media_type="application/json", status_code=code
         )
 
+    @app.get("/healthz/worker", response_model=WorkerHealthResponse)
+    def worker_healthz(state: StateDep) -> WorkerHealthResponse:
+        """Productization M6 Part 28/34. Deliberately unauthenticated (same
+        as `/healthz` — an infra liveness probe has no caller identity) and
+        deliberately never folded into `/healthz`'s own status code: a dead
+        worker fleet is a real operational problem, but it must not flap the
+        API's own liveness monitor, which can do nothing to fix it. Reads
+        `worker_heartbeats`, written by every `arie.jobs.worker.main` process
+        roughly every `WORKER_HEARTBEAT_INTERVAL_SECONDS`.
+        """
+        with state.pool.connection() as conn:
+            result = fleet_status(conn)
+        return WorkerHealthResponse.model_validate(result)
+
     @app.post(
         "/leads",
         response_model=IngestLeadResponse,
@@ -546,6 +619,15 @@ def register_routes(app: FastAPI) -> None:
                 command=payload.to_command(organization_id=auth.organization_id),
             )
             conn.commit()
+
+        if result.created:
+            # Best-effort, on a fresh connection after this request's own
+            # transaction has committed — see arie.usage_notifications' own
+            # docstring for why it must never fail the ingestion response.
+            with state.pool.connection() as usage_conn:
+                check_and_notify_usage(
+                    usage_conn, organization_id=auth.organization_id, now=datetime.now(UTC)
+                )
 
         # 200 rather than 201 for a duplicate: the request was accepted and the
         # lead exists, but this call did not create it. A caller retrying a
@@ -687,6 +769,148 @@ def register_routes(app: FastAPI) -> None:
             already_applied=result.already_applied,
         )
 
+    # ------------------------------------------------------- provisioning --
+    #
+    # Productization M6 Parts 10/11/12. Self-service organization creation
+    # for an already-authenticated, already email-verified Supabase user —
+    # `IdentityDep`, not `AuthDep`, the same "no organization membership
+    # required yet" auth boundary `POST /invitations/accept` uses, and for
+    # the identical reason.
+
+    @app.post(
+        "/organizations",
+        response_model=CreateOrganizationResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_organization_endpoint(
+        payload: CreateOrganizationRequest, request: Request, state: StateDep, identity: IdentityDep
+    ) -> CreateOrganizationResponse:
+        client_ip = request.client.host if request.client else None
+        if not verify_turnstile_token(payload.turnstile_token, remote_ip=client_ip):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="CAPTCHA verification failed"
+            )
+        try:
+            with _transaction(state.pool) as conn:
+                result = create_customer_organization(
+                    conn, owner_user_id=identity.user_id, organization_name=payload.name
+                )
+        except InvalidOrganizationNameError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+        except SlugGenerationExhaustedError as exc:  # pragma: no cover - vanishingly unlikely
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
+        return CreateOrganizationResponse.model_validate(result)
+
+    # ------------------------------------------------------------- billing --
+    #
+    # Productization M6 Parts 2-9/17-19/25-26. `GET /billing` and the
+    # Checkout/Portal routes require an owner/admin JWT session — billing
+    # management is never available to an analyst_reviewer or any API key,
+    # matching Part 37 exactly. `POST /billing/webhook` is the one
+    # unauthenticated route in this whole API besides `/healthz*`: Stripe
+    # itself is the caller, and `arie.billing.service.process_webhook_event`
+    # is what actually authenticates the request, via signature
+    # verification — see that function's own docstring.
+
+    @app.get("/billing", response_model=BillingResponse)
+    def get_billing_endpoint(state: StateDep, auth: AuthDep) -> BillingResponse:
+        _require_org_admin(auth)
+        with state.pool.connection() as conn:
+            billing = get_billing(conn, organization_id=auth.organization_id)
+            entitlements = resolve_organization_entitlements(
+                conn, organization_id=auth.organization_id
+            )
+        return BillingResponse(
+            billing=OrganizationBillingResponse.model_validate(billing),
+            entitlements=EffectiveEntitlementsResponse.model_validate(entitlements),
+        )
+
+    @app.post("/billing/checkout", response_model=CheckoutSessionResponse)
+    def start_checkout_endpoint(
+        payload: StartCheckoutRequest, state: StateDep, auth: AuthDep
+    ) -> CheckoutSessionResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        actor_email = get_user_email(auth.user_id)
+        if actor_email is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="could not resolve the caller's account email",
+            )
+        try:
+            with _transaction(state.pool) as conn:
+                checkout_url = start_checkout(
+                    conn,
+                    organization_id=auth.organization_id,
+                    actor_user_id=auth.user_id,
+                    actor_email=actor_email,
+                    plan=payload.plan,
+                    success_url=payload.success_url,
+                    cancel_url=payload.cancel_url,
+                )
+        except PurchasableUnknownPlanError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+        except (StripeNotConfiguredError, UnknownPlanError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
+        return CheckoutSessionResponse(checkout_url=checkout_url)
+
+    @app.post("/billing/portal", response_model=BillingPortalResponse)
+    def open_billing_portal_endpoint(
+        payload: BillingPortalRequest, state: StateDep, auth: AuthDep
+    ) -> BillingPortalResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        try:
+            with _transaction(state.pool) as conn:
+                portal_url = open_billing_portal(
+                    conn,
+                    organization_id=auth.organization_id,
+                    actor_user_id=auth.user_id,
+                    return_url=payload.return_url,
+                )
+        except NoStripeCustomerError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except StripeNotConfiguredError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
+        return BillingPortalResponse(portal_url=portal_url)
+
+    @app.post("/billing/webhook", include_in_schema=False)
+    async def stripe_webhook_endpoint(request: Request, state: StateDep) -> Response:
+        """`async def`, the one deliberate exception to this module's
+        sync-handler convention (see the module docstring). Webhook traffic
+        is low-volume and Stripe's own signature verification needs the
+        exact raw bytes Starlette received — `await request.body()` is only
+        reachable from an async route — so the small amount of blocking DB
+        work `process_webhook_event` does runs directly on the event loop
+        here rather than being threaded through `run_in_threadpool` for one
+        endpoint. Status codes are Stripe's own retry contract: 400 for a
+        signature that doesn't verify, 200 for anything processed
+        (including a harmlessly-ignored or already-seen event), 500 for a
+        transient failure worth Stripe retrying.
+        """
+        raw_body = await request.body()
+        signature_header = request.headers.get("stripe-signature", "")
+        result = process_webhook_event(
+            state.pool, raw_body=raw_body, signature_header=signature_header
+        )
+        return (
+            _json_error(result.status_code, result.detail)
+            if result.status_code != 200
+            else Response(
+                content='{"received": true}', media_type="application/json", status_code=200
+            )
+        )
+
     # -------------------------------------------------- organization settings --
     #
     # Productization M4 Part 1. Same permission split as ICP configuration
@@ -739,9 +963,26 @@ def register_routes(app: FastAPI) -> None:
         this ever reaches `set_execution_mode`, so the `InvalidExecutionMode
         Error` branch below only guards a race no request-time validation
         can catch on its own.
+
+        Productization M6 Part 20: moving away from `simulated` additionally
+        requires this organization's plan to entitle it to live provider
+        features (`arie.billing.plans.is_live_provider_feature_allowed`) —
+        checked *alongside*, never instead of, every M5 execution-safety
+        guard. A billing entitlement can make this route reachable; it can
+        never itself place a real provider call.
         """
         _require_org_admin(auth)
         assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        if payload.execution_mode != "simulated":
+            with state.pool.connection() as entitlement_conn:
+                entitlements = resolve_organization_entitlements(
+                    entitlement_conn, organization_id=auth.organization_id
+                )
+            if not entitlements.live_provider_feature_allowed:
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail=f"the {entitlements.plan} plan does not include live provider execution",
+                )
         try:
             with _transaction(state.pool) as conn:
                 record = set_execution_mode(
@@ -876,6 +1117,11 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
             ) from exc
+        except MemberQuotaExceededError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(exc)
+            ) from exc
+        _dispatch_invitation_email(state, auth, generated)
         base = InvitationResponse.model_validate(generated.record)
         return InvitationCreatedResponse(**base.model_dump(), raw_token=generated.raw_token)
 
@@ -898,6 +1144,47 @@ def register_routes(app: FastAPI) -> None:
             )
         return InvitationResponse.model_validate(record)
 
+    @app.post(
+        "/organization/invitations/{invitation_id}/resend",
+        response_model=InvitationCreatedResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def resend_invitation_endpoint(
+        invitation_id: UUID, state: StateDep, auth: AuthDep
+    ) -> InvitationCreatedResponse:
+        """Productization M6 Part 14 ("allow resend by creating/reissuing
+        safely"). A raw invitation token is never persisted (see
+        `arie.invitations`' own docstring), so a literal resend of the same
+        link is impossible by design — this revokes the existing pending
+        invitation and issues a fresh one for the same email/role, which is
+        the safe reissue the brief asks for. 404s for anything not currently
+        `pending`, the same as `DELETE .../invitations/{id}` does.
+        """
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        with _transaction(state.pool) as conn:
+            existing = revoke_invitation(
+                conn,
+                organization_id=auth.organization_id,
+                invitation_id=invitation_id,
+                actor_user_id=auth.user_id,
+            )
+            if existing is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="no pending invitation with that id",
+                )
+            generated = create_invitation(
+                conn,
+                organization_id=auth.organization_id,
+                invited_by_user_id=auth.user_id,
+                email=existing.email_normalized,
+                role=existing.role,
+            )
+        _dispatch_invitation_email(state, auth, generated)
+        base = InvitationResponse.model_validate(generated.record)
+        return InvitationCreatedResponse(**base.model_dump(), raw_token=generated.raw_token)
+
     @app.post("/invitations/accept", response_model=InvitationResponse)
     def accept_invitation_endpoint(
         payload: AcceptInvitationRequest, state: StateDep, identity: IdentityDep
@@ -916,6 +1203,10 @@ def register_routes(app: FastAPI) -> None:
             ) from exc
         except InvitationExpiredError as exc:
             raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(exc)) from exc
+        except MemberQuotaExceededError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(exc)
+            ) from exc
         except MismatchedInvitationEmailError as exc:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -962,8 +1253,23 @@ def register_routes(app: FastAPI) -> None:
         state: StateDep,
         auth: AuthDep,
     ) -> ProviderStatusResponse:
+        """Productization M6 Part 20: configuring a BYOK credential requires
+        the same plan entitlement `PATCH /organization/execution-mode`
+        requires for going live — see that route's own docstring for why
+        this is additive to, never a substitute for, M5's execution-safety
+        guards.
+        """
         _require_org_admin(auth)
         assert auth.user_id is not None  # guaranteed by is_org_admin()'s auth_method == "jwt" check
+        with state.pool.connection() as entitlement_conn:
+            entitlements = resolve_organization_entitlements(
+                entitlement_conn, organization_id=auth.organization_id
+            )
+        if not entitlements.live_provider_feature_allowed:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail=f"the {entitlements.plan} plan does not include live provider configuration",
+            )
         try:
             with _transaction(state.pool) as conn:
                 record = set_provider_credential(
@@ -1093,12 +1399,35 @@ def register_routes(app: FastAPI) -> None:
 
     @app.get("/organization/limits", response_model=UsageAgainstLimitsResponse)
     def get_limits_endpoint(state: StateDep, auth: AuthDep) -> UsageAgainstLimitsResponse:
+        """Productization M6 Part 23 added `plan`/`members_used`/
+        `members_limit` alongside the M4 usage figures — built explicitly
+        from two separately computed objects (`arie.limits
+        .get_usage_against_limits`, `arie.billing.plans
+        .resolve_organization_entitlements`) plus an active-member count,
+        rather than a single `model_validate`."""
         _require_jwt_session(auth)
         with state.pool.connection() as conn:
-            result = get_usage_against_limits(
+            usage = get_usage_against_limits(
                 conn, organization_id=auth.organization_id, now=datetime.now(UTC)
             )
-        return UsageAgainstLimitsResponse.model_validate(result)
+            entitlements = resolve_organization_entitlements(
+                conn, organization_id=auth.organization_id
+            )
+            members_used = len(list_members(conn, organization_id=auth.organization_id))
+        return UsageAgainstLimitsResponse(
+            leads_used=usage.leads_used,
+            leads_limit=usage.leads_limit,
+            leads_remaining=usage.leads_remaining,
+            modeled_spend_used_usd=usage.modeled_spend_used_usd,
+            modeled_spend_limit_usd=usage.modeled_spend_limit_usd,
+            modeled_spend_remaining_usd=usage.modeled_spend_remaining_usd,
+            max_csv_rows_per_upload=usage.max_csv_rows_per_upload,
+            period_start=usage.period_start,
+            period_end=usage.period_end,
+            plan=entitlements.plan,
+            members_used=members_used,
+            members_limit=entitlements.max_members,
+        )
 
     # ------------------------------------------------------- icp profiles --
     #
@@ -1237,6 +1566,11 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
             ) from exc
+
+        with state.pool.connection() as usage_conn:
+            check_and_notify_usage(
+                usage_conn, organization_id=auth.organization_id, now=datetime.now(UTC)
+            )
         return _to_batch_response(record, progress)
 
     @app.get("/batches", response_model=list[BatchResponse])

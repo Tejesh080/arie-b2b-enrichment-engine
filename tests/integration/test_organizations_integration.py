@@ -295,9 +295,31 @@ def test_default_execution_mode_is_simulated(api_client: TestClient) -> None:
     assert body["execution_mode"] == "simulated"
 
 
-def test_owner_can_change_execution_mode(
-    api_client_org_b: TestClient, db_conn: psycopg.Connection
+def _grant_live_provider_entitlement(
+    db_conn: psycopg.Connection, organization_id: uuid.UUID
 ) -> None:
+    """`migrations/0033`'s trigger gives every organization (including
+    `other_org`) a `plan='starter'`/`status='none'` billing row —
+    Productization M6's UNSUBSCRIBED floor, which does not entitle live
+    provider execution (Part 20). This suite tests execution-mode CRUD/
+    audit/tenancy, not billing gating (see
+    tests/integration/test_billing_integration.py for that), so tests that
+    exercise a genuine mode change grant the `internal` plan's unconditional
+    entitlement first.
+    """
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE organization_billing SET plan = 'internal', status = 'active' "
+            "WHERE organization_id = %s",
+            (organization_id,),
+        )
+    db_conn.commit()
+
+
+def test_owner_can_change_execution_mode(
+    api_client_org_b: TestClient, other_org: uuid.UUID, db_conn: psycopg.Connection
+) -> None:
+    _grant_live_provider_entitlement(db_conn, other_org)
     response = api_client_org_b.patch(
         "/organization/execution-mode", json={"execution_mode": "live_shadow"}
     )
@@ -311,6 +333,7 @@ def test_owner_can_change_execution_mode(
 def test_changing_execution_mode_is_audited(
     api_client_org_b: TestClient, other_org: uuid.UUID, db_conn: psycopg.Connection
 ) -> None:
+    _grant_live_provider_entitlement(db_conn, other_org)
     api_client_org_b.patch(
         "/organization/execution-mode", json={"execution_mode": "live_human_only"}
     )
@@ -373,8 +396,9 @@ def test_an_api_key_cannot_change_execution_mode(
 
 
 def test_changing_execution_mode_cannot_reach_another_organization(
-    api_client_org_b: TestClient,
+    api_client_org_b: TestClient, other_org: uuid.UUID, db_conn: psycopg.Connection
 ) -> None:
+    _grant_live_provider_entitlement(db_conn, other_org)
     before = api_client_org_b.get("/organization").json()
 
     response = api_client_org_b.patch(

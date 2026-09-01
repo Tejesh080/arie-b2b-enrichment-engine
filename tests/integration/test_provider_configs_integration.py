@@ -128,6 +128,19 @@ def _insert_org(db_conn: psycopg.Connection, organization_id: uuid.UUID) -> None
             "VALUES (%s, %s, %s, 'active')",
             (organization_id, "Provider Config Test Org", f"pc-test-{organization_id.hex[:10]}"),
         )
+        # migrations/0033's trigger gives every new organization a
+        # plan='starter'/status='none' billing row (Productization M6) — the
+        # UNSUBSCRIBED entitlement floor, which does not allow live provider
+        # configuration (Part 20). This file tests provider-config CRUD/
+        # tenancy, not billing gating (that's covered by
+        # tests/integration/test_billing_integration.py), so every org this
+        # helper creates is granted the `internal` plan's unconditional
+        # entitlement.
+        cur.execute(
+            "UPDATE organization_billing SET plan = 'internal', status = 'active' "
+            "WHERE organization_id = %s",
+            (organization_id,),
+        )
     db_conn.commit()
 
 
