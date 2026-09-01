@@ -18,6 +18,7 @@ added this note) — keep it fake.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import psycopg
@@ -61,7 +62,7 @@ def _insert_call(
 
 
 @pytest.fixture
-def pool(migrated_database: str) -> ConnectionPool:
+def pool(migrated_database: str) -> Iterator[ConnectionPool]:
     with ConnectionPool(migrated_database, min_size=1, max_size=4, open=True) as pool:
         yield pool
 
@@ -200,8 +201,9 @@ def test_the_advisory_lock_key_serializes_same_organization_same_provider(
             contender.cursor() as cur,
         ):
             cur.execute(try_lock_sql, {"organization_id": org_id, "provider": _PROVIDER})
-            (acquired_same_key,) = cur.fetchone()
-            assert acquired_same_key is False
+            same_key_row = cur.fetchone()
+            assert same_key_row is not None
+            assert same_key_row[0] is False
 
         # A different provider for the SAME organization is a different key
         # and must not be blocked.
@@ -213,8 +215,9 @@ def test_the_advisory_lock_key_serializes_same_organization_same_provider(
                 try_lock_sql,
                 {"organization_id": org_id, "provider": "hunter_combined_enrichment"},
             )
-            (acquired_different_provider,) = cur.fetchone()
-            assert acquired_different_provider is True
+            different_provider_row = cur.fetchone()
+            assert different_provider_row is not None
+            assert different_provider_row[0] is True
     finally:
         holder.rollback()  # releases the advisory xact lock
         holder.close()

@@ -33,6 +33,7 @@ from arie.billing.repository import (
 )
 from arie.config import FRONTEND, STRIPE
 from arie.email import get_notifier
+from arie.observability.tracing import get_tracer, record_error, set_attributes, traced
 from arie.organizations import get_organization
 
 __all__ = [
@@ -47,6 +48,7 @@ __all__ = [
 ]
 
 _LOGGER = logging.getLogger("arie.billing")
+_TRACER = get_tracer("arie.billing")
 
 PURCHASABLE_PLANS = ("starter", "growth", "pro")
 """`internal` is deliberately excluded — it is grandfathered, never sold
@@ -85,37 +87,42 @@ def start_checkout(
     if plan not in PURCHASABLE_PLANS:
         raise PurchasableUnknownPlanError(f"unknown purchasable plan: {plan!r}")
 
-    organization = get_organization(conn, organization_id=organization_id)
-    assert organization is not None
-    billing = get_billing(conn, organization_id=organization_id)
+    with traced(
+        _TRACER,
+        "billing.checkout.start",
+        attributes={"arie.organization_id": organization_id, "arie.plan": plan},
+    ):
+        organization = get_organization(conn, organization_id=organization_id)
+        assert organization is not None
+        billing = get_billing(conn, organization_id=organization_id)
 
-    customer_id = stripe_gateway.get_or_create_customer(
-        existing_customer_id=billing.stripe_customer_id,
-        email=actor_email,
-        organization_id=str(organization_id),
-        organization_name=organization.name,
-    )
-    if customer_id != billing.stripe_customer_id:
-        update_billing_stripe_customer(
-            conn, organization_id=organization_id, stripe_customer_id=customer_id
+        customer_id = stripe_gateway.get_or_create_customer(
+            existing_customer_id=billing.stripe_customer_id,
+            email=actor_email,
+            organization_id=str(organization_id),
+            organization_name=organization.name,
         )
+        if customer_id != billing.stripe_customer_id:
+            update_billing_stripe_customer(
+                conn, organization_id=organization_id, stripe_customer_id=customer_id
+            )
 
-    session = stripe_gateway.create_checkout_session(
-        customer_id=customer_id,
-        plan=plan,
-        organization_id=str(organization_id),
-        success_url=success_url,
-        cancel_url=cancel_url,
-    )
-    record_event(
-        conn,
-        organization_id=organization_id,
-        actor_user_id=actor_user_id,
-        event_type="billing.checkout_started",
-        payload={"plan": plan, "checkout_session_id": session.session_id},
-    )
-    conn.commit()
-    return session.url
+        session = stripe_gateway.create_checkout_session(
+            customer_id=customer_id,
+            plan=plan,
+            organization_id=str(organization_id),
+            success_url=success_url,
+            cancel_url=cancel_url,
+        )
+        record_event(
+            conn,
+            organization_id=organization_id,
+            actor_user_id=actor_user_id,
+            event_type="billing.checkout_started",
+            payload={"plan": plan, "checkout_session_id": session.session_id},
+        )
+        conn.commit()
+        return session.url
 
 
 def open_billing_portal(
@@ -130,23 +137,28 @@ def open_billing_portal(
     out. Does **not** touch any entitlement (Part 25) — only a subsequent
     webhook from an action the customer takes inside the Portal does.
     """
-    billing = get_billing(conn, organization_id=organization_id)
-    if billing.stripe_customer_id is None:
-        raise NoStripeCustomerError(f"organization {organization_id} has no Stripe customer yet")
+    with traced(
+        _TRACER, "billing.portal.open", attributes={"arie.organization_id": organization_id}
+    ):
+        billing = get_billing(conn, organization_id=organization_id)
+        if billing.stripe_customer_id is None:
+            raise NoStripeCustomerError(
+                f"organization {organization_id} has no Stripe customer yet"
+            )
 
-    session = stripe_gateway.create_portal_session(
-        customer_id=billing.stripe_customer_id,
-        return_url=return_url or f"{FRONTEND.base_url}/settings/billing",
-    )
-    record_event(
-        conn,
-        organization_id=organization_id,
-        actor_user_id=actor_user_id,
-        event_type="billing.portal_opened",
-        payload={},
-    )
-    conn.commit()
-    return session.url
+        session = stripe_gateway.create_portal_session(
+            customer_id=billing.stripe_customer_id,
+            return_url=return_url or f"{FRONTEND.base_url}/settings/billing",
+        )
+        record_event(
+            conn,
+            organization_id=organization_id,
+            actor_user_id=actor_user_id,
+            event_type="billing.portal_opened",
+            payload={},
+        )
+        conn.commit()
+        return session.url
 
 
 HANDLED_EVENT_TYPES = frozenset(
@@ -261,7 +273,26 @@ def process_webhook_event(
     this handler ultimately couldn't act on, e.g. an unmapped price)
     deliberately stops Stripe from retrying a delivery that would only ever
     fail the same way.
+
+    A thin tracing wrapper around :func:`_process_webhook_event_impl` (Part
+    27) — kept separate so the implementation's own early-return control
+    flow (several legitimate 200s before an organization or event type is
+    even known) never has to be re-indented under a `with` block just to
+    carry a span.
     """
+    with traced(_TRACER, "billing.webhook.process") as span:
+        result = _process_webhook_event_impl(
+            pool, raw_body=raw_body, signature_header=signature_header
+        )
+        set_attributes(span, {"arie.webhook.status_code": result.status_code})
+        if result.status_code >= 500:
+            record_error(span, result.detail)
+        return result
+
+
+def _process_webhook_event_impl(
+    pool: ConnectionPool, *, raw_body: bytes, signature_header: str
+) -> WebhookProcessResult:
     try:
         event = stripe_gateway.construct_event(raw_body=raw_body, signature_header=signature_header)
     except stripe_gateway.StripeWebhookSignatureError as exc:

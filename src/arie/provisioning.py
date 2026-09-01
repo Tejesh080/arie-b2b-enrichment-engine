@@ -32,6 +32,7 @@ import psycopg
 
 from arie.audit import record_event
 from arie.billing.plans import sync_organization_limits
+from arie.observability.tracing import get_tracer, traced
 
 __all__ = [
     "InvalidOrganizationNameError",
@@ -42,6 +43,7 @@ __all__ = [
 
 _SLUGIFY_RE = re.compile(r"[^a-z0-9]+")
 _MAX_SLUG_ATTEMPTS = 8
+_TRACER = get_tracer("arie.provisioning")
 
 
 class InvalidOrganizationNameError(ValueError):
@@ -92,6 +94,15 @@ def create_customer_organization(
     empty name, :class:`SlugGenerationExhaustedError` on the (effectively
     unreachable) exhaustion of retry attempts.
     """
+    with traced(_TRACER, "organization.provision"):
+        return _create_customer_organization_impl(
+            conn, owner_user_id=owner_user_id, organization_name=organization_name
+        )
+
+
+def _create_customer_organization_impl(
+    conn: psycopg.Connection, *, owner_user_id: UUID, organization_name: str
+) -> ProvisioningResult:
     name = organization_name.strip()
     if not name:
         raise InvalidOrganizationNameError("organization name must not be empty")

@@ -12,6 +12,7 @@ and cannot exercise the `organization_id` filter's SQL.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
 
 import psycopg
 import pytest
@@ -59,7 +60,7 @@ def _insert_call(
 
 
 @pytest.fixture
-def pool(migrated_database: str) -> ConnectionPool:
+def pool(migrated_database: str) -> Iterator[ConnectionPool]:
     with ConnectionPool(migrated_database, min_size=1, max_size=4, open=True) as pool:
         yield pool
 
