@@ -69,11 +69,12 @@ _RECORD_PROVIDER_CALL = """
 _RECORD_MODEL_CALL = """
     INSERT INTO model_calls (
         organization_id, lead_id, model, tier, purpose, escalated_from,
-        prompt_tokens, completion_tokens, cost_usd, latency_ms, idempotency_key
+        prompt_tokens, completion_tokens, cost_usd, latency_ms, idempotency_key,
+        provider, batch_id, actual_cost_usd
     ) VALUES (
         %(organization_id)s, %(lead_id)s, %(model)s, %(tier)s, %(purpose)s, %(escalated_from)s,
         %(prompt_tokens)s, %(completion_tokens)s, %(cost_usd)s, %(latency_ms)s,
-        %(idempotency_key)s
+        %(idempotency_key)s, %(provider)s, %(batch_id)s, %(actual_cost_usd)s
     )
     ON CONFLICT (idempotency_key) DO UPDATE
         SET idempotency_key = model_calls.idempotency_key
@@ -87,10 +88,12 @@ _RECORD_MODEL_CALL = """
 _RECORD_MODEL_CALL_UNKEYED = """
     INSERT INTO model_calls (
         organization_id, lead_id, model, tier, purpose, escalated_from,
-        prompt_tokens, completion_tokens, cost_usd, latency_ms
+        prompt_tokens, completion_tokens, cost_usd, latency_ms,
+        provider, batch_id, actual_cost_usd
     ) VALUES (
         %(organization_id)s, %(lead_id)s, %(model)s, %(tier)s, %(purpose)s, %(escalated_from)s,
-        %(prompt_tokens)s, %(completion_tokens)s, %(cost_usd)s, %(latency_ms)s
+        %(prompt_tokens)s, %(completion_tokens)s, %(cost_usd)s, %(latency_ms)s,
+        %(provider)s, %(batch_id)s, %(actual_cost_usd)s
     )
     RETURNING call_id, cost_usd
 """
@@ -279,6 +282,9 @@ class PostgresCostLedger:
         escalated_from: str | None = None,
         idempotency_key: str | None = None,
         cost_usd: float | Decimal | None = None,
+        provider: str | None = None,
+        batch_id: UUID | None = None,
+        actual_cost_usd: float | Decimal | None = None,
     ) -> LedgerWrite:
         """Record one model call, pricing it from token counts.
 
@@ -292,6 +298,23 @@ class PostgresCostLedger:
         cache-token pricing this table doesn't model. Passing it is how a
         *reported* cost gets in; omitting it derives one. Unpriced models raise
         rather than ledger as free (see ``arie.ledger.pricing``).
+
+        The three M7 fields (0034) are optional and, like `provider_calls`'
+        equivalents, pure record-keeping. `provider` names which
+        ``arie.llm.provider.LLMProvider`` served the call, so the abstraction
+        is observable in the ledger and not only in code; `batch_id` attributes
+        the call to the CSV upload whose processing incurred it, which is what
+        makes a per-batch AI budget answerable at all
+        (``arie.llm.budget.get_llm_spend``).
+
+        `actual_cost_usd` is the vendor's own billed figure and **only** that —
+        never computed here, never copied from `cost_usd`, never estimated by a
+        caller. ``None`` means "the vendor did not report a charge", not
+        "free". `cost_usd` remains the modelled figure either way, and the two
+        stay separate columns so no view can present one as the other. DeepSeek
+        reports token counts and no charge, so today every M7 row leaves this
+        NULL; the parameter exists so that a provider that does report one has
+        somewhere truthful to put it.
         """
         price = price_for(model)
         tier: ModelTier = price.tier
@@ -314,6 +337,9 @@ class PostgresCostLedger:
             "completion_tokens": completion_tokens,
             "cost_usd": resolved_cost,
             "latency_ms": int(latency_ms) if latency_ms is not None else None,
+            "provider": provider,
+            "batch_id": batch_id,
+            "actual_cost_usd": None if actual_cost_usd is None else usd(actual_cost_usd),
         }
 
         with traced(

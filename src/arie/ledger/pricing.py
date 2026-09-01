@@ -84,6 +84,19 @@ MODEL_PRICES: dict[str, ModelPrice] = {
         usd_per_1m_input_tokens=Decimal("0.55"),
         usd_per_1m_output_tokens=Decimal("2.19"),
     ),
+    # The M7 fake provider (`arie.llm.fake_provider`). Zero is not a fallback
+    # here, it is the correct price: `FakeLLMProvider` calls nothing and is
+    # billed by nobody. `UnknownModelError` still fires for every real model
+    # missing from this table, which is the property that matters — this entry
+    # is a specific named exception, not a hole in the rule. Its `tier` is
+    # "cheap" so it lands on the cheap side of `v_model_escalation` rather
+    # than inflating the strong-model count in a test database.
+    "fake-llm": ModelPrice(
+        model="fake-llm",
+        tier="cheap",
+        usd_per_1m_input_tokens=Decimal("0"),
+        usd_per_1m_output_tokens=Decimal("0"),
+    ),
 }
 
 

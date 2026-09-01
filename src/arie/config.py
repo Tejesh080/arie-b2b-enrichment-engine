@@ -252,6 +252,96 @@ class LLMConfig:
 
 
 @dataclass(frozen=True)
+class IntelligenceConfig:
+    """The M7 intelligence layer's *general* LLM configuration — the one that
+    backs ``arie.llm.provider.LLMProvider``.
+
+    Deliberately separate from :class:`LLMConfig` rather than an extension of
+    it. ``LLMConfig`` configures one narrow M1 task (buying-signal extraction,
+    ``arie.llm.deepseek``) and its docstring says so in as many words; M7's
+    layer is the general "call a model" facility that module was written to
+    not be. Folding the two together would make that module's stated scope a
+    lie by editing the config it reads rather than by changing the module.
+
+    Both read ``DEEPSEEK_API_KEY``, and that is intentional: there is one
+    DeepSeek account and one key. ``LLM_API_KEY``/``LLM_BASE_URL`` take
+    precedence so that swapping ``LLM_PROVIDER`` to something that is not
+    DeepSeek does not require the credential to keep living under a DeepSeek
+    name — the abstraction's own variables exist from the start, and the
+    DeepSeek-named ones remain the working fallback until there is a second
+    provider to justify a migration.
+
+    Nothing here is ``NEXT_PUBLIC_``-prefixed or otherwise reachable from the
+    browser: every field is read in the API/worker process only.
+    """
+
+    provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "deepseek").strip())
+    """Which :class:`~arie.llm.provider.LLMProvider` implementation
+    ``arie.llm.factory.build_llm_provider`` constructs. ``"deepseek"`` (the
+    real hosted model), ``"fake"`` (the deterministic in-process double), or
+    ``"none"`` (no LLM at all — every intelligence feature degrades to its
+    deterministic fallback, which is the same path a budget exhaustion or an
+    API outage takes). An unrecognised value raises at construction rather
+    than silently selecting a default: a typo'd provider name that quietly
+    became DeepSeek would spend real money."""
+
+    model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "deepseek-chat").strip())
+    """Must be a key of ``arie.ledger.pricing.MODEL_PRICES`` — an unpriced
+    model raises ``UnknownModelError`` at ledger time rather than being
+    recorded as free (see that module). Checked eagerly by
+    ``build_llm_provider`` so the failure lands at startup, not on the first
+    customer request."""
+
+    api_key: str = field(
+        default_factory=lambda: os.getenv("LLM_API_KEY", "") or os.getenv("DEEPSEEK_API_KEY", "")
+    )
+    base_url: str = field(
+        default_factory=lambda: (
+            os.getenv("LLM_BASE_URL", "")
+            or os.getenv("DEEPSEEK_BASE_URL", "")
+            or "https://api.deepseek.com"
+        ).rstrip("/")
+    )
+
+    timeout_seconds: float = field(default_factory=lambda: _env_float("LLM_TIMEOUT_SECONDS", 30.0))
+    max_attempts: int = field(default_factory=lambda: _env_int("LLM_MAX_ATTEMPTS", 2))
+    """Total attempts per structured generation, including the first — so the
+    default of 2 is "one bounded repair retry", which is what the M7 brief
+    permits and no more. Bounded for the same reason
+    ``LLMConfig.max_attempts`` is: a miscalibrated prompt should cost a
+    bounded amount rather than loop."""
+
+    max_output_tokens: int = field(default_factory=lambda: _env_int("LLM_MAX_OUTPUT_TOKENS", 2000))
+    """A ceiling on what one call can be billed for on the output side. Every
+    M7 output is a small bounded JSON document; a model that starts
+    generating unbounded prose is malfunctioning, and this is the cheapest
+    place to stop paying for it."""
+
+    max_untrusted_chars: int = field(
+        default_factory=lambda: _env_int("LLM_MAX_UNTRUSTED_CHARS", 20_000)
+    )
+    """Total characters of customer/third-party text that may be fenced into
+    one prompt (``arie.llm.structured.render_untrusted``). Two jobs: it caps
+    input spend the same way ``max_output_tokens`` caps output spend, and it
+    is the structural answer to "do not send an entire huge CSV to the LLM" —
+    the truncation is enforced at the prompt-rendering boundary, so no caller
+    can forget it."""
+
+    @property
+    def configured(self) -> bool:
+        """True when a real model can actually be called.
+
+        ``"fake"`` is configured without a key on purpose — it is how the test
+        suite and a keyless developer machine exercise every M7 path. ``"none"``
+        is never configured, which is the whole point of it."""
+        if self.provider == "fake":
+            return True
+        if self.provider == "none":
+            return False
+        return bool(self.api_key)
+
+
+@dataclass(frozen=True)
 class LiveProviderConfig:
     """Config for the one real enrichment adapter (P5) — ``arie.providers.live_abstract``.
 
@@ -810,6 +900,7 @@ SUPABASE_AUTH = SupabaseAuthConfig()
 RUNTIME = RuntimeConfig()
 OBSERVABILITY = ObservabilityConfig()
 LLM = LLMConfig()
+INTELLIGENCE = IntelligenceConfig()
 LIVE_PROVIDER = LiveProviderConfig()
 APOLLO_PERSON = ApolloPersonConfig()
 HUNTER = HunterConfig()
