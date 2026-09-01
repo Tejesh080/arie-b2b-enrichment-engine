@@ -295,6 +295,20 @@ def _process_webhook_event_impl(
 ) -> WebhookProcessResult:
     try:
         event = stripe_gateway.construct_event(raw_body=raw_body, signature_header=signature_header)
+    except stripe_gateway.StripeNotConfiguredError:
+        # No signing secret means there is no way to tell Stripe's traffic
+        # from anyone else's, so nothing here can be trusted — the same
+        # outcome as a bad signature, reached for a different reason. It is
+        # reported as 503 rather than 400 because the fault is this
+        # deployment's, not the caller's: Stripe then retries with backoff,
+        # and a delivery that arrives after the secret is configured
+        # succeeds instead of having been permanently discarded.
+        #
+        # Uncaught, this was a 500 — safe (still nothing trusted) but wrong
+        # twice over: it pages an operator for a configuration state rather
+        # than a fault, and it buries the one line that says what to fix.
+        _LOGGER.warning("stripe webhook received but STRIPE_WEBHOOK_SECRET is not configured")
+        return WebhookProcessResult(503, "stripe webhook signing secret is not configured")
     except stripe_gateway.StripeWebhookSignatureError as exc:
         _LOGGER.warning("stripe webhook signature rejected: %s", exc)
         return WebhookProcessResult(400, "invalid signature")

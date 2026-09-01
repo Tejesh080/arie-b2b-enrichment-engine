@@ -900,9 +900,10 @@ def register_routes(app: FastAPI) -> None:
         work `process_webhook_event` does runs directly on the event loop
         here rather than being threaded through `run_in_threadpool` for one
         endpoint. Status codes are Stripe's own retry contract: 400 for a
-        signature that doesn't verify, 200 for anything processed
-        (including a harmlessly-ignored or already-seen event), 500 for a
-        transient failure worth Stripe retrying.
+        signature that doesn't verify, 503 when this deployment has no
+        signing secret configured to verify it *with*, 200 for anything
+        processed (including a harmlessly-ignored or already-seen event),
+        500 for a transient failure worth Stripe retrying.
         """
         raw_body = await request.body()
         signature_header = request.headers.get("stripe-signature", "")
