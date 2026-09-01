@@ -78,7 +78,7 @@ def notify_review_required(pool: ConnectionPool, *, lead_id: UUID) -> None:
             ]
 
         notifier = get_notifier()
-        review_url = f"{FRONTEND.base_url}/reviews/{review_id}"
+        review_url = f"{FRONTEND.base_url}/leads/{lead_id}"
         lead_reference = str(lead_id)[:8]
         summary = (
             f"Machine recommendation: {original_decision}."

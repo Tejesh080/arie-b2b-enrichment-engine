@@ -524,7 +524,7 @@ def _dispatch_invitation_email(
         organization = get_organization(conn, organization_id=auth.organization_id)
         assert organization is not None
         inviter_email = get_user_email(auth.user_id) or "An ARIE administrator"
-        accept_url = f"{FRONTEND.base_url}/invitations/accept?token={generated.raw_token}"
+        accept_url = f"{FRONTEND.base_url}/invite/accept?token={generated.raw_token}"
         send_invitation_email(
             conn,
             invitation=generated.record,

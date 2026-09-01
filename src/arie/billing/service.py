@@ -149,7 +149,7 @@ def open_billing_portal(
 
         session = stripe_gateway.create_portal_session(
             customer_id=billing.stripe_customer_id,
-            return_url=return_url or f"{FRONTEND.base_url}/settings/billing",
+            return_url=return_url or f"{FRONTEND.base_url}/settings",
         )
         record_event(
             conn,
@@ -492,7 +492,7 @@ def _notify_payment_failed(conn: psycopg.Connection, *, organization_id: UUID) -
         organization = get_organization(conn, organization_id=organization_id)
         assert organization is not None
         notifier = get_notifier()
-        portal_url = f"{FRONTEND.base_url}/settings/billing"
+        portal_url = f"{FRONTEND.base_url}/settings"
         for member in list_members(conn, organization_id=organization_id):
             if member.role not in ("owner", "admin"):
                 continue

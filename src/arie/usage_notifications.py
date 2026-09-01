@@ -114,7 +114,7 @@ def check_and_notify_usage(
             return
 
         notifier = get_notifier()
-        billing_url = f"{FRONTEND.base_url}/settings/billing"
+        billing_url = f"{FRONTEND.base_url}/settings"
         for kind, metric, used, limit in triggers:
             metric_label = "leads/month" if metric == "leads" else "modeled spend/month"
             for email in emails:

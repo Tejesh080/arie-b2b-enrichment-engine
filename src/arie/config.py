@@ -756,7 +756,16 @@ class FrontendConfig:
     """Where the customer-facing console is hosted — used only to build
     absolute links in transactional email (an invitation accept URL, a
     review-required URL) when the caller doesn't supply its own return URL.
-    Not a secret; not read by any provider-selection or scoring code."""
+    Not a secret; not read by any provider-selection or scoring code.
+
+    **The paths appended to this are `arie-web`'s routes, not this API's.**
+    They look like API routes and are not: the console serves
+    `/invite/accept`, `/settings`, and `/leads/{lead_id}`, while this API
+    separately serves `/invitations/accept` and `/reviews/{review_id}`. Every
+    one of these links was originally built from the API's path and would
+    have 404'd in a recipient's browser; the mistake is easy to repeat
+    because both halves are plausible. When changing one, check it against
+    `arie-web/src/app` rather than against this module's own route table."""
 
     base_url: str = field(default_factory=lambda: os.getenv("FRONTEND_BASE_URL", "").rstrip("/"))
 
