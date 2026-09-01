@@ -193,6 +193,12 @@ from arie.provisioning import (
     SlugGenerationExhaustedError,
     create_customer_organization,
 )
+from arie.security_notifications import (
+    notify_member_removed,
+    notify_member_role_changed,
+    notify_provider_credential_deleted,
+    notify_provider_credential_set,
+)
 from arie.statemachine.apply import OptimisticConcurrencyError
 from arie.supabase_admin import get_user_email
 from arie.turnstile import verify_turnstile_token
@@ -1048,6 +1054,18 @@ def register_routes(app: FastAPI) -> None:
             ) from exc
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="member not found")
+        # Best-effort, on a fresh connection after the transaction above has
+        # committed — see arie.security_notifications' own docstring. A role
+        # change is one of the four actions that can silently hand someone
+        # control of an organization, so every owner/admin hears about it.
+        with state.pool.connection() as notify_conn:
+            notify_member_role_changed(
+                notify_conn,
+                organization_id=auth.organization_id,
+                target_user_id=user_id,
+                new_role=payload.role,
+                actor_user_id=auth.user_id,
+            )
         return MemberResponse.model_validate(record)
 
     @app.delete("/organization/members/{user_id}", response_model=MemberResponse)
@@ -1074,6 +1092,13 @@ def register_routes(app: FastAPI) -> None:
             ) from exc
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="member not found")
+        with state.pool.connection() as notify_conn:
+            notify_member_removed(
+                notify_conn,
+                organization_id=auth.organization_id,
+                target_user_id=user_id,
+                actor_user_id=auth.user_id,
+            )
         return MemberResponse.model_validate(record)
 
     # -------------------------------------------------------- invitations --
@@ -1281,6 +1306,15 @@ def register_routes(app: FastAPI) -> None:
                 )
         except InvalidProviderError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        # The notice names the provider and never the credential — not a
+        # prefix, not a length. See arie.security_notifications' docstring.
+        with state.pool.connection() as notify_conn:
+            notify_provider_credential_set(
+                notify_conn,
+                organization_id=auth.organization_id,
+                provider=provider,
+                actor_user_id=auth.user_id,
+            )
         return ProviderStatusResponse.model_validate(ProviderStatus.from_record(record))
 
     @app.patch("/organization/providers/{provider}", response_model=ProviderStatusResponse)
@@ -1328,6 +1362,13 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"{provider} has not been configured for this organization",
+            )
+        with state.pool.connection() as notify_conn:
+            notify_provider_credential_deleted(
+                notify_conn,
+                organization_id=auth.organization_id,
+                provider=provider,
+                actor_user_id=auth.user_id,
             )
 
     @app.post("/organization/providers/{provider}/test", response_model=ProviderStatusResponse)

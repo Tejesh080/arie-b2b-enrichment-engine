@@ -151,6 +151,21 @@ unconfigured state is a deliberate, safe one rather than a broken one:
 | `TURNSTILE_SECRET_KEY` | Provisioning's CAPTCHA check is bypassed. A documented dev/CI seam — never a bypass in an environment where the secret *is* set. |
 | `FRONTEND_BASE_URL` | Invitation and review emails carry no working link. Set it before enabling real email. |
 
+Six transactional emails exist, and nothing else does — no marketing, no
+digests, no raw provider payloads or Stripe objects in any of them:
+invitation, human-review-required, usage-warning, limit-reached,
+payment-problem, and security-notice. The last fires on the four actions that
+can hand someone control of an organization — a role change, a member
+removal, and a BYOK provider credential written or deleted — and goes to
+every owner and admin *including the actor*, because a legitimate admin's own
+copy is what lets them say "I did not do this". Those notices name the
+provider and never the credential.
+
+Every value interpolated into an email's HTML is escaped. That is load-bearing
+rather than tidy: an organization name is 200 characters of tenant-controlled
+text, an invitation carries it to an address outside the organization, and
+self-service signup means anyone with an email address can set it.
+
 The Legacy Organization is grandfathered onto the `internal` plan by
 `migrations/0030` and needs none of the above to keep working — see
 `tests/integration/test_legacy_organization_m6_regression.py`, which asserts
