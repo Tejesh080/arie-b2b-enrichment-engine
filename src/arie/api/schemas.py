@@ -37,6 +37,8 @@ from arie.recommendations import (
     NextAction,
     ResearchStatus,
 )
+from arie.research import Materiality, ResearchReasonCode, ResearchTargetField
+from arie.research_acquisition import ResearchExecutionResult, ResearchPlanResult
 
 
 class IngestLeadRequest(BaseModel):
@@ -507,6 +509,94 @@ class FeedbackResponse(BaseModel):
     @classmethod
     def from_record(cls, record: FeedbackRecord) -> FeedbackResponse:
         return cls.model_validate(record)
+
+
+# ------------------------------------------------------------------ research --
+#
+# M7 Slice 5. A plan proposes; execution recomputes authorization from
+# scratch and, if approved, performs one simulated provider call — see
+# `arie.research_acquisition`'s own module docstring for why this never
+# rewrites the immutable Decision Receipt.
+
+
+class ResearchPlanResponse(BaseModel):
+    """`POST /leads/{lead_id}/research-plan`'s response — a proposal, never
+    an action. `approved` tells the client whether `POST /leads/{lead_id}
+    /research` would currently succeed for `target_field`; the client never
+    computes that itself."""
+
+    target_field: ResearchTargetField | None
+    question: str | None
+    rationale: str | None
+    materiality: Materiality | None
+    decision_already_clear: bool
+    candidate_sources: list[str]
+    estimated_cost_usd: Decimal | None
+    reason_code: ResearchReasonCode
+    detail: str
+    approved: bool
+    llm_used: bool
+
+    @classmethod
+    def from_result(cls, result: ResearchPlanResult) -> ResearchPlanResponse:
+        return cls(
+            target_field=result.target_field,
+            question=result.question,
+            rationale=result.rationale,
+            materiality=result.materiality,
+            decision_already_clear=result.decision_already_clear,
+            candidate_sources=list(result.candidate_sources),
+            estimated_cost_usd=result.estimated_cost_usd,
+            reason_code=result.reason_code,
+            detail=result.detail,
+            approved=result.approved,
+            llm_used=result.llm_used,
+        )
+
+
+class ExecuteResearchRequest(BaseModel):
+    """`POST /leads/{lead_id}/research`. Only `target_field` is client-
+    supplied — provider, cost, and approval are always recomputed server-side
+    from current state, never trusted from the request."""
+
+    target_field: ResearchTargetField
+
+
+class ResearchPreviewResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    score: float
+    bounds_lower: float
+    bounds_upper: float
+    likely_outcome: str
+
+
+class ResearchExecutionResponse(BaseModel):
+    approved: bool
+    reason_code: ResearchReasonCode
+    detail: str
+    target_field: ResearchTargetField | None
+    provider: str | None
+    found_value: Any | None
+    cost_usd: Decimal
+    preview: ResearchPreviewResponse | None
+
+    @classmethod
+    def from_result(cls, result: ResearchExecutionResult) -> ResearchExecutionResponse:
+        return cls(
+            approved=result.approved,
+            reason_code=result.reason_code,
+            detail=result.detail,
+            target_field=result.target_field,
+            provider=result.provider,
+            found_value=result.found_value,
+            cost_usd=result.cost_usd,
+            preview=(
+                ResearchPreviewResponse.model_validate(result.preview)
+                if result.preview is not None
+                else None
+            ),
+        )
 
 
 # ------------------------------------------------------------------ api keys --

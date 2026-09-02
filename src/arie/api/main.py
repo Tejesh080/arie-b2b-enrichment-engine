@@ -68,6 +68,7 @@ from arie.api.schemas import (
     CreateOrganizationRequest,
     CreateOrganizationResponse,
     EffectiveEntitlementsResponse,
+    ExecuteResearchRequest,
     FeedbackResponse,
     HealthResponse,
     ICPProfileResponse,
@@ -91,6 +92,8 @@ from arie.api.schemas import (
     ProposedChangeResponse,
     ProviderStatusResponse,
     ReceiptResponse,
+    ResearchExecutionResponse,
+    ResearchPlanResponse,
     ReviewDecisionRequest,
     ReviewDecisionResponse,
     ReviewResponse,
@@ -155,6 +158,7 @@ from arie.billing.service import (
 from arie.billing.stripe_gateway import StripeNotConfiguredError, UnknownPlanError
 from arie.config import DATABASE, FRONTEND, OBSERVABILITY
 from arie.credential_resolver import resolve_provider_credential
+from arie.evidence.store import PostgresEvidenceStore
 from arie.feedback import get_feedback, submit_feedback
 from arie.icp_profiles import (
     create_profile as create_icp_profile_row,
@@ -234,6 +238,7 @@ from arie.onboarding import get_onboarding_status
 from arie.organizations import (
     InvalidExecutionModeError,
     InvalidOrganizationSettingsError,
+    get_execution_mode,
     get_organization,
     set_execution_mode,
     update_organization,
@@ -260,6 +265,7 @@ from arie.recommendations import (
     build_recommendation,
     score_snapshot,
 )
+from arie.research_acquisition import build_research_plan, execute_research
 from arie.security_notifications import (
     notify_member_removed,
     notify_member_role_changed,
@@ -1125,6 +1131,63 @@ def register_routes(app: FastAPI) -> None:
                 conn, organization_id=auth.organization_id, lead_id=lead_id, user_id=auth.user_id
             )
         return FeedbackResponse.from_record(feedback) if feedback is not None else None
+
+    # ------------------------------------------------------------- research --
+    #
+    # M7 Slice 5. "Is another piece of evidence worth acquiring at all?" —
+    # `POST /research-plan` never spends anything; `POST /research`
+    # recomputes authorization from scratch before ever touching a provider.
+    # See `arie.research_acquisition`'s own module docstring for why neither
+    # route ever rewrites the immutable Decision Receipt.
+
+    @app.post("/leads/{lead_id}/research-plan", response_model=ResearchPlanResponse)
+    def post_research_plan(
+        lead_id: UUID, state: StateDep, auth: AuthDep, llm: LLMServiceDep
+    ) -> ResearchPlanResponse:
+        _require_scope(auth, "leads:read")
+        with state.pool.connection() as conn:
+            execution_mode = get_execution_mode(conn, organization_id=auth.organization_id)
+            plan = build_research_plan(
+                conn,
+                state.ledger,
+                organization_id=auth.organization_id,
+                lead_id=lead_id,
+                execution_mode=execution_mode,
+                llm=llm,
+                now=datetime.now(UTC),
+            )
+        if plan is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no lead {lead_id}")
+        return ResearchPlanResponse.from_result(plan)
+
+    @app.post("/leads/{lead_id}/research", response_model=ResearchExecutionResponse)
+    def post_research_execution(
+        lead_id: UUID, payload: ExecuteResearchRequest, state: StateDep, auth: AuthDep
+    ) -> ResearchExecutionResponse:
+        """Authorize and, if approved, perform one simulated research call.
+
+        `payload.target_field` is the only client-supplied input — provider
+        choice, cost, and approval are always recomputed here from current
+        state, never trusted from the request or from an earlier plan
+        response the client may be holding.
+        """
+        _require_scope(auth, "leads:write")
+        with _transaction(state.pool) as conn:
+            execution_mode = get_execution_mode(conn, organization_id=auth.organization_id)
+            evidence_store = PostgresEvidenceStore(state.pool)
+            result = execute_research(
+                conn,
+                state.ledger,
+                evidence_store,
+                organization_id=auth.organization_id,
+                lead_id=lead_id,
+                target_field=payload.target_field,
+                execution_mode=execution_mode,
+                now=datetime.now(UTC),
+            )
+        if result is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no lead {lead_id}")
+        return ResearchExecutionResponse.from_result(result)
 
     @app.get("/reviews/{review_id}", response_model=ReviewResponse)
     def get_review_endpoint(review_id: UUID, state: StateDep, auth: AuthDep) -> ReviewResponse:

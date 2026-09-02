@@ -21,6 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 from tests.integration.conftest import authorize_app
 
+from arie.api.main import AppState, create_app
 from arie.auth import AuthContext
 from arie.tenancy import LEGACY_ORGANIZATION_ID as ORG
 
@@ -138,10 +139,11 @@ def test_feedback_on_foreign_organizations_lead_is_404(
     assert response.status_code == 404
 
 
-def test_feedback_is_denied_for_an_api_key(api_client: TestClient, make_lead: MakeLead) -> None:
+def test_feedback_is_denied_for_an_api_key(app_state: AppState, make_lead: MakeLead) -> None:
     lead_id, _ = make_lead()
+    app = create_app(state=app_state)
     authorize_app(
-        api_client.app,
+        app,
         AuthContext(
             organization_id=ORG,
             auth_method="api_key",
@@ -149,7 +151,8 @@ def test_feedback_is_denied_for_an_api_key(api_client: TestClient, make_lead: Ma
             scopes=frozenset({"leads:read", "leads:write"}),
         ),
     )
-    response = api_client.post(f"/leads/{lead_id}/feedback", json={"sentiment": "positive"})
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(f"/leads/{lead_id}/feedback", json={"sentiment": "positive"})
     assert response.status_code == 403
 
 
