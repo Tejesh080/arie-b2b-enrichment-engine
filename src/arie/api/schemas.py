@@ -23,6 +23,7 @@ from arie.apikeys import SCOPES
 from arie.approval.workflow import ReviewAction
 from arie.auth import ROLES
 from arie.billing.service import PURCHASABLE_PLANS
+from arie.copilot import CopilotIntent, CopilotResponse, LeadCopilotResponse
 from arie.core.types import LeadStatus
 from arie.feedback import FeedbackReason, FeedbackRecord, FeedbackSentiment
 from arie.icp_profiles import InvalidICPConfigError, validate_config
@@ -1483,3 +1484,76 @@ class AcceptProposalRequest(BaseModel):
     """
 
     name: Annotated[str, Field(min_length=1, max_length=200)] = "Updated from past results"
+
+
+# ------------------------------------------------------------------ copilot --
+#
+# M7 Slice 6 — "Ask ARIE". Read-only: neither route below ever mutates a
+# profile, submits feedback, executes research, or calls a provider. See
+# `arie.copilot_service`'s own module docstring for the query-plan/LLM
+# architecture behind these two thin request/response shapes.
+
+
+class CopilotQueryRequest(BaseModel):
+    """`POST /copilot/query`. `question` is the only client-supplied input —
+    everything else (intent, filters, the leads actually returned) is
+    resolved server-side from the caller's own authenticated organization."""
+
+    question: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class CopilotLeadReferenceResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    lead_id: UUID
+    company: str | None
+    contact: str | None
+    priority: CustomerPriority
+    score: float | None
+    why: str
+    next_action: NextAction
+
+
+class CopilotResponseSchema(BaseModel):
+    """`POST /copilot/query`'s response. `filters_applied` echoes back the
+    (already-validated, already-clamped) query plan's non-default fields —
+    Advanced Details material, not something a client should parse to decide
+    what to render; render `leads` and `answer`."""
+
+    answer: str
+    leads: list[CopilotLeadReferenceResponse]
+    intent: CopilotIntent
+    result_count: int
+    filters_applied: dict[str, Any]
+    llm_used: bool
+
+    @classmethod
+    def from_result(cls, result: CopilotResponse) -> CopilotResponseSchema:
+        return cls(
+            answer=result.answer,
+            leads=[CopilotLeadReferenceResponse.model_validate(lead) for lead in result.leads],
+            intent=result.intent,
+            result_count=result.result_count,
+            filters_applied=result.filters_applied,
+            llm_used=result.llm_used,
+        )
+
+
+class LeadCopilotRequest(BaseModel):
+    """`POST /leads/{lead_id}/copilot`."""
+
+    question: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class LeadCopilotResponseSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    lead_id: UUID
+    intent: CopilotIntent
+    answer: str
+    missing_information: list[str]
+    researchable_field: ResearchTargetField | None
+
+    @classmethod
+    def from_result(cls, result: LeadCopilotResponse) -> LeadCopilotResponseSchema:
+        return cls.model_validate(result)

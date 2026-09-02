@@ -62,6 +62,8 @@ from arie.api.schemas import (
     BillingResponse,
     CanonicalFieldResponse,
     CheckoutSessionResponse,
+    CopilotQueryRequest,
+    CopilotResponseSchema,
     CreateApiKeyRequest,
     CreateICPProfileRequest,
     CreateInvitationRequest,
@@ -76,6 +78,8 @@ from arie.api.schemas import (
     IngestLeadResponse,
     InvitationCreatedResponse,
     InvitationResponse,
+    LeadCopilotRequest,
+    LeadCopilotResponseSchema,
     LeadCostResponse,
     LeadExplanationResponse,
     LeadRecommendationResponse,
@@ -157,6 +161,7 @@ from arie.billing.service import (
 )
 from arie.billing.stripe_gateway import StripeNotConfiguredError, UnknownPlanError
 from arie.config import DATABASE, FRONTEND, OBSERVABILITY
+from arie.copilot_service import answer_lead_query, answer_list_query
 from arie.credential_resolver import resolve_provider_credential
 from arie.evidence.store import PostgresEvidenceStore
 from arie.feedback import get_feedback, submit_feedback
@@ -222,6 +227,7 @@ from arie.limits import (
     enforce_lead_quota,
     get_usage_against_limits,
 )
+from arie.live.outcome_cache import ProviderOutcomeGuard
 from arie.llm.budget import LLMBudgetReason
 from arie.llm.service import LLMService
 from arie.members import (
@@ -1155,6 +1161,7 @@ def register_routes(app: FastAPI) -> None:
                 execution_mode=execution_mode,
                 llm=llm,
                 now=datetime.now(UTC),
+                outcome_guard=ProviderOutcomeGuard(state.pool),
             )
         if plan is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no lead {lead_id}")
@@ -1184,10 +1191,60 @@ def register_routes(app: FastAPI) -> None:
                 target_field=payload.target_field,
                 execution_mode=execution_mode,
                 now=datetime.now(UTC),
+                outcome_guard=ProviderOutcomeGuard(state.pool),
             )
         if result is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no lead {lead_id}")
         return ResearchExecutionResponse.from_result(result)
+
+    # -------------------------------------------------------------- copilot --
+    #
+    # M7 Slice 6 — "Ask ARIE". A safe interface to ARIE's own already-decided
+    # truth, never a second decision engine. Both routes are strictly
+    # read-only: see `arie.copilot_service`'s own module docstring. Human JWT
+    # session only — an interactive customer copilot has no established
+    # machine-API-key use case, matching `_require_jwt_session`'s existing
+    # bar for CSV batch upload and organization configuration reads.
+
+    @app.post("/copilot/query", response_model=CopilotResponseSchema)
+    def post_copilot_query(
+        payload: CopilotQueryRequest, state: StateDep, auth: AuthDep, llm: LLMServiceDep
+    ) -> CopilotResponseSchema:
+        _require_jwt_session(auth)
+        assert auth.user_id is not None  # guaranteed by the JWT check above
+        with state.pool.connection() as conn:
+            result = answer_list_query(
+                conn,
+                llm,
+                organization_id=auth.organization_id,
+                user_id=auth.user_id,
+                question=payload.question,
+                now=datetime.now(UTC),
+            )
+        return CopilotResponseSchema.from_result(result)
+
+    @app.post("/leads/{lead_id}/copilot", response_model=LeadCopilotResponseSchema)
+    def post_lead_copilot(
+        lead_id: UUID,
+        payload: LeadCopilotRequest,
+        state: StateDep,
+        auth: AuthDep,
+        llm: LLMServiceDep,
+    ) -> LeadCopilotResponseSchema:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            result = answer_lead_query(
+                conn,
+                state.ledger,
+                llm,
+                organization_id=auth.organization_id,
+                lead_id=lead_id,
+                question=payload.question,
+                now=datetime.now(UTC),
+            )
+        if result is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no lead {lead_id}")
+        return LeadCopilotResponseSchema.from_result(result)
 
     @app.get("/reviews/{review_id}", response_model=ReviewResponse)
     def get_review_endpoint(review_id: UUID, state: StateDep, auth: AuthDep) -> ReviewResponse:

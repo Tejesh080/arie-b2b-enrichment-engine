@@ -50,6 +50,7 @@ from arie.icp_profiles import get_profile_by_version, resolve_scoring_config
 from arie.intelligence.research_planning import propose_research_question
 from arie.ledger.store import PostgresCostLedger
 from arie.limits import get_usage_against_limits
+from arie.live.outcome_cache import ProviderOutcomeGuard
 from arie.live.provider_availability import resolve_organization_providers
 from arie.llm.service import LLMService
 from arie.organizations import SIMULATED
@@ -155,6 +156,44 @@ def _lead_budget_cap(conn: psycopg.Connection, lead_id: UUID) -> Decimal:
     return Decimal(str(row[0]))
 
 
+def _suppressed_providers(
+    outcome_guard: ProviderOutcomeGuard | None,
+    candidates: tuple[str, ...],
+    *,
+    entity_type: EntityType,
+    entity_id: UUID | None,
+    organization_id: UUID,
+) -> frozenset[str]:
+    """Which of `candidates` the existing M5 outcome-cache guard
+    (`arie.live.outcome_cache.ProviderOutcomeGuard`) currently recognises as a
+    recent, still-suppressed settled miss or uncertain (timeout/transport)
+    outcome for this exact entity — the read this module's own "Known
+    limitations" note flagged as missing: `authorize_research` has always
+    accepted a `suppressed_providers` set, but nothing populated it. No new
+    suppression *behavior* is introduced here; this only wires the read that
+    `arie.jobs.handlers`' live acquisition path already performs for the
+    identical reason (see `_acquire_live_evidence`).
+
+    `()` (no suppression) whenever there is nothing to check against — no
+    guard was supplied (simulated mode never needs one), no candidates, or no
+    resolved entity yet.
+    """
+    if outcome_guard is None or not candidates or entity_id is None:
+        return frozenset()
+    return frozenset(
+        provider
+        for provider in candidates
+        if outcome_guard.recent_miss(
+            provider, entity_type, entity_id, organization_id=organization_id
+        )
+        is not None
+        or outcome_guard.recent_uncertain_outcome(
+            provider, entity_type, entity_id, organization_id=organization_id
+        )
+        is not None
+    )
+
+
 def _authorization_inputs(
     conn: psycopg.Connection,
     *,
@@ -162,17 +201,20 @@ def _authorization_inputs(
     lead_id: UUID,
     target_field: ResearchTargetField,
     execution_mode: str,
-) -> tuple[tuple[str, ...], dict[str, str], Decimal, bool]:
+    outcome_guard: ProviderOutcomeGuard | None = None,
+) -> tuple[tuple[str, ...], dict[str, str], Decimal, bool, frozenset[str]]:
     """Everything `ResearchAuthorizationContext` needs beyond materiality and
     spend — one place both `build_research_plan` and `execute_research` read
     it from, so a plan and its later execution can never disagree about what
     was available. Returns `(candidates, unavailable, estimated_cost,
-    entitled_live)`.
+    entitled_live, suppressed)`.
 
     Provider *suppression* (`arie.live.outcome_cache`, live mode only) is
-    deliberately not read here yet — see this module's "Known limitations"
-    note in the M7 Slice 5 handoff; `authorize_research` still accepts a
-    suppressed set and this caller always passes an empty one.
+    resolved here via `outcome_guard` when the caller supplies one —
+    `simulated` mode never checks it (there is nothing for it to answer: the
+    guard only ever sees rows a *live* adapter wrote). Pass `None` (the
+    default) to keep the pre-fix behaviour of an always-empty suppressed set,
+    which every caller that hasn't been updated yet still gets.
     """
     if execution_mode == SIMULATED:
         called = _already_called_providers(conn, lead_id)
@@ -187,26 +229,38 @@ def _authorization_inputs(
             else Decimal(0)
         )
         entitled_live = True  # not applicable in simulated mode; authorize_research ignores it
-    else:
-        candidates = CANDIDATE_LIVE_PROVIDERS[target_field]
-        adapters, unavailable = resolve_organization_providers(
-            conn,
-            organization_id=organization_id,
-            execution_mode=execution_mode,
-            provider_names=candidates,
-        )
-        for adapter in adapters:
-            # `EnrichmentProvider` declares no `close()` (arie.jobs.handlers'
-            # own live builder uses the identical defensive getattr, for the
-            # identical reason: simulated providers and test fakes share the
-            # same minimal Protocol shape).
-            close = getattr(adapter, "close", None)
-            if close is not None:
-                close()
-        estimated_cost = _LIVE_COST_USD.get(candidates[0], Decimal(0)) if candidates else Decimal(0)
-        entitled_live = is_live_provider_feature_allowed(conn, organization_id=organization_id)
+        return candidates, unavailable, estimated_cost, entitled_live, frozenset()
 
-    return candidates, unavailable, estimated_cost, entitled_live
+    candidates = CANDIDATE_LIVE_PROVIDERS[target_field]
+    adapters, unavailable = resolve_organization_providers(
+        conn,
+        organization_id=organization_id,
+        execution_mode=execution_mode,
+        provider_names=candidates,
+    )
+    for adapter in adapters:
+        # `EnrichmentProvider` declares no `close()` (arie.jobs.handlers'
+        # own live builder uses the identical defensive getattr, for the
+        # identical reason: simulated providers and test fakes share the
+        # same minimal Protocol shape).
+        close = getattr(adapter, "close", None)
+        if close is not None:
+            close()
+    estimated_cost = _LIVE_COST_USD.get(candidates[0], Decimal(0)) if candidates else Decimal(0)
+    entitled_live = is_live_provider_feature_allowed(conn, organization_id=organization_id)
+
+    identity = _load_identity(conn, lead_id)
+    entity_type = _ENTITY_TYPE_FOR_FIELD[target_field]
+    entity_id = identity.company_id if entity_type == "company" else identity.person_id
+    suppressed = _suppressed_providers(
+        outcome_guard,
+        candidates,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        organization_id=organization_id,
+    )
+
+    return candidates, unavailable, estimated_cost, entitled_live, suppressed
 
 
 def _materiality_analysis(
@@ -296,6 +350,7 @@ def build_research_plan(
     execution_mode: str,
     llm: LLMService | None,
     now: datetime,
+    outcome_guard: ProviderOutcomeGuard | None = None,
 ) -> ResearchPlanResult | None:
     """The single best next fact for this lead, or a reason there isn't one.
 
@@ -361,12 +416,13 @@ def build_research_plan(
         question = DETERMINISTIC_QUESTIONS[target]
         rationale = "The largest-impact missing field."
 
-    candidates, unavailable, cost, entitled_live = _authorization_inputs(
+    candidates, unavailable, cost, entitled_live, suppressed = _authorization_inputs(
         conn,
         organization_id=organization_id,
         lead_id=lead_id,
         target_field=target,
         execution_mode=execution_mode,
+        outcome_guard=outcome_guard,
     )
     ledger_cost = ledger.lead_cost(lead_id)
     assert ledger_cost is not None
@@ -378,7 +434,7 @@ def build_research_plan(
         decision_already_clear=False,
         candidate_providers=candidates,
         unavailable_providers=unavailable,
-        suppressed_providers=frozenset(),
+        suppressed_providers=suppressed,
         execution_mode=execution_mode,
         entitled_live=entitled_live,
         estimated_cost_usd=cost,
@@ -480,6 +536,7 @@ def execute_research(
     target_field: ResearchTargetField,
     execution_mode: str,
     now: datetime,
+    outcome_guard: ProviderOutcomeGuard | None = None,
 ) -> ResearchExecutionResult | None:
     """Authorize and, if approved, perform one simulated provider call for
     `target_field`. Recomputes authorization from scratch — never trusts a
@@ -512,12 +569,13 @@ def execute_research(
     analysis, _ = materiality
     field_state = next(f for f in analysis.fields if f.field is target_field)
 
-    candidates, unavailable, cost, entitled_live = _authorization_inputs(
+    candidates, unavailable, cost, entitled_live, suppressed = _authorization_inputs(
         conn,
         organization_id=organization_id,
         lead_id=lead_id,
         target_field=target_field,
         execution_mode=execution_mode,
+        outcome_guard=outcome_guard,
     )
     ledger_cost = ledger.lead_cost(lead_id)
     assert ledger_cost is not None
@@ -529,7 +587,7 @@ def execute_research(
         decision_already_clear=analysis.decision_already_clear,
         candidate_providers=candidates,
         unavailable_providers=unavailable,
-        suppressed_providers=frozenset(),
+        suppressed_providers=suppressed,
         execution_mode=execution_mode,
         entitled_live=entitled_live,
         estimated_cost_usd=cost,
