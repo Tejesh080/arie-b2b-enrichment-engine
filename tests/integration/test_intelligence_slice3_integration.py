@@ -174,9 +174,31 @@ def test_an_obvious_file_previews_free_and_needs_no_confirmation(
 
 
 def test_a_messy_file_previews_with_labels_a_customer_can_read(
-    api_client: TestClient,
+    app_state: AppState,
 ) -> None:
-    response = api_client.post(PREVIEW_URL, files={"file": ("leads.csv", MESSY_CSV)})
+    """ "Contact" is genuinely ambiguous (`full_name` or `email`), so this
+    scripts the model's answer rather than relying on `api_client`'s ambient
+    LLM configuration — whatever a real deployment happens to have
+    configured must not decide what this test asserts."""
+    provider = FakeLLMProvider(
+        responses=[
+            json.dumps(
+                {
+                    "columns": [
+                        {
+                            "source_column": "Contact",
+                            "canonical_field": "full_name",
+                            "confident": True,
+                            "reason": "A person's name, not a company.",
+                        }
+                    ]
+                }
+            )
+        ]
+    )
+    app = _app(app_state, provider)
+    with _client(app) as client:
+        response = client.post(PREVIEW_URL, files={"file": ("leads.csv", MESSY_CSV)})
     assert response.status_code == 200
     body = response.json()
     columns = {c["source_column"]: c for c in body["columns"]}
@@ -243,7 +265,16 @@ def _lead_ids_for_batch(conn: psycopg.Connection, batch_id: str) -> list[uuid.UU
 def test_the_same_file_without_a_mapping_loses_the_company_column(
     api_client: TestClient, db_conn: psycopg.Connection, cleanup_ingest: Any
 ) -> None:
-    """Why the mapping step exists, demonstrated rather than asserted."""
+    """Why the mapping step exists, demonstrated rather than asserted.
+
+    Without a confirmed mapping, `arie.batches`' own alias table (which has
+    no entry for "Business") never recognises the company-name column, so
+    every lead still resolves to *a* company — `arie.identity.resolver`
+    always falls back to the email's domain — but with the domain itself as
+    its name, not the "Acme Gyms" a customer actually typed. That silent
+    downgrade, not a missing company row, is the real cost of skipping the
+    mapping step.
+    """
     cleanup_ingest.emails.extend(["sarah@acmegyms.example", "li@betasupps.example"])
     response = api_client.post("/batches", files={"file": ("leads.csv", MESSY_CSV)})
     assert response.status_code == 201
@@ -251,11 +282,12 @@ def test_the_same_file_without_a_mapping_loses_the_company_column(
     cleanup_ingest.lead_ids.extend(_lead_ids_for_batch(db_conn, batch["batch_id"]))
     with db_conn.cursor() as cur:
         cur.execute(
-            "SELECT COUNT(*) FROM leads WHERE batch_id = %s AND company_id IS NOT NULL",
+            "SELECT c.name FROM leads l JOIN companies c ON c.company_id = l.company_id "
+            "WHERE l.batch_id = %s ORDER BY c.name",
             (batch["batch_id"],),
         )
-        row = cur.fetchone()
-    assert row is not None and row[0] == 0
+        names = [r[0] for r in cur.fetchall()]
+    assert names == ["acmegyms.example", "betasupps.example"]
 
 
 @pytest.mark.parametrize(

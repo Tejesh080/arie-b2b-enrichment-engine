@@ -131,7 +131,7 @@ def _make_borderline(db_conn: psycopg.Connection, lead_id: str, *, unknown_field
     db_conn.commit()
 
 
-def test_decision_already_clear_needs_no_research(
+def test_all_researchable_fields_known_needs_no_research(
     api_client: TestClient,
     cleanup_ingest: IngestCleanup,
     job_queue: PostgresJobQueue,
@@ -140,6 +140,20 @@ def test_decision_already_clear_needs_no_research(
     db_conn: psycopg.Connection,
     cost_ledger: PostgresCostLedger,
 ) -> None:
+    """`AUTONOMOUS_EMAIL` lands well above `threshold_qualify` with all four
+    `ResearchTargetField`s already known — but that is `NO_USEFUL_QUESTION`,
+    not `DECISION_ALREADY_CLEAR`. The two are genuinely different: this
+    corpus identity's evidence also carries fields outside the four
+    researchable ones (`buying_intent`, `recent_trigger_event`), and
+    `arie.research.analyze_materiality`'s `disqualifier_pinned` check keeps
+    `bounds_lower` at 0 whenever *any* field is still unknown, researchable
+    or not — so the aggregate score range never collapses to "clear" even
+    though every field ARIE could actually go research already has an
+    answer. `DECISION_ALREADY_CLEAR` (bounds entirely clear of both
+    thresholds) is exercised at the unit level in `tests/unit/test_research.py`
+    against fabricated bounds instead, precisely because a real corpus lead
+    with any outstanding evidence at all does not naturally produce it.
+    """
     lead = _ingest_and_decide(
         api_client, cleanup_ingest, job_queue, research_pool, handlers, db_conn
     )
@@ -154,7 +168,7 @@ def test_decision_already_clear_needs_no_research(
     )
     assert plan is not None
     assert plan.approved is False
-    assert plan.reason_code is ResearchReasonCode.DECISION_ALREADY_CLEAR
+    assert plan.reason_code is ResearchReasonCode.NO_USEFUL_QUESTION
 
 
 def test_material_unknown_is_approved_and_executes(

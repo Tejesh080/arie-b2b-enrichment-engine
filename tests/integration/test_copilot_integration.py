@@ -91,7 +91,7 @@ def make_decided_lead(
                 "VALUES (%s, %s, %s, 'test', %s) RETURNING lead_id",
                 (person_id, company_id, organization_id, status),
             )
-            lead_id = cur.fetchone()[0]  # type: ignore[index]
+            lead_id: UUID = cur.fetchone()[0]  # type: ignore[index]
             cur.execute(
                 """
                 INSERT INTO decision_receipts (

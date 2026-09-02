@@ -157,18 +157,28 @@ class LeadListQueryPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     intent: CopilotIntent
-    priorities: Annotated[list[CustomerPriority], Field(default_factory=list, max_length=4)]
-    confidence_bands: Annotated[list[ConfidenceBand], Field(default_factory=list, max_length=3)]
-    research_states: Annotated[list[ResearchStatus], Field(default_factory=list, max_length=5)]
+    # The trailing `= Field(default_factory=list)` (rather than folding
+    # `default_factory` into the `Annotated[...]` metadata alongside the
+    # length constraint) is load-bearing for mypy: without a real assigned
+    # default, mypy's dataclass_transform sees these as required constructor
+    # arguments and flags every direct `LeadListQueryPlan(...)` call missing
+    # them, even though pydantic itself has always treated them as optional.
+    priorities: Annotated[list[CustomerPriority], Field(max_length=4)] = Field(default_factory=list)
+    confidence_bands: Annotated[list[ConfidenceBand], Field(max_length=3)] = Field(
+        default_factory=list
+    )
+    research_states: Annotated[list[ResearchStatus], Field(max_length=5)] = Field(
+        default_factory=list
+    )
     feedback_sentiment: FeedbackSentiment | None = None
     industries: Annotated[
         list[Annotated[str, Field(min_length=1, max_length=100)]],
-        Field(default_factory=list, max_length=5),
-    ]
+        Field(max_length=5),
+    ] = Field(default_factory=list)
     company_names: Annotated[
         list[Annotated[str, Field(min_length=1, max_length=200)]],
-        Field(default_factory=list, max_length=5),
-    ]
+        Field(max_length=5),
+    ] = Field(default_factory=list)
     limit: Annotated[int, Field(ge=1, le=MAX_LIST_LIMIT)] = DEFAULT_LIST_LIMIT
     sort: SortOption = SortOption.PRIORITY
 

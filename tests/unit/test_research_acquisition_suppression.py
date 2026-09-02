@@ -15,8 +15,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import cast
 from uuid import UUID
 
+from arie.live.outcome_cache import ProviderOutcomeGuard
 from arie.research_acquisition import _suppressed_providers
 
 ORG = UUID("11111111-1111-1111-1111-111111111111")
@@ -59,7 +61,7 @@ def test_recent_miss_suppresses_that_provider() -> None:
         misses={("abstract_company_enrichment", COMPANY, ORG): _Sentinel(NOW)}
     )
     result = _suppressed_providers(
-        guard,
+        cast(ProviderOutcomeGuard, guard),
         ("abstract_company_enrichment",),
         entity_type="company",
         entity_id=COMPANY,
@@ -73,7 +75,7 @@ def test_recent_uncertain_outcome_suppresses_that_provider() -> None:
         uncertain={("hunter_combined_enrichment", COMPANY, ORG): _Sentinel(NOW)}
     )
     result = _suppressed_providers(
-        guard,
+        cast(ProviderOutcomeGuard, guard),
         ("hunter_combined_enrichment",),
         entity_type="company",
         entity_id=COMPANY,
@@ -87,7 +89,7 @@ def test_unsuppressed_provider_is_unaffected_by_a_sibling_suppression() -> None:
         misses={("abstract_company_enrichment", COMPANY, ORG): _Sentinel(NOW)}
     )
     result = _suppressed_providers(
-        guard,
+        cast(ProviderOutcomeGuard, guard),
         ("abstract_company_enrichment", "hunter_combined_enrichment"),
         entity_type="company",
         entity_id=COMPANY,
@@ -104,7 +106,7 @@ def test_expired_suppression_does_not_block() -> None:
     turned into a suppression here."""
     guard = _FakeOutcomeGuard(misses={})
     result = _suppressed_providers(
-        guard,
+        cast(ProviderOutcomeGuard, guard),
         ("abstract_company_enrichment",),
         entity_type="company",
         entity_id=COMPANY,
@@ -120,7 +122,7 @@ def test_organization_id_is_forwarded_to_the_guard_for_every_candidate() -> None
     supplying it."""
     guard = _FakeOutcomeGuard()
     _suppressed_providers(
-        guard,
+        cast(ProviderOutcomeGuard, guard),
         ("abstract_company_enrichment",),
         entity_type="company",
         entity_id=COMPANY,
@@ -148,7 +150,11 @@ def test_no_candidates_means_no_suppression() -> None:
         misses={("abstract_company_enrichment", COMPANY, ORG): _Sentinel(NOW)}
     )
     result = _suppressed_providers(
-        guard, (), entity_type="company", entity_id=COMPANY, organization_id=ORG
+        cast(ProviderOutcomeGuard, guard),
+        (),
+        entity_type="company",
+        entity_id=COMPANY,
+        organization_id=ORG,
     )
     assert result == frozenset()
     assert guard.calls == []
@@ -161,7 +167,7 @@ def test_unresolved_entity_means_no_suppression() -> None:
         misses={("abstract_company_enrichment", COMPANY, ORG): _Sentinel(NOW)}
     )
     result = _suppressed_providers(
-        guard,
+        cast(ProviderOutcomeGuard, guard),
         ("abstract_company_enrichment",),
         entity_type="company",
         entity_id=None,
