@@ -33,6 +33,7 @@ from psycopg_pool import ConnectionPool
 
 from arie.discovery import repository
 from arie.discovery.buyer_search import BuyerSearchFn, execute_buyer_search
+from arie.discovery.company_identity import domain_derived_name, looks_like_a_company_name
 from arie.discovery.dedupe import dedupe_raw_candidates
 from arie.discovery.models import (
     DiscoveryCandidate,
@@ -53,10 +54,12 @@ from arie.discovery.providers import (
 from arie.discovery.repository import NewCandidate
 from arie.discovery.screening import screen_candidates
 from arie.discovery.search_planning import generate_search_plan
+from arie.discovery.suitability import is_non_business_domain
 from arie.discovery.website_verification import WebsiteVerifierFn, verify_candidate
 from arie.evidence.store import PostgresEvidenceStore
 from arie.icp_profiles import ICPProfileRecord
 from arie.identity.resolver import IdentityResolver
+from arie.intelligence.schemas import BusinessProfileDraft
 from arie.intelligence.targeting import stored_draft
 from arie.jobs.handlers import SimulatedEnrichmentRuntime, build_handlers, build_runtime
 from arie.jobs.queue import PostgresJobQueue
@@ -106,6 +109,37 @@ def _clamp(value: int, *, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
+def _buyer_summary(draft: BusinessProfileDraft) -> str:
+    """A description of the *customer being looked for*, built only from the
+    draft fields that describe them.
+
+    Discovery Quality Fix 4/5, and the subtlest defect the proof rerun
+    exposed. `plain_english_summary` is written for the business owner — it
+    opens by restating what *they* sell — so feeding it to the screener and
+    the website verifier as "the target customer" taught both to look for
+    companies resembling the seller. It rejected a real equipment dealer
+    ("no evidence of software or automation services") and accepted a
+    software vendor ("matching the target of AI automation"): precisely
+    backwards. Nothing describing the seller's own offering belongs in this
+    string."""
+    sections: list[tuple[str, list[str]]] = [
+        ("Kinds of company to look for", list(draft.ideal_company_types)),
+        ("Industries", [str(value) for value in draft.preferred_industries]),
+        (
+            "Company characteristics that make a better fit",
+            list(draft.preferred_company_characteristics),
+        ),
+        ("Good signs", list(draft.positive_indicators)),
+        ("Places", list(draft.preferred_geographies)),
+        (
+            "Not a fit",
+            [*draft.negative_indicators, *draft.hard_disqualifiers],
+        ),
+    ]
+    lines = [f"{label}: {', '.join(values)}" for label, values in sections if values]
+    return "\n".join(lines)
+
+
 def _profile_summary(profile: ICPProfileRecord | None) -> tuple[str, str, tuple[str, ...]]:
     """`(offering_summary, target_summary, ideal_company_types)` from a
     confirmed targeting profile's own stored AI draft where one exists —
@@ -119,7 +153,7 @@ def _profile_summary(profile: ICPProfileRecord | None) -> tuple[str, str, tuple[
         return profile.name, profile.name, ()
     return (
         draft.offering_summary or profile.name,
-        draft.plain_english_summary or profile.name,
+        _buyer_summary(draft) or draft.plain_english_summary or profile.name,
         tuple(draft.ideal_company_types),
     )
 
@@ -238,6 +272,7 @@ def run_discovery(
         requested_count=requested_count,
         funnel=funnel,
         profile=profile,
+        market=market,
         buyer_search_fn=buyer_search_fn,
         now=now,
     )
@@ -322,7 +357,20 @@ def _run_stages(
             continue
     raw = raw[:candidate_cap]
     unique = dedupe_raw_candidates(raw)
-    funnel = replace(funnel, raw_candidates=len(raw), unique_companies=len(unique))
+    # Discovery Quality Fix 6: a directory, aggregator or social platform is
+    # never itself a prospect, so it is dropped here — before screening spends
+    # a model call on it, before verification spends a fetch, and long before
+    # it could reach a buyer lookup. Counted, not silently swallowed.
+    business_only = [
+        (domain, item) for domain, item in unique if not is_non_business_domain(domain)
+    ]
+    funnel = replace(
+        funnel,
+        raw_candidates=len(raw),
+        unique_companies=len(business_only),
+        excluded_non_business=len(unique) - len(business_only),
+    )
+    unique = business_only
 
     with pool.connection() as conn:
         candidates = repository.insert_candidates(
@@ -349,6 +397,7 @@ def _run_stages(
         organization_id=organization_id,
         candidates=candidates,
         target_summary=target_summary,
+        seller_offering=offering_summary,
         now=now,
     )
     counts = {c: 0 for c in ScreeningClass}
@@ -413,12 +462,31 @@ def _run_stages(
             domain=candidate.domain,
             target_summary=target_summary,
             now=now,
+            # Discovery Quality Fix 7: the page search actually found, as the
+            # same-domain fallback when the homepage yields nothing.
+            source_url=candidate.source_url,
+            seller_offering=offering_summary,
         )
         website_calls += verification.pages_fetched
         website_cost += verification.website_cost_usd
         if verification.llm_used:
             verification_llm_calls += 1
             verification_llm_cost += verification.llm_cost_usd
+
+        # Discovery Quality Fix 1, step 2: a name the company's own site
+        # states outranks the domain-derived fallback — but never the
+        # explicit provider metadata that produced a real name already.
+        verified_name = verification.facts.company_name_on_site if verification.facts else None
+        upgraded_name = (
+            verified_name
+            if (
+                looks_like_a_company_name(verified_name)
+                and candidate.company_name == domain_derived_name(candidate.domain)
+            )
+            else None
+        )
+        if upgraded_name is not None:
+            candidate = replace(candidate, company_name=upgraded_name)
 
         with pool.connection() as conn:
             repository.update_candidate_verification(
@@ -428,6 +496,7 @@ def _run_stages(
                 status=verification.status,
                 verified_facts=verification.facts.model_dump() if verification.facts else None,
                 verified_at=now,
+                company_name=upgraded_name,
             )
             conn.commit()
 
@@ -506,6 +575,7 @@ def _build_opportunities(
     requested_count: int,
     funnel: DiscoveryFunnel,
     profile: ICPProfileRecord | None,
+    market: str | None,
     now: datetime,
     buyer_search_fn: BuyerSearchFn = execute_buyer_search,
 ) -> tuple[list[Opportunity], DiscoveryFunnel]:
@@ -519,6 +589,7 @@ def _build_opportunities(
         execution_mode = get_execution_mode(conn, organization_id=organization_id)
 
     preferred_seniorities, preferred_functions = _preferred_buyer_traits(profile)
+    seller_offering, _, _ = _profile_summary(profile)
     evidence_store = PostgresEvidenceStore(pool)
     outcome_guard = ProviderOutcomeGuard(pool)
 
@@ -543,6 +614,8 @@ def _build_opportunities(
                 execution_mode=execution_mode,
                 preferred_seniorities=preferred_seniorities,
                 preferred_functions=preferred_functions,
+                seller_offering=seller_offering,
+                market=market,
                 now=now,
                 outcome_guard=outcome_guard,
                 buyer_search_fn=buyer_search_fn,
@@ -605,6 +678,7 @@ def list_opportunities(
     run_id: UUID,
     requested_count: int,
     profile: ICPProfileRecord | None,
+    market: str | None = None,
     now: datetime,
     buyer_search_fn: BuyerSearchFn = execute_buyer_search,
 ) -> list[Opportunity]:
@@ -623,6 +697,7 @@ def list_opportunities(
         requested_count=requested_count,
         funnel=DiscoveryFunnel(),
         profile=profile,
+        market=market,
         buyer_search_fn=buyer_search_fn,
         now=now,
     )

@@ -32,20 +32,32 @@ __all__ = ["ScreeningRunResult", "screen_candidates"]
 _MAX_SNIPPET_CHARS = 220
 _SCREENING_MAX_OUTPUT_TOKENS = 4000
 
-_INSTRUCTIONS = """You are ARIE's discovery screener. You are given a customer's \
-targeting profile and a batch of candidate companies found by web search — each \
-with only a name, a domain, and a short search snippet. Classify each one using \
-ONLY what the name, domain, and snippet actually say.
+_INSTRUCTIONS = """You are ARIE's discovery screener. You are given a \
+description of the kind of customer a business wants to reach, a summary of \
+what that business SELLS, and a batch of candidate companies found by web \
+search — each with only a name, a domain, and a short search snippet. \
+Classify each one using ONLY what the name, domain, and snippet actually say.
+
+WHAT YOU ARE SCREENING FOR
+
+Companies that could BUY from the seller. A candidate does not need to \
+resemble the seller and should not: the buyer is in some other line of work \
+entirely. Two kinds of result must always be `unlikely`, however good the \
+snippet reads: (a) a company that sells the same kind of thing the seller \
+sells — a competitor or another vendor in that market; and (b) a directory, \
+ranking, listicle, marketplace, news article or blog post about companies, \
+rather than a company's own site.
 
 RULES
 
 1. Classify every candidate_id you were given exactly once. Never invent a \
 candidate_id that was not given to you.
 
-2. `promising`: the snippet gives clear, specific evidence this company matches \
-the target description. `possible`: plausible but not clearly confirmed. \
-`unlikely`: the snippet suggests a clear mismatch (wrong kind of business, \
-wrong market). `insufficient_info`: the snippet says too little to judge either \
+2. `promising`: the snippet gives clear, specific evidence this company is \
+the kind of business described in the target. `possible`: plausible but not \
+clearly confirmed. `unlikely`: a clear mismatch (wrong kind of business, \
+wrong market, a competing vendor, or a directory/article rather than a \
+company). `insufficient_info`: the snippet says too little to judge either \
 way — this is a correct, honest answer, not a failure.
 
 3. short_reason must cite what the snippet or name actually said. Never assert \
@@ -88,6 +100,7 @@ def _screen_one_batch(
     organization_id: UUID,
     batch: list[DiscoveryCandidate],
     target_summary: str,
+    seller_offering: str,
     now: datetime,
 ) -> tuple[dict[UUID, tuple[ScreeningClass, str]], bool, Decimal]:
     result = llm.generate(
@@ -98,6 +111,7 @@ def _screen_one_batch(
         now=now,
         untrusted=(
             UntrustedBlock(label="target_customer", text=target_summary[:2000]),
+            UntrustedBlock(label="what_the_seller_sells", text=seller_offering[:500]),
             UntrustedBlock(label="candidates", text=_render_batch(batch)),
         ),
         max_output_tokens=_SCREENING_MAX_OUTPUT_TOKENS,
@@ -134,6 +148,7 @@ def screen_candidates(
     candidates: list[DiscoveryCandidate],
     target_summary: str,
     now: datetime,
+    seller_offering: str = "",
 ) -> ScreeningRunResult:
     """Classify every candidate, `MAX_SCREENING_BATCH` at a time. `llm=None`
     (or an unavailable model, on any given batch) degrades that batch to
@@ -157,6 +172,7 @@ def screen_candidates(
             organization_id=organization_id,
             batch=batch,
             target_summary=target_summary,
+            seller_offering=seller_offering,
             now=now,
         )
         screened.update(batch_result)

@@ -24,14 +24,21 @@ from uuid import UUID
 import psycopg
 
 from arie.api.receipt import build_receipt
-from arie.discovery.buyer_search import BuyerSearchFn, BuyerSearchOutcome, execute_buyer_search
+from arie.discovery.buyer_search import (
+    BuyerSearchFn,
+    BuyerSearchOutcome,
+    buyer_search_eligible,
+    execute_buyer_search,
+)
 from arie.discovery.models import (
     BuyerSignal,
     DiscoveryCandidate,
+    DiscoverySuitability,
     EmailStatus,
     Opportunity,
     OpportunityNextAction,
 )
+from arie.discovery.suitability import assess_suitability
 from arie.evidence.store import PostgresEvidenceStore
 from arie.ledger.store import PostgresCostLedger
 from arie.live.outcome_cache import ProviderOutcomeGuard
@@ -49,6 +56,43 @@ _PERSON_FIELDS = frozenset(
     {ResearchTargetField.TITLE_SENIORITY, ResearchTargetField.TITLE_FUNCTION}
 )
 _USABLE_EMAIL = frozenset({EmailStatus.VERIFIED, EmailStatus.LIKELY})
+
+_PRIORITY_STRENGTH: dict[CustomerPriority, int] = {
+    CustomerPriority.CONTACT_FIRST: 3,
+    CustomerPriority.WORTH_PURSUING: 2,
+    CustomerPriority.REVIEW: 1,
+    CustomerPriority.SKIP: 0,
+}
+
+_SUITABILITY_CEILING: dict[DiscoverySuitability, CustomerPriority | None] = {
+    DiscoverySuitability.SUPPORTED: None,
+    DiscoverySuitability.UNCERTAIN: CustomerPriority.REVIEW,
+    DiscoverySuitability.CONTRADICTED: CustomerPriority.SKIP,
+}
+"""Discovery Quality Fix 2/3: what real public evidence permits, as a ceiling
+on what the scorer produced.
+
+The scorer is untouched — it still runs exactly as it does for every other
+lead, and in `simulated` provider mode it is still fed simulated
+firmographics. What changes is that those simulated firmographics can no
+longer *outrank* a real reading of the company's own website. `UNCERTAIN`
+caps at `REVIEW` specifically because a discovery-origin company ARIE could
+not verify has nothing but simulated evidence arguing for it: "contact this
+company first" is a claim the run cannot support, while "worth a look" is.
+
+Ceilings only, never lifts: a company the scorer disliked stays disliked no
+matter how good its website looks."""
+
+
+def _apply_ceiling(
+    priority: CustomerPriority, suitability: DiscoverySuitability
+) -> CustomerPriority:
+    ceiling = _SUITABILITY_CEILING[suitability]
+    if ceiling is None:
+        return priority
+    if _PRIORITY_STRENGTH[priority] <= _PRIORITY_STRENGTH[ceiling]:
+        return priority
+    return ceiling
 
 
 @dataclass(frozen=True)
@@ -145,6 +189,8 @@ def build_opportunity(
     now: datetime,
     preferred_seniorities: tuple[str, ...] = (),
     preferred_functions: tuple[str, ...] = (),
+    seller_offering: str = "",
+    market: str | None = None,
     outcome_guard: ProviderOutcomeGuard | None = None,
     buyer_search_fn: BuyerSearchFn = execute_buyer_search,
 ) -> OpportunityBuildResult:
@@ -163,6 +209,18 @@ def build_opportunity(
         )
 
     recommendation = build_recommendation(lead_id, DecisionSignal.from_receipt(receipt))
+
+    # The gate runs before anything is spent on this lead's buyer, and before
+    # any priority is reported — see `_SUITABILITY_CEILING`.
+    assessment = assess_suitability(
+        domain=candidate.domain,
+        verification_status=candidate.verification_status,
+        verified_facts=candidate.verified_facts,
+        seller_offering=seller_offering,
+        market=market,
+    )
+    priority = _apply_ceiling(recommendation.priority, assessment.suitability)
+    downgraded = priority is not recommendation.priority
 
     research_attempted = False
     research_performed = False
@@ -205,7 +263,13 @@ def build_opportunity(
     alternate_buyers: list[BuyerSignal] = []
 
     outcome: BuyerSearchOutcome | None = None
-    if person_id is not None:
+    # Discovery Quality Fix 8: the gate refuses here, at the call site,
+    # rather than trusting the provider adapter to refuse for us. A company
+    # real evidence contradicted — or never confirmed — cannot spend a buyer
+    # lookup however well simulated firmographics scored it, and that holds
+    # for *any* injected buyer-search function, not only the Hunter one that
+    # happens to re-check the same gate.
+    if person_id is not None and buyer_search_eligible(priority=priority, existing_buyer_name=None):
         outcome = buyer_search_fn(
             conn,
             ledger,
@@ -214,7 +278,7 @@ def build_opportunity(
             lead_id=lead_id,
             person_id=person_id,
             domain=candidate.domain,
-            priority=recommendation.priority,
+            priority=priority,
             preferred_seniorities=preferred_seniorities,
             preferred_functions=preferred_functions,
             now=now,
@@ -222,19 +286,28 @@ def build_opportunity(
         if outcome.best is not None:
             buyer = BuyerSignal.from_candidate(outcome.best)
             alternate_buyers = [BuyerSignal.from_candidate(c) for c in outcome.alternates]
+        # A gated-out company keeps whatever role-only signal the ordinary
+        # pipeline produced and nothing more: no lookup, and no named buyer
+        # implying a confidence in the *company* that the evidence does not
+        # support.
 
-    next_action = _next_action(recommendation.priority, buyer)
+    next_action = _next_action(priority, buyer)
+    short_reason = (
+        f"{recommendation.short_reason} {assessment.reason}".strip()
+        if downgraded
+        else recommendation.short_reason
+    )
 
     opportunity = Opportunity(
         candidate_id=candidate.candidate_id,
         lead_id=lead_id,
         company_name=candidate.company_name,
         domain=candidate.domain,
-        priority=str(recommendation.priority),
+        priority=str(priority),
         next_action=str(next_action),
         score=recommendation.score,
         confidence=recommendation.confidence,
-        short_reason=recommendation.short_reason,
+        short_reason=short_reason,
         key_evidence=recommendation.key_evidence,
         missing_information=recommendation.missing_information,
         buyer=buyer,
@@ -246,6 +319,8 @@ def build_opportunity(
         verification_status=candidate.verification_status,
         verified_facts=candidate.verified_facts,
         website_verified_at=candidate.website_verified_at,
+        suitability=assessment.suitability,
+        suitability_reason=assessment.reason,
     )
     return OpportunityBuildResult(
         opportunity=opportunity,
@@ -253,7 +328,7 @@ def build_opportunity(
         research_performed=research_performed,
         was_buyer_lookup=was_buyer_lookup,
         research_cost_usd=research_cost,
-        buyer_search_eligible=recommendation.priority
+        buyer_search_eligible=priority
         in (CustomerPriority.CONTACT_FIRST, CustomerPriority.WORTH_PURSUING),
         buyer_search_performed=outcome.provider_called if outcome is not None else False,
         buyer_found=buyer is not None and buyer.name_known,

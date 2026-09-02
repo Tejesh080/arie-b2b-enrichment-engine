@@ -1392,6 +1392,7 @@ def register_routes(app: FastAPI) -> None:
             run_id=run_id,
             requested_count=run.requested_opportunity_count,
             profile=profile,
+            market=run.market,
             now=datetime.now(UTC),
         )
         return DiscoveryOpportunitiesResponse(

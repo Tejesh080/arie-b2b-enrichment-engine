@@ -33,6 +33,7 @@ __all__ = [
     "DiscoveryRun",
     "DiscoveryRunStatus",
     "DiscoverySearchPlan",
+    "DiscoverySuitability",
     "EmailStatus",
     "Opportunity",
     "OpportunityNextAction",
@@ -91,6 +92,29 @@ class VerificationStatus(StrEnum):
     SKIPPED = "skipped"
     """Never attempted — reserved for a candidate that didn't reach this
     stage at all (discarded by cheap screening)."""
+
+
+class DiscoverySuitability(StrEnum):
+    """How much *real public evidence* supports treating a discovered company
+    as a prospect — see `arie.discovery.suitability`, which decides it
+    deterministically, and `arie.discovery.opportunity`, which applies it as
+    a ceiling on the priority the (simulated-in-this-mode) scorer produced.
+
+    Deliberately separate from `VerificationStatus`: that says what happened
+    when ARIE tried to fetch a website, this says what the fetched evidence
+    means for this particular customer's target."""
+
+    SUPPORTED = "supported"
+    """Real website evidence is consistent with the target. The only state
+    that may keep a positive priority, and the only state that may spend a
+    buyer-lookup call."""
+    UNCERTAIN = "uncertain"
+    """No usable real evidence either way. Never a rejection — but never a
+    confident recommendation either, because everything still arguing for it
+    is simulated."""
+    CONTRADICTED = "contradicted"
+    """Real evidence argues against it: a directory or content platform, the
+    wrong geography, or a business selling what the customer sells."""
 
 
 class EmailStatus(StrEnum):
@@ -177,6 +201,12 @@ class VerifiedCompanyFacts(BaseModel):
     `arie.discovery.website_verification.verify_candidate`. `insufficient_
     content` is a correct, honest answer when the page said too little to
     judge either way, not a failure."""
+    company_name_on_site: str | None = Field(default=None, max_length=80)
+    """The name the site calls *itself* (masthead, logo alt text, "About
+    <name>", copyright line) — Discovery Quality Fix 1's "verified site
+    identity" step. `None` whenever the pages never state one; a page title
+    is not an answer, and `arie.discovery.company_identity` rejects one that
+    reads like a headline anyway."""
     business_description: str = Field(max_length=400)
     industry_category: str = Field(max_length=100)
     customer_type: Literal["b2b", "b2c", "both", "unclear"]
@@ -200,10 +230,16 @@ class RawDiscoveryCandidate:
     intact, nothing normalised or judged yet."""
 
     company_name: str
+    """Already resolved by `arie.discovery.company_identity` — never the raw
+    page title the search API returned (Discovery Quality Fix 1)."""
     url: str
     snippet: str
     source_provider: str
     search_query: str
+    site_name: str | None = None
+    """Whatever the provider reported as the *site's* own name (`og:site_name`
+    and friends), kept separately from `company_name` so the resolution chain
+    stays inspectable."""
 
 
 @dataclass(frozen=True)
@@ -244,6 +280,11 @@ class DiscoveryFunnel:
     search_queries: int = 0
     raw_candidates: int = 0
     unique_companies: int = 0
+    excluded_non_business: int = 0
+    """Deduped domains dropped before they cost anything — directories,
+    aggregators and social/content platforms (`arie.discovery.suitability.
+    is_non_business_domain`). Counted rather than silently discarded, so a
+    customer can see search volume that never became prospects."""
     screened: int = 0
     promising: int = 0
     possible: int = 0
@@ -284,6 +325,7 @@ class DiscoveryFunnel:
             "search_queries": self.search_queries,
             "raw_candidates": self.raw_candidates,
             "unique_companies": self.unique_companies,
+            "excluded_non_business": self.excluded_non_business,
             "screened": self.screened,
             "promising": self.promising,
             "possible": self.possible,
@@ -323,6 +365,7 @@ class DiscoveryFunnel:
             search_queries=_int("search_queries"),
             raw_candidates=_int("raw_candidates"),
             unique_companies=_int("unique_companies"),
+            excluded_non_business=_int("excluded_non_business"),
             screened=_int("screened"),
             promising=_int("promising"),
             possible=_int("possible"),
@@ -454,6 +497,12 @@ class Opportunity:
     verification_status: VerificationStatus | None = None
     verified_facts: dict[str, Any] | None = None
     website_verified_at: datetime | None = None
+    suitability: DiscoverySuitability = DiscoverySuitability.UNCERTAIN
+    """The gate that produced `priority`'s ceiling — see
+    `arie.discovery.suitability`. Defaults to `UNCERTAIN` so a caller
+    constructing an `Opportunity` without one can never accidentally claim
+    real evidence that was never gathered."""
+    suitability_reason: str | None = None
 
     @property
     def is_contactable(self) -> bool:

@@ -312,6 +312,8 @@ def test_discovery_run_rejects_a_candidate_after_website_verification(
         domain: str,
         target_summary: str,
         now: datetime,
+        source_url: str | None = None,
+        seller_offering: str = "",
     ) -> VerificationResult:
         if not rejected_domains:
             rejected_domains.append(domain)
@@ -500,3 +502,150 @@ def test_discovery_run_finds_and_records_a_real_buyer(
     again = next(o for o in opportunities_again if o.candidate_id == opportunity.candidate_id)
     assert again.buyer is not None
     assert again.buyer.full_name == "Sarah Chen"
+
+
+def test_unverifiable_company_is_downgraded_and_never_costs_a_buyer_lookup(
+    discovery_pool: ConnectionPool,
+    job_queue: PostgresJobQueue,
+    identity_resolver: IdentityResolver,
+    discovery_cleanup: list[uuid.UUID],
+) -> None:
+    """Discovery Quality Fix 3/8, the defect the contactable-opportunity
+    proof found: a company whose website ARIE could not read ranked
+    `contact_first` at 96.8 on simulated firmographics alone, and that
+    simulated confidence then bought a real Hunter call.
+
+    With the suitability gate in place the same run must cap every such
+    company at `review` and spend nothing on finding a buyer for it."""
+    from arie.discovery.models import DiscoverySuitability
+    from arie.discovery.website_verification import VerificationResult
+
+    def _unreachable_website(
+        llm: LLMService | None,
+        *,
+        organization_id: uuid.UUID,
+        domain: str,
+        target_summary: str,
+        now: datetime,
+        source_url: str | None = None,
+        seller_offering: str = "",
+    ) -> VerificationResult:
+        return VerificationResult(
+            status=VerificationStatus.UNAVAILABLE,
+            facts=None,
+            pages_fetched=0,
+            website_cost_usd=Decimal(0),
+            llm_used=False,
+            llm_cost_usd=Decimal(0),
+        )
+
+    buyer_calls: list[str] = []
+
+    def _record_buyer_call(*args: object, **kwargs: object) -> object:
+        buyer_calls.append(str(kwargs.get("domain")))
+        return fake_buyer_search(*args, **kwargs)  # type: ignore[arg-type]
+
+    ledger = PostgresCostLedger(discovery_pool)
+    llm = LLMService(
+        discovery_pool,
+        ledger=ledger,
+        provider=FakeLLMProvider(handler=_classify_all_promising_handler),
+    )
+    with discovery_pool.connection() as conn:
+        profile = get_active_profile(conn, organization_id=LEGACY_ORGANIZATION_ID)
+
+    run, opportunities = run_discovery(
+        discovery_pool,
+        resolver=identity_resolver,
+        queue=job_queue,
+        ledger=ledger,
+        llm=llm,
+        organization_id=LEGACY_ORGANIZATION_ID,
+        profile=profile,
+        requested_opportunity_count=5,
+        market="Australia",
+        max_candidates=12,
+        created_by_user_id=None,
+        now=datetime.now(UTC),
+        discovery_provider=FakeDiscoveryProvider(),
+        website_verifier=_unreachable_website,
+        buyer_search_fn=_record_buyer_call,  # type: ignore[arg-type]
+    )
+    discovery_cleanup.append(run.run_id)
+
+    assert run.status is DiscoveryRunStatus.COMPLETE
+    assert opportunities, "the run should still return opportunities, just downgraded ones"
+    for opportunity in opportunities:
+        assert opportunity.suitability is DiscoverySuitability.UNCERTAIN
+        # Never `contact_first`/`worth_pursuing`: nothing real supports it.
+        assert opportunity.priority in ("review", "skip")
+        assert opportunity.next_action in ("research_more", "skip")
+        assert not opportunity.is_contactable
+    assert buyer_calls == []
+    assert run.funnel.buyer_lookup_eligible == 0
+    assert run.funnel.buyer_lookups == 0
+
+
+def test_directory_domains_never_become_candidates(
+    discovery_pool: ConnectionPool,
+    job_queue: PostgresJobQueue,
+    identity_resolver: IdentityResolver,
+    discovery_cleanup: list[uuid.UUID],
+) -> None:
+    """Discovery Quality Fix 6: GoodFirms was a ranked 'opportunity' in the
+    previous proof run. A directory must be dropped before it costs a
+    screening call, a website fetch, or a buyer lookup."""
+    from arie.discovery.models import RawDiscoveryCandidate
+
+    class _DirectoryHeavyProvider:
+        name = "fake_directory_heavy"
+
+        def search(self, query: str, limit: int) -> list[RawDiscoveryCandidate]:
+            rows = [
+                ("https://www.goodfirms.co/artificial-intelligence/australia", "GoodFirms"),
+                ("https://www.linkedin.com/pulse/choosing-best-systems", "LinkedIn"),
+                ("https://realfreightco.com.au/about", "Real Freight Co"),
+            ]
+            return [
+                RawDiscoveryCandidate(
+                    company_name=name,
+                    url=url,
+                    snippet="A search result.",
+                    source_provider=self.name,
+                    search_query=query,
+                )
+                for url, name in rows
+            ]
+
+    ledger = PostgresCostLedger(discovery_pool)
+    llm = LLMService(
+        discovery_pool,
+        ledger=ledger,
+        provider=FakeLLMProvider(handler=_classify_all_promising_handler),
+    )
+    with discovery_pool.connection() as conn:
+        profile = get_active_profile(conn, organization_id=LEGACY_ORGANIZATION_ID)
+
+    run, opportunities = run_discovery(
+        discovery_pool,
+        resolver=identity_resolver,
+        queue=job_queue,
+        ledger=ledger,
+        llm=llm,
+        organization_id=LEGACY_ORGANIZATION_ID,
+        profile=profile,
+        requested_opportunity_count=5,
+        market="Australia",
+        max_candidates=12,
+        created_by_user_id=None,
+        now=datetime.now(UTC),
+        discovery_provider=_DirectoryHeavyProvider(),
+        website_verifier=fake_website_verifier,
+        buyer_search_fn=fake_buyer_search,
+    )
+    discovery_cleanup.append(run.run_id)
+
+    assert run.funnel.excluded_non_business == 2
+    assert run.funnel.unique_companies == 1
+    domains = {o.domain for o in opportunities}
+    assert domains == {"realfreightco.com.au"}

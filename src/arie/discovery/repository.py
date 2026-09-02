@@ -202,9 +202,13 @@ _UPDATE_CANDIDATE_VERIFICATION = """
     UPDATE discovery_candidates
     SET verification_status = %(verification_status)s,
         verified_facts = %(verified_facts)s,
-        website_verified_at = %(website_verified_at)s
+        website_verified_at = %(website_verified_at)s,
+        company_name = COALESCE(%(company_name)s, company_name)
     WHERE candidate_id = %(candidate_id)s AND organization_id = %(organization_id)s
 """
+"""`company_name` is only ever *upgraded* here, never cleared: `NULL` means
+"verification found no better name than the one already stored", which is the
+normal case (Discovery Quality Fix 1)."""
 
 
 def _row_to_candidate(row: dict[str, Any]) -> DiscoveryCandidate:
@@ -315,6 +319,7 @@ def update_candidate_verification(
     status: VerificationStatus,
     verified_facts: dict[str, Any] | None,
     verified_at: datetime,
+    company_name: str | None = None,
 ) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -325,5 +330,6 @@ def update_candidate_verification(
                 "verification_status": str(status),
                 "verified_facts": Jsonb(verified_facts) if verified_facts is not None else None,
                 "website_verified_at": verified_at,
+                "company_name": company_name,
             },
         )

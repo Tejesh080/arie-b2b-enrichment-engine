@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import httpx
 
 from arie.config import FIRECRAWL, FirecrawlConfig
+from arie.discovery.company_identity import resolve_company_name
+from arie.discovery.dedupe import canonical_domain
 from arie.discovery.models import RawDiscoveryCandidate
 
 __all__ = [
@@ -34,6 +37,25 @@ __all__ = [
 ]
 
 _LOGGER = logging.getLogger("arie.discovery.providers")
+
+_SITE_NAME_KEYS = ("ogSiteName", "og:site_name", "siteName", "site_name", "application-name")
+"""Where a search row reports what the *site* is called, as opposed to what
+one page on it is titled. Read defensively: a provider that reports none of
+these simply leaves `resolve_company_name` to fall through to the domain."""
+
+
+def _site_name(row: Mapping[str, Any]) -> str | None:
+    sources: list[Mapping[str, Any]] = [row]
+    metadata = row.get("metadata")
+    if isinstance(metadata, Mapping):
+        sources.append(metadata)
+    for source in sources:
+        for key in _SITE_NAME_KEYS:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:80]
+    return None
+
 
 MAX_LIMIT_PER_QUERY = 25
 """A search call is bounded regardless of what a caller asks for — the same
@@ -164,15 +186,24 @@ class FirecrawlDiscoveryProvider:
             url = str(row.get("url") or "").strip()
             if not url:
                 continue
-            title = str(row.get("title") or url).strip()[:300]
             description = str(row.get("description") or "").strip()[:500]
+            site_name = _site_name(row)
+            domain = canonical_domain(url)
             candidates.append(
                 RawDiscoveryCandidate(
-                    company_name=title,
+                    # Discovery Quality Fix 1: the row's `title` is the title
+                    # of one *page*, never the company's name, so it is not
+                    # in this chain at all — see `company_identity`.
+                    company_name=resolve_company_name(
+                        provider_site_name=site_name,
+                        verified_site_name=None,
+                        domain=domain or url,
+                    ),
                     url=url,
                     snippet=description,
                     source_provider=self.name,
                     search_query=query,
+                    site_name=site_name,
                 )
             )
         return candidates

@@ -1708,6 +1708,7 @@ class DiscoveryFunnelResponse(BaseModel):
     search_queries: int
     raw_candidates: int
     unique_companies: int
+    excluded_non_business: int
     screened: int
     promising: int
     possible: int
@@ -1737,6 +1738,7 @@ class DiscoveryFunnelResponse(BaseModel):
             search_queries=funnel.search_queries,
             raw_candidates=funnel.raw_candidates,
             unique_companies=funnel.unique_companies,
+            excluded_non_business=funnel.excluded_non_business,
             screened=funnel.screened,
             promising=funnel.promising,
             possible=funnel.possible,
@@ -1841,6 +1843,8 @@ class OpportunityResponse(BaseModel):
     verification_status: str | None
     verified_facts: dict[str, Any] | None
     website_verified_at: datetime | None
+    suitability: str
+    suitability_reason: str | None
     is_contactable: bool
 
     @classmethod
@@ -1870,6 +1874,8 @@ class OpportunityResponse(BaseModel):
             ),
             verified_facts=opportunity.verified_facts,
             website_verified_at=opportunity.website_verified_at,
+            suitability=str(opportunity.suitability),
+            suitability_reason=opportunity.suitability_reason,
             is_contactable=opportunity.is_contactable,
         )
 
