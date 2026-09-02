@@ -396,6 +396,35 @@ class LiveProviderConfig:
 
 
 @dataclass(frozen=True)
+class FirecrawlConfig:
+    """Config for the Discovery Pivot's real discovery provider —
+    ``arie.discovery.providers.FirecrawlDiscoveryProvider``.
+
+    Firecrawl's search endpoint (``POST /v1/search``, verified live against
+    the vendor 2026-09-03): a bearer-token ``Authorization`` header, a JSON
+    body of ``{"query", "limit"}``, and a response of
+    ``{"success", "data": [{"url", "title", "description"}], "id"}``. No
+    adapter existed before this — ``.env.example`` called the key "deferred,
+    no adapter written" — so nothing here reuses an established contract the
+    way ``LiveProviderConfig`` reuses Abstract's.
+    """
+
+    api_key: str = field(default_factory=lambda: os.getenv("FIRECRAWL_API_KEY", ""))
+    base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "FIRECRAWL_BASE_URL", "https://api.firecrawl.dev/v1/search"
+        ).rstrip("/")
+    )
+    timeout_seconds: float = field(
+        default_factory=lambda: _env_float("FIRECRAWL_TIMEOUT_SECONDS", 20.0)
+    )
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key)
+
+
+@dataclass(frozen=True)
 class ApolloPersonConfig:
     """Config for the second real enrichment adapter — ``arie.providers.live_apollo``.
 
@@ -902,6 +931,7 @@ OBSERVABILITY = ObservabilityConfig()
 LLM = LLMConfig()
 INTELLIGENCE = IntelligenceConfig()
 LIVE_PROVIDER = LiveProviderConfig()
+FIRECRAWL = FirecrawlConfig()
 APOLLO_PERSON = ApolloPersonConfig()
 HUNTER = HunterConfig()
 LIVE_STRATEGY = LiveStrategyConfig()

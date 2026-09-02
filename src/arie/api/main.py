@@ -72,6 +72,9 @@ from arie.api.schemas import (
     CreateOrganizationRequest,
     CreateOrganizationResponse,
     DashboardResponse,
+    DiscoveryOpportunitiesResponse,
+    DiscoveryRunResponse,
+    DiscoveryRunWithOpportunitiesResponse,
     EffectiveEntitlementsResponse,
     ExecuteResearchRequest,
     FeedbackInsightsResponse,
@@ -92,6 +95,7 @@ from arie.api.schemas import (
     MappingPreviewResponse,
     MemberResponse,
     OnboardingStatusResponse,
+    OpportunityResponse,
     OrganizationBillingResponse,
     OrganizationResponse,
     OutcomeAnalysisResponse,
@@ -109,6 +113,7 @@ from arie.api.schemas import (
     SetProviderCredentialRequest,
     SetProviderEnabledRequest,
     StartCheckoutRequest,
+    StartDiscoveryRunRequest,
     SubmitFeedbackRequest,
     TargetingConfirmRequest,
     TargetingDraftRequest,
@@ -170,6 +175,8 @@ from arie.config import DATABASE, FRONTEND, OBSERVABILITY
 from arie.copilot_service import answer_lead_query, answer_list_query
 from arie.credential_resolver import resolve_provider_credential
 from arie.dashboard import load_dashboard
+from arie.discovery import repository as discovery_repository
+from arie.discovery.orchestrator import list_opportunities, run_discovery
 from arie.evidence.store import PostgresEvidenceStore
 from arie.feedback import get_feedback, submit_feedback
 from arie.feedback_learning_service import (
@@ -1297,6 +1304,91 @@ def register_routes(app: FastAPI) -> None:
         if result is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no lead {lead_id}")
         return LeadCopilotResponseSchema.from_result(result)
+
+    # ------------------------------------------------------------- discovery --
+    #
+    # Product Pivot. "Tell me what you sell and I will find the opportunities
+    # worth your attention" — `POST /discovery/runs` walks a customer's
+    # already-confirmed targeting profile through search planning, discovery,
+    # screening, and promotion into the exact same lead pipeline every other
+    # route in this file already reads, synchronously, and returns the ranked
+    # shortlist in one round trip. See `arie.discovery.orchestrator` for why
+    # synchronous is the right shape for this pivot slice.
+
+    @app.post("/discovery/runs", response_model=DiscoveryRunWithOpportunitiesResponse)
+    def post_discovery_run(
+        payload: StartDiscoveryRunRequest, state: StateDep, auth: AuthDep, llm: LLMServiceDep
+    ) -> DiscoveryRunWithOpportunitiesResponse:
+        _require_jwt_session(auth)
+        assert auth.user_id is not None  # guaranteed by the JWT check above
+        with state.pool.connection() as conn:
+            profile = get_active_profile(conn, organization_id=auth.organization_id)
+        run, opportunities = run_discovery(
+            state.pool,
+            resolver=state.resolver,
+            queue=state.queue,
+            ledger=state.ledger,
+            llm=llm,
+            organization_id=auth.organization_id,
+            profile=profile,
+            requested_opportunity_count=payload.requested_opportunity_count,
+            market=payload.market,
+            max_candidates=payload.max_candidates,
+            created_by_user_id=auth.user_id,
+            now=datetime.now(UTC),
+        )
+        return DiscoveryRunWithOpportunitiesResponse(
+            run=DiscoveryRunResponse.from_run(run),
+            opportunities=[OpportunityResponse.from_opportunity(o) for o in opportunities],
+        )
+
+    @app.get("/discovery/runs", response_model=list[DiscoveryRunResponse])
+    def list_discovery_runs(state: StateDep, auth: AuthDep) -> list[DiscoveryRunResponse]:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            runs = discovery_repository.list_runs(conn, organization_id=auth.organization_id)
+        return [DiscoveryRunResponse.from_run(run) for run in runs]
+
+    @app.get("/discovery/runs/{run_id}", response_model=DiscoveryRunResponse)
+    def get_discovery_run(run_id: UUID, state: StateDep, auth: AuthDep) -> DiscoveryRunResponse:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            run = discovery_repository.get_run(
+                conn, run_id=run_id, organization_id=auth.organization_id
+            )
+        if run is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"no discovery run {run_id}"
+            )
+        return DiscoveryRunResponse.from_run(run)
+
+    @app.get(
+        "/discovery/runs/{run_id}/opportunities", response_model=DiscoveryOpportunitiesResponse
+    )
+    def get_discovery_opportunities(
+        run_id: UUID, state: StateDep, auth: AuthDep
+    ) -> DiscoveryOpportunitiesResponse:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            run = discovery_repository.get_run(
+                conn, run_id=run_id, organization_id=auth.organization_id
+            )
+        if run is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"no discovery run {run_id}"
+            )
+        opportunities = list_opportunities(
+            state.pool,
+            ledger=state.ledger,
+            organization_id=auth.organization_id,
+            run_id=run_id,
+            requested_count=run.requested_opportunity_count,
+            now=datetime.now(UTC),
+        )
+        return DiscoveryOpportunitiesResponse(
+            run=DiscoveryRunResponse.from_run(run),
+            opportunities=[OpportunityResponse.from_opportunity(o) for o in opportunities],
+        )
 
     @app.get("/reviews/{review_id}", response_model=ReviewResponse)
     def get_review_endpoint(review_id: UUID, state: StateDep, auth: AuthDep) -> ReviewResponse:

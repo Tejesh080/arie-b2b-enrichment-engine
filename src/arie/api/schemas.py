@@ -27,6 +27,7 @@ from arie.billing.service import PURCHASABLE_PLANS
 from arie.copilot import CopilotIntent, CopilotResponse, LeadCopilotResponse
 from arie.core.types import LeadStatus
 from arie.dashboard import DashboardSummary
+from arie.discovery.models import BuyerSignal, DiscoveryFunnel, DiscoveryRun, Opportunity
 from arie.feedback import FeedbackReason, FeedbackRecord, FeedbackSentiment
 from arie.icp_profiles import InvalidICPConfigError, validate_config
 from arie.identity.normalize import normalize_domain, normalize_email
@@ -1683,3 +1684,165 @@ class DashboardResponse(BaseModel):
             open_proposals=open_proposals,
             feedback=DashboardFeedbackResponse.model_validate(summary.feedback),
         )
+
+
+# --------------------------------------------------------------- discovery --
+#
+# Product Pivot: "tell me what you sell and I will find the opportunities
+# worth your attention." `StartDiscoveryRunRequest` deliberately has no
+# offering/target fields — those come from the customer's already-confirmed
+# targeting profile (`arie.icp_profiles.get_active_profile`), never re-asked.
+
+
+class StartDiscoveryRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requested_opportunity_count: int = Field(default=20, ge=1, le=50)
+    market: str | None = Field(default=None, max_length=200)
+    max_candidates: int = Field(default=100, ge=10, le=200)
+
+
+class DiscoveryFunnelResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    search_queries: int
+    raw_candidates: int
+    unique_companies: int
+    screened: int
+    promising: int
+    possible: int
+    unlikely: int
+    insufficient_info: int
+    promoted_to_leads: int
+    research_candidates: int
+    research_calls: int
+    buyer_lookups: int
+    final_opportunities: int
+    llm_calls: int
+    llm_cost_usd: str
+    provider_calls: int
+    provider_cost_usd: str
+
+    @classmethod
+    def from_funnel(cls, funnel: DiscoveryFunnel) -> DiscoveryFunnelResponse:
+        return cls(
+            search_queries=funnel.search_queries,
+            raw_candidates=funnel.raw_candidates,
+            unique_companies=funnel.unique_companies,
+            screened=funnel.screened,
+            promising=funnel.promising,
+            possible=funnel.possible,
+            unlikely=funnel.unlikely,
+            insufficient_info=funnel.insufficient_info,
+            promoted_to_leads=funnel.promoted_to_leads,
+            research_candidates=funnel.research_candidates,
+            research_calls=funnel.research_calls,
+            buyer_lookups=funnel.buyer_lookups,
+            final_opportunities=funnel.final_opportunities,
+            llm_calls=funnel.llm_calls,
+            llm_cost_usd=str(funnel.llm_cost_usd),
+            provider_calls=funnel.provider_calls,
+            provider_cost_usd=str(funnel.provider_cost_usd),
+        )
+
+
+class DiscoveryRunResponse(BaseModel):
+    run_id: UUID
+    status: str
+    requested_opportunity_count: int
+    market: str | None
+    max_candidates: int
+    profile_version: int | None
+    error_detail: str | None
+    funnel: DiscoveryFunnelResponse
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+
+    @classmethod
+    def from_run(cls, run: DiscoveryRun) -> DiscoveryRunResponse:
+        return cls(
+            run_id=run.run_id,
+            status=str(run.status),
+            requested_opportunity_count=run.requested_opportunity_count,
+            market=run.market,
+            max_candidates=run.max_candidates,
+            profile_version=run.profile_version,
+            error_detail=run.error_detail,
+            funnel=DiscoveryFunnelResponse.from_funnel(run.funnel),
+            created_at=run.created_at,
+            started_at=run.started_at,
+            completed_at=run.completed_at,
+        )
+
+
+class BuyerSignalResponse(BaseModel):
+    seniority: str | None
+    function: str | None
+    name_known: bool
+    source: str | None
+    confidence: float | None
+
+    @classmethod
+    def from_signal(cls, signal: BuyerSignal) -> BuyerSignalResponse:
+        return cls(
+            seniority=signal.seniority,
+            function=signal.function,
+            name_known=signal.name_known,
+            source=signal.source,
+            confidence=signal.confidence,
+        )
+
+
+class OpportunityResponse(BaseModel):
+    candidate_id: UUID
+    lead_id: UUID
+    company_name: str
+    domain: str
+    priority: str
+    next_action: str
+    score: float | None
+    confidence: float | None
+    short_reason: str
+    key_evidence: list[str]
+    missing_information: list[str]
+    buyer: BuyerSignalResponse | None
+    research_performed: bool
+    discovery_source: str
+    source_url: str
+    search_query: str
+
+    @classmethod
+    def from_opportunity(cls, opportunity: Opportunity) -> OpportunityResponse:
+        return cls(
+            candidate_id=opportunity.candidate_id,
+            lead_id=opportunity.lead_id,
+            company_name=opportunity.company_name,
+            domain=opportunity.domain,
+            priority=opportunity.priority,
+            next_action=opportunity.next_action,
+            score=opportunity.score,
+            confidence=opportunity.confidence,
+            short_reason=opportunity.short_reason,
+            key_evidence=opportunity.key_evidence,
+            missing_information=opportunity.missing_information,
+            buyer=BuyerSignalResponse.from_signal(opportunity.buyer) if opportunity.buyer else None,
+            research_performed=opportunity.research_performed,
+            discovery_source=opportunity.discovery_source,
+            source_url=opportunity.source_url,
+            search_query=opportunity.search_query,
+        )
+
+
+class DiscoveryRunWithOpportunitiesResponse(BaseModel):
+    """`POST /discovery/runs`'s response — the run this pivot's synchronous
+    orchestrator has already finished, plus its ranked shortlist, in one
+    round trip."""
+
+    run: DiscoveryRunResponse
+    opportunities: list[OpportunityResponse]
+
+
+class DiscoveryOpportunitiesResponse(BaseModel):
+    run: DiscoveryRunResponse
+    opportunities: list[OpportunityResponse]

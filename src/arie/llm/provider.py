@@ -84,6 +84,13 @@ class LLMPurpose(StrEnum):
     BATCH_SUMMARY = "batch_summary"
     COPILOT = "copilot"
     FEEDBACK_ANALYSIS = "feedback_analysis"
+    DISCOVERY_SEARCH_PLANNING = "discovery_search_planning"
+    """Product Pivot Phase 2 — turning a targeting profile into search intent.
+    Never chooses a provider or executes a URL; see
+    ``arie.discovery.search_planning``."""
+    DISCOVERY_SCREENING = "discovery_screening"
+    """Product Pivot Phase 5 — cheap batch classification of discovered
+    candidates, never one call per company; see ``arie.discovery.screening``."""
 
 
 @dataclass(frozen=True)
