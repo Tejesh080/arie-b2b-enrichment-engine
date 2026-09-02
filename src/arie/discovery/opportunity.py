@@ -1,13 +1,17 @@
 """Projecting one promoted, decided lead into the customer-facing
-`Opportunity` — Discovery Pivot Phases 8, 10, 11.
+`Opportunity` — Discovery Pivot Phases 8, 10, 11; extended by Opportunity
+Activation Parts 3-13 with real buyer identification and next-action logic
+that never claims a contact channel ARIE doesn't actually have.
 
 No parallel scoring system. `arie.recommendations.build_recommendation` is
 the exact same call `GET /leads/{lead_id}/recommendation` makes; this module
-adds exactly two things on top of it, both bounded and both reusing existing
+adds three things on top of it, all bounded and all reusing existing
 machinery: one selective-research attempt (`arie.research_acquisition`,
-already Slice 5) when the receipt itself says a fact could still change the
-decision, and a read of whatever contact-role evidence exists so far — never
-a fabricated buyer name, see `arie.discovery.models.BuyerSignal`.
+Slice 5) when the receipt itself says a fact could still change the
+decision, a real buyer search (`arie.discovery.buyer_search`) gated on the
+recommendation actually being worth pursuing, and a discovery-specific
+next-action projection that only ever claims a contact channel the buyer
+search actually verified.
 """
 
 from __future__ import annotations
@@ -20,14 +24,20 @@ from uuid import UUID
 import psycopg
 
 from arie.api.receipt import build_receipt
-from arie.discovery.models import BuyerSignal, DiscoveryCandidate, Opportunity
+from arie.discovery.buyer_search import BuyerSearchFn, BuyerSearchOutcome, execute_buyer_search
+from arie.discovery.models import (
+    BuyerSignal,
+    DiscoveryCandidate,
+    EmailStatus,
+    Opportunity,
+    OpportunityNextAction,
+)
 from arie.evidence.store import PostgresEvidenceStore
 from arie.ledger.store import PostgresCostLedger
 from arie.live.outcome_cache import ProviderOutcomeGuard
 from arie.recommendations import (
+    CustomerPriority,
     DecisionSignal,
-    LeadRecommendation,
-    NextAction,
     build_recommendation,
 )
 from arie.research import ResearchTargetField
@@ -38,6 +48,7 @@ __all__ = ["OpportunityBuildResult", "build_opportunity"]
 _PERSON_FIELDS = frozenset(
     {ResearchTargetField.TITLE_SENIORITY, ResearchTargetField.TITLE_FUNCTION}
 )
+_USABLE_EMAIL = frozenset({EmailStatus.VERIFIED, EmailStatus.LIKELY})
 
 
 @dataclass(frozen=True)
@@ -50,10 +61,17 @@ class OpportunityBuildResult:
     """Whether a provider was actually called (as opposed to the plan being
     refused by budget/materiality) — the funnel's `research_calls`."""
     was_buyer_lookup: bool
+    """Whether the *selective research* step above happened to target a
+    person field — distinct from `buyer_search_*` below, which is the real
+    Hunter Domain Search step."""
     research_cost_usd: Decimal
+    buyer_search_eligible: bool
+    buyer_search_performed: bool
+    buyer_found: bool
+    buyer_email_found: bool
 
 
-def _read_buyer_signal(
+def _simulated_buyer_signal(
     conn: psycopg.Connection,
     evidence_store: PostgresEvidenceStore,
     *,
@@ -61,6 +79,9 @@ def _read_buyer_signal(
     person_id: UUID | None,
     now: datetime,
 ) -> BuyerSignal | None:
+    """The existing pipeline's own simulated role signal — never a name, see
+    `arie.discovery.promotion`'s module docstring for why that placeholder
+    identity's display name must never surface as a customer-facing buyer."""
     if person_id is None:
         return None
     seniority = evidence_store.get_fresh(
@@ -90,21 +111,26 @@ def _read_buyer_signal(
     )
 
 
-def _effective_next_action(
-    recommendation: LeadRecommendation, buyer: BuyerSignal | None
-) -> NextAction:
-    """`recommendation.next_action` is frozen at the receipt's own decision
-    time. If research performed *after* that (this module's own selective
-    research step) found a contact's seniority, "find a decision maker" is
-    stale — the customer-facing next action should say so, without rewriting
-    the immutable receipt itself."""
-    if (
-        recommendation.next_action is NextAction.FIND_DECISION_MAKER
-        and buyer is not None
-        and buyer.seniority
-    ):
-        return NextAction.EMAIL_FIRST
-    return recommendation.next_action
+def _next_action(priority: CustomerPriority, buyer: BuyerSignal | None) -> OpportunityNextAction:
+    """Part 13's deterministic projection. Never claims a contact channel
+    ARIE doesn't have: `CONTACT_NOW`/`EMAIL_FIRST` require a *named* buyer
+    with a *usable* (verified or likely) email — a known role with no name,
+    or a name with no usable email, both fall through to an honest
+    intermediate state instead."""
+    if priority is CustomerPriority.SKIP:
+        return OpportunityNextAction.SKIP
+    if priority is CustomerPriority.REVIEW:
+        return OpportunityNextAction.RESEARCH_MORE
+    # CONTACT_FIRST or WORTH_PURSUING.
+    if buyer is None or not buyer.name_known:
+        return OpportunityNextAction.FIND_DECISION_MAKER
+    if buyer.email is not None and buyer.email_status in _USABLE_EMAIL:
+        return (
+            OpportunityNextAction.CONTACT_NOW
+            if priority is CustomerPriority.CONTACT_FIRST
+            else OpportunityNextAction.EMAIL_FIRST
+        )
+    return OpportunityNextAction.VERIFY_CONTACT_METHOD
 
 
 def build_opportunity(
@@ -117,7 +143,10 @@ def build_opportunity(
     lead_id: UUID,
     execution_mode: str,
     now: datetime,
+    preferred_seniorities: tuple[str, ...] = (),
+    preferred_functions: tuple[str, ...] = (),
     outcome_guard: ProviderOutcomeGuard | None = None,
+    buyer_search_fn: BuyerSearchFn = execute_buyer_search,
 ) -> OpportunityBuildResult:
     receipt = build_receipt(conn, ledger, lead_id, organization_id=organization_id)
     if receipt is None:
@@ -127,6 +156,10 @@ def build_opportunity(
             research_performed=False,
             was_buyer_lookup=False,
             research_cost_usd=Decimal(0),
+            buyer_search_eligible=False,
+            buyer_search_performed=False,
+            buyer_found=False,
+            buyer_email_found=False,
         )
 
     recommendation = build_recommendation(lead_id, DecisionSignal.from_receipt(receipt))
@@ -165,13 +198,32 @@ def build_opportunity(
                 research_performed = True
                 research_cost = execution.cost_usd
 
-    buyer = _read_buyer_signal(
-        conn,
-        evidence_store,
-        organization_id=organization_id,
-        person_id=_person_id(conn, lead_id),
-        now=now,
+    person_id = _person_id(conn, lead_id)
+    buyer = _simulated_buyer_signal(
+        conn, evidence_store, organization_id=organization_id, person_id=person_id, now=now
     )
+    alternate_buyers: list[BuyerSignal] = []
+
+    outcome: BuyerSearchOutcome | None = None
+    if person_id is not None:
+        outcome = buyer_search_fn(
+            conn,
+            ledger,
+            evidence_store,
+            organization_id=organization_id,
+            lead_id=lead_id,
+            person_id=person_id,
+            domain=candidate.domain,
+            priority=recommendation.priority,
+            preferred_seniorities=preferred_seniorities,
+            preferred_functions=preferred_functions,
+            now=now,
+        )
+        if outcome.best is not None:
+            buyer = BuyerSignal.from_candidate(outcome.best)
+            alternate_buyers = [BuyerSignal.from_candidate(c) for c in outcome.alternates]
+
+    next_action = _next_action(recommendation.priority, buyer)
 
     opportunity = Opportunity(
         candidate_id=candidate.candidate_id,
@@ -179,17 +231,21 @@ def build_opportunity(
         company_name=candidate.company_name,
         domain=candidate.domain,
         priority=str(recommendation.priority),
-        next_action=str(_effective_next_action(recommendation, buyer)),
+        next_action=str(next_action),
         score=recommendation.score,
         confidence=recommendation.confidence,
         short_reason=recommendation.short_reason,
         key_evidence=recommendation.key_evidence,
         missing_information=recommendation.missing_information,
         buyer=buyer,
+        alternate_buyers=alternate_buyers,
         research_performed=research_performed,
         discovery_source=candidate.source_provider,
         source_url=candidate.source_url,
         search_query=candidate.search_query,
+        verification_status=candidate.verification_status,
+        verified_facts=candidate.verified_facts,
+        website_verified_at=candidate.website_verified_at,
     )
     return OpportunityBuildResult(
         opportunity=opportunity,
@@ -197,6 +253,11 @@ def build_opportunity(
         research_performed=research_performed,
         was_buyer_lookup=was_buyer_lookup,
         research_cost_usd=research_cost,
+        buyer_search_eligible=recommendation.priority
+        in (CustomerPriority.CONTACT_FIRST, CustomerPriority.WORTH_PURSUING),
+        buyer_search_performed=outcome.provider_called if outcome is not None else False,
+        buyer_found=buyer is not None and buyer.name_known,
+        buyer_email_found=buyer is not None and buyer.name_known and buyer.email is not None,
     )
 
 

@@ -32,6 +32,7 @@ from uuid import UUID
 from psycopg_pool import ConnectionPool
 
 from arie.discovery import repository
+from arie.discovery.buyer_search import BuyerSearchFn, execute_buyer_search
 from arie.discovery.dedupe import dedupe_raw_candidates
 from arie.discovery.models import (
     DiscoveryCandidate,
@@ -40,6 +41,7 @@ from arie.discovery.models import (
     DiscoveryRunStatus,
     Opportunity,
     ScreeningClass,
+    VerificationStatus,
 )
 from arie.discovery.opportunity import build_opportunity
 from arie.discovery.promotion import promote_candidate
@@ -51,6 +53,7 @@ from arie.discovery.providers import (
 from arie.discovery.repository import NewCandidate
 from arie.discovery.screening import screen_candidates
 from arie.discovery.search_planning import generate_search_plan
+from arie.discovery.website_verification import WebsiteVerifierFn, verify_candidate
 from arie.evidence.store import PostgresEvidenceStore
 from arie.icp_profiles import ICPProfileRecord
 from arie.identity.resolver import IdentityResolver
@@ -121,6 +124,21 @@ def _profile_summary(profile: ICPProfileRecord | None) -> tuple[str, str, tuple[
     )
 
 
+def _preferred_buyer_traits(
+    profile: ICPProfileRecord | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """`(preferred_seniorities, preferred_functions)` for buyer ranking —
+    Opportunity Activation Part 6. Same source as `_profile_summary`'s own
+    read of the confirmed targeting draft; empty tuples (never scored, ranks
+    on decision-maker/email-quality alone) when the profile has none."""
+    if profile is None:
+        return (), ()
+    draft = stored_draft(profile.config)
+    if draft is None:
+        return (), ()
+    return tuple(draft.preferred_seniorities), tuple(draft.preferred_functions)
+
+
 def _drive_to_completion(pool: ConnectionPool, queue: PostgresJobQueue) -> None:
     handlers = build_handlers(pool, runtime=_shared_runtime(), provider_mode="simulated")
     for _ in range(_WORKER_DRIVE_MAX_CYCLES):
@@ -146,13 +164,19 @@ def run_discovery(
     created_by_user_id: UUID | None,
     now: datetime,
     discovery_provider: DiscoveryProvider | None = None,
+    website_verifier: WebsiteVerifierFn = verify_candidate,
+    buyer_search_fn: BuyerSearchFn = execute_buyer_search,
 ) -> tuple[DiscoveryRun, list[Opportunity]]:
     """Run one discovery loop end to end and return the completed run
     (status COMPLETE or FAILED) and its ranked opportunities.
 
     `discovery_provider` lets a caller (tests) inject a fake provider;
     production leaves it `None` and gets `build_discovery_provider()`'s
-    real-if-configured choice.
+    real-if-configured choice. `website_verifier` and `buyer_search_fn` are
+    the identical seam for Opportunity Activation's website verification and
+    buyer search steps — tests pass `arie.discovery.website_verification.
+    fake_website_verifier` / `arie.discovery.buyer_search.fake_buyer_search`
+    so a fake-provider run never makes a real Firecrawl or Hunter call.
     """
     requested_count = _clamp(
         requested_opportunity_count, low=MIN_OPPORTUNITY_COUNT, high=MAX_OPPORTUNITY_COUNT
@@ -185,6 +209,7 @@ def run_discovery(
             market=market,
             candidate_cap=candidate_cap,
             discovery_provider=discovery_provider,
+            website_verifier=website_verifier,
             now=now,
         )
     except Exception as exc:
@@ -212,6 +237,8 @@ def run_discovery(
         run_id=run.run_id,
         requested_count=requested_count,
         funnel=funnel,
+        profile=profile,
+        buyer_search_fn=buyer_search_fn,
         now=now,
     )
 
@@ -245,6 +272,7 @@ def _run_stages(
     market: str | None,
     candidate_cap: int,
     discovery_provider: DiscoveryProvider | None,
+    website_verifier: WebsiteVerifierFn,
     now: datetime,
 ) -> tuple[DiscoveryRun, DiscoveryFunnel]:
     funnel = DiscoveryFunnel()
@@ -368,7 +396,62 @@ def _run_stages(
 
     _advance(DiscoveryRunStatus.PROMOTING)
     promoted = 0
+    website_verified = 0
+    company_rejected_after_verification = 0
+    website_calls = 0
+    website_cost = Decimal(0)
+    verification_llm_calls = 0
+    verification_llm_cost = Decimal(0)
     for candidate in to_promote:
+        # Opportunity Activation Part 1/17: only survivors of cheap
+        # screening — already true of `to_promote` — and only the already-
+        # capped promotion set, so website calls stay bounded to roughly
+        # `promotion_cap`, never to every raw discovery result.
+        verification = website_verifier(
+            llm,
+            organization_id=organization_id,
+            domain=candidate.domain,
+            target_summary=target_summary,
+            now=now,
+        )
+        website_calls += verification.pages_fetched
+        website_cost += verification.website_cost_usd
+        if verification.llm_used:
+            verification_llm_calls += 1
+            verification_llm_cost += verification.llm_cost_usd
+
+        with pool.connection() as conn:
+            repository.update_candidate_verification(
+                conn,
+                candidate_id=candidate.candidate_id,
+                organization_id=organization_id,
+                status=verification.status,
+                verified_facts=verification.facts.model_dump() if verification.facts else None,
+                verified_at=now,
+            )
+            conn.commit()
+
+        if verification.status in (VerificationStatus.VERIFIED, VerificationStatus.REJECTED):
+            website_verified += 1
+
+        if verification.status is VerificationStatus.REJECTED:
+            company_rejected_after_verification += 1
+            reason = (
+                verification.facts.reasoning
+                if verification.facts
+                else "Rejected after website review."
+            )
+            with pool.connection() as conn:
+                repository.update_candidate_screening(
+                    conn,
+                    candidate_id=candidate.candidate_id,
+                    organization_id=organization_id,
+                    screening_class=ScreeningClass.UNLIKELY,
+                    screening_reason=f"Website review: {reason}",
+                )
+                conn.commit()
+            continue  # never promoted — Part 12's "candidate may move promising -> poor fit"
+
         with pool.connection() as conn:
             result = promote_candidate(
                 conn,
@@ -388,7 +471,17 @@ def _run_stages(
             )
             conn.commit()
         promoted += 1
-    funnel = replace(funnel, promoted_to_leads=promoted)
+
+    funnel = replace(
+        funnel,
+        promoted_to_leads=promoted,
+        website_verified=website_verified,
+        company_rejected_after_verification=company_rejected_after_verification,
+        website_calls=website_calls,
+        website_cost_usd=website_cost,
+        llm_calls=funnel.llm_calls + verification_llm_calls,
+        llm_cost_usd=funnel.llm_cost_usd + verification_llm_cost,
+    )
 
     # This "RESEARCHING" stage is the ordinary acquisition/scoring pipeline
     # every promoted lead goes through regardless of its origin — the
@@ -412,7 +505,9 @@ def _build_opportunities(
     run_id: UUID,
     requested_count: int,
     funnel: DiscoveryFunnel,
+    profile: ICPProfileRecord | None,
     now: datetime,
+    buyer_search_fn: BuyerSearchFn = execute_buyer_search,
 ) -> tuple[list[Opportunity], DiscoveryFunnel]:
     with pool.connection() as conn:
         candidates = repository.list_candidates(
@@ -423,13 +518,17 @@ def _build_opportunities(
             return [], funnel
         execution_mode = get_execution_mode(conn, organization_id=organization_id)
 
+    preferred_seniorities, preferred_functions = _preferred_buyer_traits(profile)
     evidence_store = PostgresEvidenceStore(pool)
     outcome_guard = ProviderOutcomeGuard(pool)
 
     opportunities: list[Opportunity] = []
     research_candidates = 0
     research_calls = 0
+    buyer_lookup_eligible = 0
     buyer_lookups = 0
+    buyer_found = 0
+    buyer_email_found = 0
 
     for candidate in promoted:
         assert candidate.promoted_lead_id is not None
@@ -442,16 +541,25 @@ def _build_opportunities(
                 candidate=candidate,
                 lead_id=candidate.promoted_lead_id,
                 execution_mode=execution_mode,
+                preferred_seniorities=preferred_seniorities,
+                preferred_functions=preferred_functions,
                 now=now,
                 outcome_guard=outcome_guard,
+                buyer_search_fn=buyer_search_fn,
             )
             conn.commit()
         if outcome.research_attempted:
             research_candidates += 1
         if outcome.research_performed:
             research_calls += 1
-            if outcome.was_buyer_lookup:
-                buyer_lookups += 1
+        if outcome.buyer_search_eligible:
+            buyer_lookup_eligible += 1
+        if outcome.buyer_search_performed:
+            buyer_lookups += 1
+        if outcome.buyer_found:
+            buyer_found += 1
+        if outcome.buyer_email_found:
+            buyer_email_found += 1
         if outcome.opportunity is not None:
             opportunities.append(outcome.opportunity)
 
@@ -462,6 +570,7 @@ def _build_opportunities(
         )
     )
     ranked = opportunities[:requested_count]
+    contactable = sum(1 for o in ranked if o.is_contactable)
 
     provider_calls = 0
     provider_cost = Decimal(0)
@@ -476,11 +585,14 @@ def _build_opportunities(
         funnel,
         research_candidates=research_candidates,
         research_calls=research_calls,
+        buyer_lookup_eligible=buyer_lookup_eligible,
         buyer_lookups=buyer_lookups,
+        buyer_found=buyer_found,
+        buyer_email_found=buyer_email_found,
         final_opportunities=len(ranked),
+        final_contactable_opportunities=contactable,
         provider_calls=provider_calls,
         provider_cost_usd=provider_cost,
-        llm_cost_usd=funnel.llm_cost_usd,  # research above deliberately spends no LLM budget
     )
     return ranked, funnel
 
@@ -492,14 +604,16 @@ def list_opportunities(
     organization_id: UUID,
     run_id: UUID,
     requested_count: int,
+    profile: ICPProfileRecord | None,
     now: datetime,
+    buyer_search_fn: BuyerSearchFn = execute_buyer_search,
 ) -> list[Opportunity]:
     """Re-derive a completed run's opportunities on demand —
     `GET /discovery/runs/{run_id}/opportunities`'s read model. Safe to poll
-    repeatedly: `build_opportunity`'s own selective-research step is
-    idempotent (`execute_research`'s freshness check refuses to re-spend on
-    an already-answered field), so a second call here costs nothing beyond
-    what the first one already spent.
+    repeatedly: both `build_opportunity`'s selective-research step and its
+    buyer search are idempotent (each checks for fresh evidence before
+    spending), so a second call here costs nothing beyond what the first one
+    already spent.
     """
     opportunities, _ = _build_opportunities(
         pool,
@@ -508,6 +622,8 @@ def list_opportunities(
         run_id=run_id,
         requested_count=requested_count,
         funnel=DiscoveryFunnel(),
+        profile=profile,
+        buyer_search_fn=buyer_search_fn,
         now=now,
     )
     return opportunities

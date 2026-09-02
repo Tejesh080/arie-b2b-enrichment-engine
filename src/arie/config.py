@@ -418,6 +418,30 @@ class FirecrawlConfig:
     timeout_seconds: float = field(
         default_factory=lambda: _env_float("FIRECRAWL_TIMEOUT_SECONDS", 20.0)
     )
+    scrape_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "FIRECRAWL_SCRAPE_BASE_URL", "https://api.firecrawl.dev/v1/scrape"
+        ).rstrip("/")
+    )
+    """Opportunity Activation Part 1. Verified live against the vendor
+    2026-09-03 alongside the search endpoint: same bearer auth, a JSON body
+    of ``{"url", "formats": ["markdown", "links"], "onlyMainContent": true}``,
+    and a response of ``{"success", "data": {"markdown", "metadata",
+    "links"}}``. Firecrawl performs the actual HTTP fetch of the target site
+    on its own infrastructure — no direct socket connection from this process
+    to a candidate's website occurs, so ``arie.discovery.website_verification``
+    needs no SSRF guard of its own (see that module's docstring)."""
+    scrape_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("FIRECRAWL_SCRAPE_TIMEOUT_SECONDS", 20.0)
+    )
+    scrape_cost_usd_per_call: float = field(
+        default_factory=lambda: _env_float("FIRECRAWL_SCRAPE_COST_USD_PER_CALL", 0.002)
+    )
+    """An ESTIMATED unit cost, not a Firecrawl-reported figure — Firecrawl's
+    published pricing is credits-per-scrape on a monthly plan, not a per-call
+    USD price; this follows the same "list price / plan allowance" derivation
+    ``LiveProviderConfig.cost_usd_per_call`` documents, at a conservative
+    placeholder until real billing data exists."""
 
     @property
     def configured(self) -> bool:
@@ -568,6 +592,30 @@ class HunterConfig:
     env-configurable: it is a property of Hunter's published credit table, not
     a knob. Recorded on the ledger row (``provider_calls.credits_used``) next
     to the modelled dollars so neither figure can be mistaken for the other."""
+
+    domain_search_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "HUNTER_DOMAIN_SEARCH_BASE_URL", "https://api.hunter.io/v2/domain-search"
+        )
+    )
+    """Opportunity Activation Part 4/5 — a genuinely different endpoint from
+    ``base_url`` above, verified live against the vendor 2026-09-03:
+    ``GET .../v2/domain-search?domain=...&limit=...`` (same ``X-API-KEY``
+    header) returns real named people at a domain — name, position, a
+    ``seniority``/``department`` enum pair, a ``decision_maker`` flag, an
+    email with a 0-100 ``confidence`` and a separate ``verification.status``,
+    and a LinkedIn URL where found. ``combined/find`` above only enriches a
+    *known* email; this is the actual company-to-person search capability
+    buyer identification needs, and no adapter read it before this."""
+    domain_search_cost_usd_per_call: float = field(
+        default_factory=lambda: _env_float("HUNTER_DOMAIN_SEARCH_COST_USD", 0.02)
+    )
+    """An ESTIMATED USD equivalent per domain search — Hunter meters domain
+    searches from a separate "searches" allowance than enrichment credits, so
+    ``cost_usd_per_success`` above does not apply here. Same derivation
+    discipline as that field: a conservative placeholder from published plan
+    pricing, not a Hunter-reported charge, revisit once real billing data
+    exists."""
 
     @property
     def configured(self) -> bool:

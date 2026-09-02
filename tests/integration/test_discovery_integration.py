@@ -15,19 +15,25 @@ import re
 import uuid
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from psycopg_pool import ConnectionPool
 
+import arie.discovery.buyer_search as buyer_search_module
 import arie.discovery.orchestrator as orchestrator_module
+import arie.discovery.website_verification as website_verification_module
 from arie.api.main import AppState, create_app, get_auth_context, get_llm_service
 from arie.auth import AuthContext
+from arie.config import FirecrawlConfig, HunterConfig
 from arie.discovery import repository
-from arie.discovery.models import DiscoveryRunStatus
+from arie.discovery.buyer_search import fake_buyer_search
+from arie.discovery.models import DiscoveryRunStatus, ScreeningClass, VerificationStatus
 from arie.discovery.orchestrator import run_discovery
 from arie.discovery.providers import DiscoveryProviderError, FakeDiscoveryProvider
+from arie.discovery.website_verification import fake_website_verifier
 from arie.icp_profiles import get_active_profile
 from arie.identity.resolver import IdentityResolver
 from arie.jobs.queue import PostgresJobQueue
@@ -127,6 +133,8 @@ def test_discovery_funnel_end_to_end(
         created_by_user_id=None,
         now=datetime.now(UTC),
         discovery_provider=FakeDiscoveryProvider(),
+        website_verifier=fake_website_verifier,
+        buyer_search_fn=fake_buyer_search,
     )
     discovery_cleanup.append(run.run_id)
 
@@ -216,6 +224,8 @@ def test_discovery_run_isolates_a_failing_provider_query(
         created_by_user_id=None,
         now=datetime.now(UTC),
         discovery_provider=_FlakyProvider(),
+        website_verifier=fake_website_verifier,
+        buyer_search_fn=fake_buyer_search,
     )
     discovery_cleanup.append(run.run_id)
 
@@ -232,11 +242,16 @@ def test_discovery_run_via_http_api(
     """The full `POST /discovery/runs` -> `GET .../{id}` ->
     `GET .../{id}/opportunities` -> `GET /discovery/runs` surface, over real
     HTTP against the real API app — not just the orchestrator function
-    directly. The real `FirecrawlDiscoveryProvider` is monkeypatched out so
-    this test never depends on network access or Firecrawl's availability."""
+    directly. The real `FirecrawlDiscoveryProvider` is monkeypatched out, and
+    both the website-verification and buyer-search steps are de-configured
+    (the HTTP route exposes no injection seam for either — by design, a real
+    API consumer always gets the real behaviour), so this test never depends
+    on network access or on Firecrawl/Hunter's availability."""
     monkeypatch.setattr(
         orchestrator_module, "build_discovery_provider", lambda: FakeDiscoveryProvider()
     )
+    monkeypatch.setattr(website_verification_module, "FIRECRAWL", FirecrawlConfig(api_key=""))
+    monkeypatch.setattr(buyer_search_module, "HUNTER", HunterConfig(api_key=""))
 
     app = create_app(state=app_state)
     app.dependency_overrides[get_auth_context] = lambda: AuthContext(
@@ -274,3 +289,214 @@ def test_discovery_run_via_http_api(
         list_response = client.get("/discovery/runs")
         assert list_response.status_code == 200
         assert any(row["run_id"] == str(run_id) for row in list_response.json())
+
+
+def test_discovery_run_rejects_a_candidate_after_website_verification(
+    discovery_pool: ConnectionPool,
+    job_queue: PostgresJobQueue,
+    identity_resolver: IdentityResolver,
+    discovery_cleanup: list[uuid.UUID],
+) -> None:
+    """Website verification is a real filter, not a rubber stamp — a
+    candidate cheap screening liked can still be rejected once ARIE reads
+    the company's own site, and a rejected candidate is never promoted."""
+    from arie.discovery.models import VerifiedCompanyFacts
+    from arie.discovery.website_verification import VerificationResult
+
+    rejected_domains: list[str] = []
+
+    def _reject_first_candidate(
+        llm: LLMService | None,
+        *,
+        organization_id: uuid.UUID,
+        domain: str,
+        target_summary: str,
+        now: datetime,
+    ) -> VerificationResult:
+        if not rejected_domains:
+            rejected_domains.append(domain)
+            return VerificationResult(
+                status=VerificationStatus.REJECTED,
+                facts=VerifiedCompanyFacts(
+                    business_relevance="clearly_irrelevant",
+                    business_description="A parked domain, not a real business.",
+                    industry_category="unknown",
+                    customer_type="unclear",
+                    reasoning="The page is a placeholder with no real content.",
+                ),
+                pages_fetched=1,
+                website_cost_usd=Decimal("0.002"),
+                llm_used=True,
+                llm_cost_usd=Decimal(0),
+            )
+        return fake_website_verifier(
+            llm,
+            organization_id=organization_id,
+            domain=domain,
+            target_summary=target_summary,
+            now=now,
+        )
+
+    ledger = PostgresCostLedger(discovery_pool)
+    llm = LLMService(
+        discovery_pool,
+        ledger=ledger,
+        provider=FakeLLMProvider(handler=_classify_all_promising_handler),
+    )
+    with discovery_pool.connection() as conn:
+        profile = get_active_profile(conn, organization_id=LEGACY_ORGANIZATION_ID)
+
+    run, opportunities = run_discovery(
+        discovery_pool,
+        resolver=identity_resolver,
+        queue=job_queue,
+        ledger=ledger,
+        llm=llm,
+        organization_id=LEGACY_ORGANIZATION_ID,
+        profile=profile,
+        requested_opportunity_count=5,
+        market="Australia",
+        max_candidates=12,
+        created_by_user_id=None,
+        now=datetime.now(UTC),
+        discovery_provider=FakeDiscoveryProvider(),
+        website_verifier=_reject_first_candidate,
+        buyer_search_fn=fake_buyer_search,
+    )
+    discovery_cleanup.append(run.run_id)
+
+    assert run.status is DiscoveryRunStatus.COMPLETE
+    assert run.funnel.company_rejected_after_verification == 1
+    assert run.funnel.website_verified >= 1
+    assert run.funnel.promoted_to_leads == run.funnel.unique_companies - 1
+
+    with discovery_pool.connection() as conn:
+        candidates = repository.list_candidates(
+            conn, run_id=run.run_id, organization_id=LEGACY_ORGANIZATION_ID
+        )
+    rejected = [c for c in candidates if c.domain == rejected_domains[0]]
+    assert len(rejected) == 1
+    assert rejected[0].promoted_lead_id is None
+    assert rejected[0].screening_class == ScreeningClass.UNLIKELY
+    assert rejected[0].verification_status == VerificationStatus.REJECTED
+    assert all(o.domain != rejected_domains[0] for o in opportunities)
+
+
+def test_discovery_run_finds_and_records_a_real_buyer(
+    discovery_pool: ConnectionPool,
+    job_queue: PostgresJobQueue,
+    identity_resolver: IdentityResolver,
+    discovery_cleanup: list[uuid.UUID],
+) -> None:
+    """A fake buyer provider standing in for Hunter — proves the buyer is
+    surfaced on the Opportunity, the next_action reflects a usable contact
+    channel, and the identity was actually written to the existing evidence
+    store (never re-derived, never re-invented on the next read)."""
+    from arie.discovery.buyer_search import BuyerSearchOutcome
+    from arie.discovery.models import BuyerCandidate, EmailStatus
+    from arie.evidence.store import PostgresEvidenceStore
+    from arie.recommendations import CustomerPriority
+
+    def _find_a_real_buyer(
+        conn: psycopg.Connection,
+        ledger: PostgresCostLedger,
+        evidence_store: PostgresEvidenceStore,
+        *,
+        organization_id: uuid.UUID,
+        lead_id: uuid.UUID,
+        person_id: uuid.UUID,
+        domain: str,
+        priority: CustomerPriority,
+        preferred_seniorities: tuple[str, ...],
+        preferred_functions: tuple[str, ...],
+        now: datetime,
+    ) -> BuyerSearchOutcome:
+
+        candidate = BuyerCandidate(
+            full_name="Sarah Chen",
+            title="Operations Director",
+            seniority="director",
+            function="operations",
+            email="sarah@example.com",
+            email_status=EmailStatus.VERIFIED,
+            profile_url=None,
+            decision_maker=True,
+            source="fake_hunter_domain_search",
+            confidence=0.95,
+        )
+        # Reuse the real freshness-check/evidence-write logic — only the
+        # transport call (`find_buyers`) is faked, so this test still proves
+        # the evidence-write and idempotency contract, not just the
+        # projection.
+        existing = buyer_search_module.read_existing_buyer(
+            evidence_store, organization_id=organization_id, person_id=person_id, now=now
+        )
+        if existing is not None:
+            return BuyerSearchOutcome(best=existing, alternates=(), provider_called=False)
+        buyer_search_module._write_buyer_evidence(
+            evidence_store,
+            organization_id=organization_id,
+            person_id=person_id,
+            candidate=candidate,
+            now=now,
+        )
+        return BuyerSearchOutcome(best=candidate, alternates=(), provider_called=True)
+
+    ledger = PostgresCostLedger(discovery_pool)
+    llm = LLMService(
+        discovery_pool,
+        ledger=ledger,
+        provider=FakeLLMProvider(handler=_classify_all_promising_handler),
+    )
+    with discovery_pool.connection() as conn:
+        profile = get_active_profile(conn, organization_id=LEGACY_ORGANIZATION_ID)
+
+    run, opportunities = run_discovery(
+        discovery_pool,
+        resolver=identity_resolver,
+        queue=job_queue,
+        ledger=ledger,
+        llm=llm,
+        organization_id=LEGACY_ORGANIZATION_ID,
+        profile=profile,
+        requested_opportunity_count=5,
+        market="Australia",
+        max_candidates=6,
+        created_by_user_id=None,
+        now=datetime.now(UTC),
+        discovery_provider=FakeDiscoveryProvider(),
+        website_verifier=fake_website_verifier,
+        buyer_search_fn=_find_a_real_buyer,
+    )
+    discovery_cleanup.append(run.run_id)
+
+    assert run.status is DiscoveryRunStatus.COMPLETE
+    assert run.funnel.buyer_found >= 1
+    assert run.funnel.buyer_email_found >= 1
+    assert run.funnel.final_contactable_opportunities >= 1
+
+    found = [o for o in opportunities if o.buyer is not None and o.buyer.name_known]
+    assert found
+    opportunity = found[0]
+    assert opportunity.buyer is not None
+    assert opportunity.buyer.full_name == "Sarah Chen"
+    assert opportunity.buyer.email == "sarah@example.com"
+    assert opportunity.next_action in ("contact_now", "email_first")
+    assert opportunity.is_contactable
+
+    # Idempotency: re-deriving opportunities must not spend again — the
+    # evidence is already fresh, so `read_existing_buyer` (not a new Hunter
+    # call) is what answers the second time.
+    opportunities_again = orchestrator_module.list_opportunities(
+        discovery_pool,
+        ledger=ledger,
+        organization_id=LEGACY_ORGANIZATION_ID,
+        run_id=run.run_id,
+        requested_count=run.requested_opportunity_count,
+        profile=profile,
+        buyer_search_fn=_find_a_real_buyer,
+        now=datetime.now(UTC),
+    )
+    again = next(o for o in opportunities_again if o.candidate_id == opportunity.candidate_id)
+    assert again.buyer is not None
+    assert again.buyer.full_name == "Sarah Chen"

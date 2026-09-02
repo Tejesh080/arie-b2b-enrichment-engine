@@ -1,6 +1,14 @@
-"""Manual, one-off local canary for the Discovery Pivot's real path: an
-actual Firecrawl search feeding the full orchestrator (screening promotion,
-scoring, selective research) against the local *test* database only.
+"""Manual, one-off local canary for the full real Opportunity Activation
+path: actual Firecrawl search, actual Firecrawl website verification, and
+actual Hunter Domain Search buyer identification, feeding the orchestrator
+(screening, promotion, scoring, selective research) against the local *test*
+database only. `discovery_provider`/`website_verifier`/`buyer_search_fn` are
+all left at their defaults, which are the real ones whenever the matching
+credential is configured (`FIRECRAWL_API_KEY`, `HUNTER_API_KEY`).
+
+Deliberately small (`max_candidates`/`requested_opportunity_count` below) —
+Opportunity Activation Parts 22/23 ask for roughly 5 real website
+verifications and at most 3 real buyer searches, not a bulk run.
 
 Not part of the pytest suite — it prints a funnel report for a human to read
 and cleans up everything it created. Run with TEST_DATABASE_URL /
@@ -18,12 +26,14 @@ import re
 import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from uuid import UUID
 
 from psycopg_pool import ConnectionPool
 
 from arie.config import IntegrationDatabaseConfig
 from arie.discovery import repository
 from arie.discovery.orchestrator import run_discovery
+from arie.discovery.website_verification import VerificationResult, verify_candidate
 from arie.icp_profiles import get_active_profile
 from arie.identity.resolver import IdentityResolver
 from arie.jobs.queue import PostgresJobQueue
@@ -38,6 +48,10 @@ _CANDIDATE_ID_RE = re.compile(r"id: ([0-9a-fA-F-]{36})")
 
 
 def _handler(messages: Sequence[LLMMessage]) -> str:
+    """Deterministic search-plan/screening answers — already proven by the
+    discovery-only canary. Website verification uses a *real* DeepSeek call
+    instead (see `_real_website_verifier` below), so this handler is never
+    asked for that schema."""
     rendered = "\n".join(m.content for m in messages)
     ids = _CANDIDATE_ID_RE.findall(rendered)
     if not ids:
@@ -78,7 +92,28 @@ def main() -> int:
     resolver = IdentityResolver(pool)
     queue = PostgresJobQueue(pool)
     ledger = PostgresCostLedger(pool)
+    # Fake for search-plan/screening (deterministic, already proven) — a
+    # *separate* real LLMService (DEEPSEEK_API_KEY is configured) for
+    # website-verification extraction only, so this canary actually proves
+    # real page text produces a sensible structured read, not a canned one.
     llm = LLMService(pool, ledger=ledger, provider=FakeLLMProvider(handler=_handler))
+    real_llm = LLMService(pool, ledger=ledger)
+
+    def _real_website_verifier(
+        llm: LLMService | None,
+        *,
+        organization_id: UUID,
+        domain: str,
+        target_summary: str,
+        now: datetime,
+    ) -> VerificationResult:
+        return verify_candidate(
+            real_llm,
+            organization_id=organization_id,
+            domain=domain,
+            target_summary=target_summary,
+            now=now,
+        )
 
     with pool.connection() as conn:
         profile = get_active_profile(conn, organization_id=LEGACY_ORGANIZATION_ID)
@@ -91,12 +126,14 @@ def main() -> int:
         llm=llm,
         organization_id=LEGACY_ORGANIZATION_ID,
         profile=profile,
-        requested_opportunity_count=10,
+        requested_opportunity_count=6,
         market="Australia",
-        max_candidates=20,
+        max_candidates=8,
         created_by_user_id=None,
         now=datetime.now(UTC),
-        discovery_provider=None,  # real FirecrawlDiscoveryProvider (FIRECRAWL_API_KEY is set)
+        website_verifier=_real_website_verifier,
+        # buyer_search_fn left at its default — real Hunter Domain Search
+        # whenever HUNTER_API_KEY is configured.
     )
 
     print(f"run status: {run.status}")
@@ -107,8 +144,18 @@ def main() -> int:
     print(f"opportunities: {len(opportunities)}")
     for o in opportunities:
         print(
-            f"  - {o.company_name} ({o.domain}) [{o.priority}] next={o.next_action} score={o.score}"
+            f"  - {o.company_name} ({o.domain}) [{o.priority}] next={o.next_action} "
+            f"score={o.score} verification={o.verification_status}"
         )
+        if o.buyer is not None and o.buyer.name_known:
+            print(
+                f"      buyer: {o.buyer.full_name} — {o.buyer.title} "
+                f"| email={o.buyer.email} ({o.buyer.email_status})"
+            )
+        elif o.buyer is not None:
+            print(f"      buyer: role signal only (seniority={o.buyer.seniority}, no name)")
+        else:
+            print("      buyer: not identified")
 
     with pool.connection() as conn:
         candidates = repository.list_candidates(

@@ -91,6 +91,13 @@ class LLMPurpose(StrEnum):
     DISCOVERY_SCREENING = "discovery_screening"
     """Product Pivot Phase 5 — cheap batch classification of discovered
     candidates, never one call per company; see ``arie.discovery.screening``."""
+    DISCOVERY_WEBSITE_VERIFICATION = "discovery_website_verification"
+    """Opportunity Activation Part 2 — extracting a narrow, bounded set of
+    facts from a candidate's own public website text, one candidate per
+    call, only for survivors of cheap screening; see
+    ``arie.discovery.website_verification``. The website text is untrusted
+    third-party data, fenced the same way every other M7 call fences
+    customer or vendor content."""
 
 
 @dataclass(frozen=True)

@@ -1713,15 +1713,23 @@ class DiscoveryFunnelResponse(BaseModel):
     possible: int
     unlikely: int
     insufficient_info: int
+    website_verified: int
+    company_rejected_after_verification: int
     promoted_to_leads: int
     research_candidates: int
     research_calls: int
+    buyer_lookup_eligible: int
     buyer_lookups: int
+    buyer_found: int
+    buyer_email_found: int
     final_opportunities: int
+    final_contactable_opportunities: int
     llm_calls: int
     llm_cost_usd: str
     provider_calls: int
     provider_cost_usd: str
+    website_calls: int
+    website_cost_usd: str
 
     @classmethod
     def from_funnel(cls, funnel: DiscoveryFunnel) -> DiscoveryFunnelResponse:
@@ -1734,15 +1742,23 @@ class DiscoveryFunnelResponse(BaseModel):
             possible=funnel.possible,
             unlikely=funnel.unlikely,
             insufficient_info=funnel.insufficient_info,
+            website_verified=funnel.website_verified,
+            company_rejected_after_verification=funnel.company_rejected_after_verification,
             promoted_to_leads=funnel.promoted_to_leads,
             research_candidates=funnel.research_candidates,
             research_calls=funnel.research_calls,
+            buyer_lookup_eligible=funnel.buyer_lookup_eligible,
             buyer_lookups=funnel.buyer_lookups,
+            buyer_found=funnel.buyer_found,
+            buyer_email_found=funnel.buyer_email_found,
             final_opportunities=funnel.final_opportunities,
+            final_contactable_opportunities=funnel.final_contactable_opportunities,
             llm_calls=funnel.llm_calls,
             llm_cost_usd=str(funnel.llm_cost_usd),
             provider_calls=funnel.provider_calls,
             provider_cost_usd=str(funnel.provider_cost_usd),
+            website_calls=funnel.website_calls,
+            website_cost_usd=str(funnel.website_cost_usd),
         )
 
 
@@ -1782,6 +1798,11 @@ class BuyerSignalResponse(BaseModel):
     name_known: bool
     source: str | None
     confidence: float | None
+    full_name: str | None = None
+    title: str | None = None
+    email: str | None = None
+    email_status: str | None = None
+    profile_url: str | None = None
 
     @classmethod
     def from_signal(cls, signal: BuyerSignal) -> BuyerSignalResponse:
@@ -1791,6 +1812,11 @@ class BuyerSignalResponse(BaseModel):
             name_known=signal.name_known,
             source=signal.source,
             confidence=signal.confidence,
+            full_name=signal.full_name,
+            title=signal.title,
+            email=signal.email,
+            email_status=str(signal.email_status) if signal.email_status else None,
+            profile_url=signal.profile_url,
         )
 
 
@@ -1807,10 +1833,15 @@ class OpportunityResponse(BaseModel):
     key_evidence: list[str]
     missing_information: list[str]
     buyer: BuyerSignalResponse | None
+    alternate_buyers: list[BuyerSignalResponse]
     research_performed: bool
     discovery_source: str
     source_url: str
     search_query: str
+    verification_status: str | None
+    verified_facts: dict[str, Any] | None
+    website_verified_at: datetime | None
+    is_contactable: bool
 
     @classmethod
     def from_opportunity(cls, opportunity: Opportunity) -> OpportunityResponse:
@@ -1827,10 +1858,19 @@ class OpportunityResponse(BaseModel):
             key_evidence=opportunity.key_evidence,
             missing_information=opportunity.missing_information,
             buyer=BuyerSignalResponse.from_signal(opportunity.buyer) if opportunity.buyer else None,
+            alternate_buyers=[
+                BuyerSignalResponse.from_signal(b) for b in opportunity.alternate_buyers
+            ],
             research_performed=opportunity.research_performed,
             discovery_source=opportunity.discovery_source,
             source_url=opportunity.source_url,
             search_query=opportunity.search_query,
+            verification_status=(
+                str(opportunity.verification_status) if opportunity.verification_status else None
+            ),
+            verified_facts=opportunity.verified_facts,
+            website_verified_at=opportunity.website_verified_at,
+            is_contactable=opportunity.is_contactable,
         )
 
 

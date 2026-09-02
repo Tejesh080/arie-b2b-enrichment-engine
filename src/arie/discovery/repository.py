@@ -20,6 +20,7 @@ from arie.discovery.models import (
     DiscoveryRun,
     DiscoveryRunStatus,
     ScreeningClass,
+    VerificationStatus,
 )
 
 __all__ = [
@@ -30,6 +31,7 @@ __all__ = [
     "list_runs",
     "update_candidate_promoted_lead",
     "update_candidate_screening",
+    "update_candidate_verification",
     "update_run_status",
 ]
 
@@ -162,7 +164,11 @@ def update_run_status(
         )
 
 
-_INSERT_CANDIDATE = """
+_CANDIDATE_COLUMNS = """candidate_id, run_id, organization_id, company_name, domain, source_url,
+           snippet, source_provider, search_query, screening_class, screening_reason,
+           promoted_lead_id, verification_status, verified_facts, website_verified_at, created_at"""
+
+_INSERT_CANDIDATE = f"""
     INSERT INTO discovery_candidates (
         run_id, organization_id, company_name, domain, source_url, snippet,
         source_provider, search_query
@@ -170,15 +176,11 @@ _INSERT_CANDIDATE = """
     VALUES (%(run_id)s, %(organization_id)s, %(company_name)s, %(domain)s, %(source_url)s,
             %(snippet)s, %(source_provider)s, %(search_query)s)
     ON CONFLICT (run_id, domain) DO NOTHING
-    RETURNING candidate_id, run_id, organization_id, company_name, domain, source_url, snippet,
-              source_provider, search_query, screening_class, screening_reason,
-              promoted_lead_id, created_at
+    RETURNING {_CANDIDATE_COLUMNS}
 """
 
-_SELECT_CANDIDATES = """
-    SELECT candidate_id, run_id, organization_id, company_name, domain, source_url, snippet,
-           source_provider, search_query, screening_class, screening_reason,
-           promoted_lead_id, created_at
+_SELECT_CANDIDATES = f"""
+    SELECT {_CANDIDATE_COLUMNS}
     FROM discovery_candidates
     WHERE run_id = %(run_id)s AND organization_id = %(organization_id)s
     ORDER BY created_at ASC
@@ -193,6 +195,14 @@ _UPDATE_CANDIDATE_SCREENING = """
 _UPDATE_CANDIDATE_LEAD = """
     UPDATE discovery_candidates
     SET promoted_lead_id = %(lead_id)s
+    WHERE candidate_id = %(candidate_id)s AND organization_id = %(organization_id)s
+"""
+
+_UPDATE_CANDIDATE_VERIFICATION = """
+    UPDATE discovery_candidates
+    SET verification_status = %(verification_status)s,
+        verified_facts = %(verified_facts)s,
+        website_verified_at = %(website_verified_at)s
     WHERE candidate_id = %(candidate_id)s AND organization_id = %(organization_id)s
 """
 
@@ -211,6 +221,11 @@ def _row_to_candidate(row: dict[str, Any]) -> DiscoveryCandidate:
         screening_class=ScreeningClass(row["screening_class"]) if row["screening_class"] else None,
         screening_reason=row["screening_reason"],
         promoted_lead_id=row["promoted_lead_id"],
+        verification_status=(
+            VerificationStatus(row["verification_status"]) if row["verification_status"] else None
+        ),
+        verified_facts=row["verified_facts"],
+        website_verified_at=row["website_verified_at"],
         created_at=row["created_at"],
     )
 
@@ -289,4 +304,26 @@ def update_candidate_promoted_lead(
         cur.execute(
             _UPDATE_CANDIDATE_LEAD,
             {"candidate_id": candidate_id, "organization_id": organization_id, "lead_id": lead_id},
+        )
+
+
+def update_candidate_verification(
+    conn: psycopg.Connection,
+    *,
+    candidate_id: UUID,
+    organization_id: UUID,
+    status: VerificationStatus,
+    verified_facts: dict[str, Any] | None,
+    verified_at: datetime,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            _UPDATE_CANDIDATE_VERIFICATION,
+            {
+                "candidate_id": candidate_id,
+                "organization_id": organization_id,
+                "verification_status": str(status),
+                "verified_facts": Jsonb(verified_facts) if verified_facts is not None else None,
+                "website_verified_at": verified_at,
+            },
         )

@@ -1377,12 +1377,21 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"no discovery run {run_id}"
             )
+        with state.pool.connection() as conn:
+            profile = (
+                get_profile_by_version(
+                    conn, organization_id=auth.organization_id, version=run.profile_version
+                )
+                if run.profile_version is not None
+                else None
+            )
         opportunities = list_opportunities(
             state.pool,
             ledger=state.ledger,
             organization_id=auth.organization_id,
             run_id=run_id,
             requested_count=run.requested_opportunity_count,
+            profile=profile,
             now=datetime.now(UTC),
         )
         return DiscoveryOpportunitiesResponse(
