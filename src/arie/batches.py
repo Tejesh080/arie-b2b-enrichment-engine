@@ -55,9 +55,17 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from arie.api.ingest import LeadIngestCommand, ingest_lead
+from arie.core.types import LeadStatus
 from arie.identity.normalize import normalize_domain, normalize_email
 from arie.identity.resolver import IdentityResolver
 from arie.jobs.queue import PostgresJobQueue
+from arie.recommendations import (
+    ConfidenceBand,
+    CustomerPriority,
+    DecisionSignal,
+    NextAction,
+    build_recommendation,
+)
 from arie.statemachine.transitions import AWAITING_REVIEW, FAILURE, QUALIFIED, REJECTED
 
 __all__ = [
@@ -319,6 +327,14 @@ class BatchRowRecord:
     """Joined live from `leads.status` — `None` when `lead_id` is `None`
     (a rejected row) or, vanishingly rarely, if the lead was deleted."""
 
+    # M7 Slice 4 — the customer-facing projection, computed deterministically
+    # from the same joined row (see `_SELECT_BATCH_ROWS`); `None` wherever
+    # `lead_id`/`lead_status` are `None` for the identical reason.
+    priority: CustomerPriority | None
+    next_action: NextAction | None
+    short_reason: str | None
+    confidence_band: ConfidenceBand | None
+
 
 @dataclass(frozen=True)
 class BatchProgress:
@@ -393,13 +409,18 @@ _SELECT_BATCHES_FOR_ORG = """
 
 _SELECT_BATCH_ROWS = """
     SELECT r.batch_id, r.row_number, r.raw_row, r.validation_status, r.validation_error,
-           r.lead_id, l.status AS lead_status
+           r.lead_id, l.status AS lead_status, l.is_shadow,
+           dr.decision, dr.confidence, dr.score_value, dr.evidence_snapshot, dr.icp_profile_version
     FROM lead_batch_rows r
     LEFT JOIN leads l ON l.lead_id = r.lead_id
+    LEFT JOIN decision_receipts dr ON dr.lead_id = r.lead_id
     WHERE r.batch_id = %(batch_id)s AND r.organization_id = %(organization_id)s
     ORDER BY r.row_number ASC
     LIMIT %(limit)s OFFSET %(offset)s
 """
+"""One extra LEFT JOIN, still one query for the whole page (K1's own rule:
+never one recommendation call per row) — `decision_receipts` is 1:1 with a
+lead once scored, so this cannot multiply `lead_batch_rows`' row count."""
 
 _SELECT_LEAD_STATUS_COUNTS = """
     SELECT status, count(*) AS n
@@ -543,18 +564,43 @@ def list_batch_rows(
             },
         )
         rows = cur.fetchall()
-    return [
-        BatchRowRecord(
-            batch_id=row["batch_id"],
-            row_number=row["row_number"],
-            raw_row=dict(row["raw_row"]),
-            validation_status=row["validation_status"],
-            validation_error=row["validation_error"],
-            lead_id=row["lead_id"],
-            lead_status=row["lead_status"],
+    return [_row_to_batch_row(row) for row in rows]
+
+
+def _row_to_batch_row(row: dict[str, Any]) -> BatchRowRecord:
+    priority: CustomerPriority | None = None
+    next_action: NextAction | None = None
+    short_reason: str | None = None
+    band: ConfidenceBand | None = None
+    if row["lead_id"] is not None and row["lead_status"] is not None:
+        signal = DecisionSignal.from_decision_row(
+            lead_status=LeadStatus(row["lead_status"]),
+            shadow=bool(row["is_shadow"]),
+            decision=row["decision"],
+            confidence=float(row["confidence"]) if row["confidence"] is not None else None,
+            score_value=float(row["score_value"]) if row["score_value"] is not None else None,
+            evidence_snapshot=row["evidence_snapshot"],
+            profile_version=row["icp_profile_version"],
         )
-        for row in rows
-    ]
+        recommendation = build_recommendation(row["lead_id"], signal)
+        priority = recommendation.priority
+        next_action = recommendation.next_action
+        short_reason = recommendation.short_reason
+        band = recommendation.confidence_band
+
+    return BatchRowRecord(
+        batch_id=row["batch_id"],
+        row_number=row["row_number"],
+        raw_row=dict(row["raw_row"]),
+        validation_status=row["validation_status"],
+        validation_error=row["validation_error"],
+        lead_id=row["lead_id"],
+        lead_status=row["lead_status"],
+        priority=priority,
+        next_action=next_action,
+        short_reason=short_reason,
+        confidence_band=band,
+    )
 
 
 def batch_progress(

@@ -24,10 +24,19 @@ from arie.approval.workflow import ReviewAction
 from arie.auth import ROLES
 from arie.billing.service import PURCHASABLE_PLANS
 from arie.core.types import LeadStatus
+from arie.feedback import FeedbackReason, FeedbackRecord, FeedbackSentiment
 from arie.icp_profiles import InvalidICPConfigError, validate_config
 from arie.identity.normalize import normalize_domain, normalize_email
+from arie.intelligence.explanation import ExplanationOutcome, LeadExplanation
 from arie.intelligence.schemas import BusinessProfileDraft, TargetingObjective
 from arie.organizations import EXECUTION_MODES, InvalidOrganizationSettingsError, validate_timezone
+from arie.recommendations import (
+    ConfidenceBand,
+    CustomerPriority,
+    LeadRecommendation,
+    NextAction,
+    ResearchStatus,
+)
 
 
 class IngestLeadRequest(BaseModel):
@@ -383,6 +392,121 @@ class ReceiptResponse(BaseModel):
     @classmethod
     def from_receipt(cls, receipt: DecisionReceipt) -> ReceiptResponse:
         return cls.model_validate(receipt)
+
+
+# ----------------------------------------------------------- recommendation --
+#
+# M7 Slice 4. The customer-facing surface — see `arie.recommendations` for why
+# every field below is derived deterministically from a `DecisionReceipt`
+# rather than by a model. `ReceiptResponse` above remains available under
+# "Advanced Details"; this is what a customer sees first.
+
+
+class LeadRecommendationResponse(BaseModel):
+    lead_id: UUID
+    priority: CustomerPriority
+    next_action: NextAction
+    machine_decision: str | None
+    score: float | None
+    confidence: float | None
+    confidence_band: ConfidenceBand | None
+    short_reason: str
+    key_evidence: list[str]
+    missing_information: list[str]
+    research_status: ResearchStatus
+    explanation_status: str
+    profile_version: int | None
+    shadow: bool
+    execution_mode: str | None
+
+    @classmethod
+    def from_recommendation(cls, recommendation: LeadRecommendation) -> LeadRecommendationResponse:
+        return cls(
+            lead_id=recommendation.lead_id,
+            priority=recommendation.priority,
+            next_action=recommendation.next_action,
+            machine_decision=recommendation.machine_decision,
+            score=recommendation.score,
+            confidence=recommendation.confidence,
+            confidence_band=recommendation.confidence_band,
+            short_reason=recommendation.short_reason,
+            key_evidence=recommendation.key_evidence,
+            missing_information=recommendation.missing_information,
+            research_status=recommendation.research_status,
+            explanation_status=recommendation.explanation_status,
+            profile_version=recommendation.profile_version,
+            shadow=recommendation.shadow,
+            execution_mode=recommendation.execution_mode,
+        )
+
+
+class EvidenceGroundedClaimResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    text: str
+    evidence_ids: list[UUID]
+    hypothesis: bool
+
+
+class LeadExplanationResponse(BaseModel):
+    """`POST /leads/{lead_id}/explanation` — the AI-authored (or deterministic
+    fallback) "why", cited to evidence ids a caller can cross-reference against
+    Advanced Details. `source` is never hidden from the client: a customer is
+    always told whether they are reading AI prose or ARIE's built-in fallback,
+    per the M7 Slice 4 brief's truthfulness rule."""
+
+    summary: str
+    claims: list[EvidenceGroundedClaimResponse]
+    missing_information: list[str]
+    hypothesis_notes: list[str]
+    source: str
+    """`"ai"` or `"deterministic"` — see `arie.intelligence.explanation.ExplanationOutcome`."""
+    unavailable_reason: str | None = None
+
+    @classmethod
+    def from_outcome(cls, outcome: ExplanationOutcome) -> LeadExplanationResponse:
+        explanation: LeadExplanation = outcome.explanation
+        return cls(
+            summary=explanation.summary,
+            claims=[
+                EvidenceGroundedClaimResponse.model_validate(claim) for claim in explanation.claims
+            ],
+            missing_information=explanation.missing_information,
+            hypothesis_notes=explanation.hypothesis_notes,
+            source=outcome.source,
+            unavailable_reason=outcome.unavailable_reason,
+        )
+
+
+# ------------------------------------------------------------------ feedback --
+#
+# M7 Slice 4, Part I. An observation on a recommendation, never a mutation —
+# see `migrations/0036_lead_recommendation_feedback.sql`.
+
+
+class SubmitFeedbackRequest(BaseModel):
+    sentiment: FeedbackSentiment
+    reason: FeedbackReason | None = None
+    note: Annotated[str | None, Field(default=None, max_length=2000)] = None
+
+
+class FeedbackResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    feedback_id: UUID
+    lead_id: UUID
+    profile_version: int | None
+    recommendation_priority: str
+    recommendation_next_action: str
+    sentiment: str
+    reason: str | None
+    note: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_record(cls, record: FeedbackRecord) -> FeedbackResponse:
+        return cls.model_validate(record)
 
 
 # ------------------------------------------------------------------ api keys --
@@ -963,6 +1087,14 @@ class BatchRowResponse(BaseModel):
     validation_error: str | None
     lead_id: UUID | None
     lead_status: str | None
+
+    # M7 Slice 4 — the customer-facing projection for the batch results list
+    # (Part K). `None` wherever the row has no lead yet, for the identical
+    # reason `lead_status` is `None`.
+    priority: CustomerPriority | None = None
+    next_action: NextAction | None = None
+    short_reason: str | None = None
+    confidence_band: ConfidenceBand | None = None
 
 
 class BatchRowsPageResponse(BaseModel):

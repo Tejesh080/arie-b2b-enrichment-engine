@@ -47,7 +47,7 @@ from psycopg_pool import ConnectionPool
 
 from arie.api.ingest import ingest_lead
 from arie.api.reads import fetch_lead
-from arie.api.receipt import build_receipt
+from arie.api.receipt import DecisionReceipt, build_receipt
 from arie.api.schemas import (
     AcceptInvitationRequest,
     AcceptProposalRequest,
@@ -68,6 +68,7 @@ from arie.api.schemas import (
     CreateOrganizationRequest,
     CreateOrganizationResponse,
     EffectiveEntitlementsResponse,
+    FeedbackResponse,
     HealthResponse,
     ICPProfileResponse,
     IngestLeadRequest,
@@ -75,6 +76,8 @@ from arie.api.schemas import (
     InvitationCreatedResponse,
     InvitationResponse,
     LeadCostResponse,
+    LeadExplanationResponse,
+    LeadRecommendationResponse,
     LeadResponse,
     MappedColumnResponse,
     MappingPreviewResponse,
@@ -95,6 +98,7 @@ from arie.api.schemas import (
     SetProviderCredentialRequest,
     SetProviderEnabledRequest,
     StartCheckoutRequest,
+    SubmitFeedbackRequest,
     TargetingConfirmRequest,
     TargetingDraftRequest,
     TargetingDraftResponse,
@@ -151,6 +155,7 @@ from arie.billing.service import (
 from arie.billing.stripe_gateway import StripeNotConfiguredError, UnknownPlanError
 from arie.config import DATABASE, FRONTEND, OBSERVABILITY
 from arie.credential_resolver import resolve_provider_credential
+from arie.feedback import get_feedback, submit_feedback
 from arie.icp_profiles import (
     create_profile as create_icp_profile_row,
 )
@@ -167,6 +172,7 @@ from arie.intelligence.csv_mapping import (
     resolve_mapping,
     validate_confirmed_mapping,
 )
+from arie.intelligence.explanation import generate_explanation
 from arie.intelligence.outcomes import (
     OutcomeAnalysis,
     analyze_outcomes,
@@ -247,6 +253,12 @@ from arie.provisioning import (
     InvalidOrganizationNameError,
     SlugGenerationExhaustedError,
     create_customer_organization,
+)
+from arie.recommendations import (
+    DecisionSignal,
+    LeadRecommendation,
+    build_recommendation,
+    score_snapshot,
 )
 from arie.security_notifications import (
     notify_member_removed,
@@ -974,6 +986,145 @@ def register_routes(app: FastAPI) -> None:
         if receipt is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no lead {lead_id}")
         return ReceiptResponse.from_receipt(receipt)
+
+    # --------------------------------------------------- lead recommendation --
+    #
+    # M7 Slice 4. `GET /recommendation` is the customer-facing payoff of every
+    # prior slice — deterministic, no LLM call, no cost — built from the exact
+    # same `DecisionReceipt` the (still-available, now "Advanced Details")
+    # receipt endpoint above already reads. `POST /explanation` is the one
+    # surface in this section allowed to spend an AI budget, and only because
+    # a caller explicitly asked for it (Part F's "never one call per row" rule).
+
+    def _load_recommendation(
+        conn: psycopg.Connection,
+        ledger: PostgresCostLedger,
+        *,
+        lead_id: UUID,
+        organization_id: UUID,
+    ) -> tuple[LeadRecommendation, DecisionReceipt] | None:
+        receipt = build_receipt(conn, ledger, lead_id, organization_id=organization_id)
+        if receipt is None:
+            return None
+        recommendation = build_recommendation(lead_id, DecisionSignal.from_receipt(receipt))
+        return recommendation, receipt
+
+    @app.get("/leads/{lead_id}/recommendation", response_model=LeadRecommendationResponse)
+    def get_lead_recommendation(
+        lead_id: UUID, state: StateDep, auth: AuthDep
+    ) -> LeadRecommendationResponse:
+        """What ARIE tells a customer to do about this lead — priority, next
+        action, a deterministic reason, and no AI cost. See
+        `arie.recommendations` for why every field is derived rather than
+        stored, and `POST /leads/{lead_id}/explanation` for the richer,
+        evidence-cited prose version this endpoint never generates on its own.
+        """
+        _require_scope(auth, "leads:read")
+        with state.pool.connection() as conn:
+            loaded = _load_recommendation(
+                conn, state.ledger, lead_id=lead_id, organization_id=auth.organization_id
+            )
+        if loaded is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no lead {lead_id}")
+        recommendation, _ = loaded
+        return LeadRecommendationResponse.from_recommendation(recommendation)
+
+    @app.post("/leads/{lead_id}/explanation", response_model=LeadExplanationResponse)
+    def post_lead_explanation(
+        lead_id: UUID, state: StateDep, auth: AuthDep, llm: LLMServiceDep
+    ) -> LeadExplanationResponse:
+        """One on-demand, evidence-grounded explanation of the recommendation
+        above. Always returns 200 — an unavailable or misbehaving model
+        degrades to `arie.intelligence.explanation.deterministic_explanation`
+        rather than failing the request, per M7's standing rule that a
+        model's absence never breaks the product. `source` in the response
+        tells the caller which one it got.
+        """
+        _require_scope(auth, "leads:read")
+        with state.pool.connection() as conn:
+            record = fetch_lead(conn, lead_id, organization_id=auth.organization_id)
+            if record is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail=f"no lead {lead_id}"
+                )
+            loaded = _load_recommendation(
+                conn, state.ledger, lead_id=lead_id, organization_id=auth.organization_id
+            )
+            assert loaded is not None  # `record` above already proved the lead exists
+            recommendation, receipt = loaded
+            profile_name = "your targeting profile"
+            if receipt.versions is not None and receipt.versions.icp_profile_version is not None:
+                profile = get_profile_by_version(
+                    conn,
+                    organization_id=auth.organization_id,
+                    version=receipt.versions.icp_profile_version,
+                )
+                if profile is not None:
+                    profile_name = profile.name
+            outcome = generate_explanation(
+                llm,
+                conn,
+                organization_id=auth.organization_id,
+                lead_id=lead_id,
+                company_id=record.company_id,
+                person_id=record.person_id,
+                recommendation=recommendation,
+                profile_name=profile_name,
+                now=datetime.now(UTC),
+            )
+        return LeadExplanationResponse.from_outcome(outcome)
+
+    # ------------------------------------------------------------- feedback --
+    #
+    # M7 Slice 4, Part I. An observation on a recommendation, never a
+    # mutation — see `migrations/0036_lead_recommendation_feedback.sql`.
+    # Human-only (`_require_jwt_session`): a machine API key has no identity
+    # to attribute an opinion to.
+
+    @app.post("/leads/{lead_id}/feedback", response_model=FeedbackResponse)
+    def post_lead_feedback(
+        lead_id: UUID, payload: SubmitFeedbackRequest, state: StateDep, auth: AuthDep
+    ) -> FeedbackResponse:
+        _require_jwt_session(auth)
+        assert auth.user_id is not None  # guaranteed by the JWT check above
+        with _transaction(state.pool) as conn:
+            loaded = _load_recommendation(
+                conn, state.ledger, lead_id=lead_id, organization_id=auth.organization_id
+            )
+            if loaded is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail=f"no lead {lead_id}"
+                )
+            recommendation, _ = loaded
+            record = submit_feedback(
+                conn,
+                organization_id=auth.organization_id,
+                lead_id=lead_id,
+                user_id=auth.user_id,
+                sentiment=payload.sentiment,
+                reason=payload.reason,
+                note=payload.note,
+                priority=recommendation.priority,
+                next_action=recommendation.next_action,
+                profile_version=recommendation.profile_version,
+                score_snapshot=score_snapshot(recommendation),
+            )
+        return FeedbackResponse.from_record(record)
+
+    @app.get("/leads/{lead_id}/feedback", response_model=FeedbackResponse | None)
+    def get_lead_feedback(lead_id: UUID, state: StateDep, auth: AuthDep) -> FeedbackResponse | None:
+        _require_jwt_session(auth)
+        assert auth.user_id is not None
+        with state.pool.connection() as conn:
+            record = fetch_lead(conn, lead_id, organization_id=auth.organization_id)
+            if record is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail=f"no lead {lead_id}"
+                )
+            feedback = get_feedback(
+                conn, organization_id=auth.organization_id, lead_id=lead_id, user_id=auth.user_id
+            )
+        return FeedbackResponse.from_record(feedback) if feedback is not None else None
 
     @app.get("/reviews/{review_id}", response_model=ReviewResponse)
     def get_review_endpoint(review_id: UUID, state: StateDep, auth: AuthDep) -> ReviewResponse:
