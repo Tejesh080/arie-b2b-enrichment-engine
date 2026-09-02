@@ -494,30 +494,52 @@ def test_provenance_records_how_the_profile_was_made_and_no_more() -> None:
         model="deepseek-chat",
     )
     generation = config["generation"]
-    assert generation == {
-        "source": GENERATION_SOURCE_AI,
-        "objective": "minimize_wasted_outreach",
-        "llm_provider": "deepseek",
-        "llm_model": "deepseek-chat",
-        "confirmed_at": NOW.isoformat(),
-        "confirmed": True,
+    assert generation["source"] == GENERATION_SOURCE_AI
+    assert generation["objective"] == "minimize_wasted_outreach"
+    assert generation["llm_provider"] == "deepseek"
+    assert generation["llm_model"] == "deepseek-chat"
+    assert generation["confirmed_at"] == NOW.isoformat()
+    assert generation["confirmed"] is True
+    # The reviewed draft is kept so a later revision proposal can start from
+    # what the customer approved. The config is a lossy projection of it —
+    # "they preferred multi-location gyms" cannot be read back out of a point
+    # map — so without this a proposal would have to invent its starting point.
+    assert generation["profile_draft"] == BusinessProfileDraft.model_validate(
+        SUPPLEMENT_DRAFT
+    ).model_dump(mode="json")
+    assert set(generation) == {
+        "source",
+        "objective",
+        "llm_provider",
+        "llm_model",
+        "confirmed_at",
+        "confirmed",
+        "profile_draft",
     }
 
 
-def test_provenance_stores_no_business_text_no_prompt_and_no_credential() -> None:
+def test_provenance_keeps_the_reviewed_draft_but_not_the_raw_description() -> None:
+    """What the customer confirmed is kept. What they typed, and what ARIE
+    asked the model, are not.
+
+    The distinction matters: the draft is a document the customer read and
+    approved, and a later revision proposal needs it. Their original free-text
+    answers are neither needed nor theirs to lose track of, and a row nothing
+    ever deletes is the wrong place for them.
+    """
+    _, draft = _generate([json.dumps(SUPPLEMENT_DRAFT)], what=INJECTION)
     config = build_confirmed_config(
-        BusinessProfileDraft.model_validate(
-            {**SUPPLEMENT_DRAFT, "offering_summary": INJECTION[:300]}
-        ),
+        draft.profile,
         objective=TargetingObjective.BEST_PROSPECTS,
         now=NOW,
         provider="deepseek",
         model="deepseek-chat",
     )
     stored = json.dumps(config["generation"])
-    assert "Ignore previous instructions" not in stored
-    assert "targeting interpreter" not in stored  # no prompt
+    assert "Ignore previous instructions" not in stored  # the raw answer
+    assert "targeting interpreter" not in stored  # the prompt
     assert "api_key" not in stored and "sk-" not in stored
+    assert config["generation"]["profile_draft"]["offering_summary"]
 
 
 def test_a_generated_config_carries_provenance_the_scorer_ignores() -> None:

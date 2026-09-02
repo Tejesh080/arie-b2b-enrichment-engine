@@ -36,6 +36,7 @@ from typing import Any
 from uuid import UUID
 
 import psycopg
+from pydantic import ValidationError
 
 from arie.icp_profiles import ICPProfileRecord, create_profile, validate_config
 from arie.intelligence.normalization import build_scoring_config, describe_allocation
@@ -64,6 +65,7 @@ __all__ = [
     "canonical_vocabularies",
     "confirm_targeting_draft",
     "generate_targeting_draft",
+    "stored_draft",
 ]
 
 MAX_DESCRIPTION_CHARS = 4000
@@ -302,7 +304,11 @@ def build_confirmed_config(
     canonical = _canonicalize(profile)
     config = build_scoring_config(canonical, objective=objective)
     config["generation"] = _generation_metadata(
-        objective=objective, provider=provider, model=model, confirmed_at=now
+        objective=objective,
+        profile=canonical,
+        provider=provider,
+        model=model,
+        confirmed_at=now,
     )
     validate_config(config)
     return config
@@ -311,6 +317,7 @@ def build_confirmed_config(
 def _generation_metadata(
     *,
     objective: TargetingObjective,
+    profile: BusinessProfileDraft,
     provider: str | None,
     model: str | None,
     confirmed_at: datetime,
@@ -324,6 +331,14 @@ def _generation_metadata(
     no migration. A separate table would have added a join, a second write, and
     a way for provenance to go missing from a profile that has it, to record
     four values that are immutable for exactly as long as the row they describe.
+
+    `profile_draft` is the reviewed interpretation itself, stored so that a
+    later revision proposal (`arie.intelligence.proposals`) can start from what
+    the customer actually approved rather than trying to reconstruct it from
+    point values — the config is a lossy projection of the draft, and inferring
+    "they preferred multi-location gyms" back out of an industry point map is
+    not possible. It is the same document the customer confirmed, so storing it
+    reveals nothing they did not already see and agree to.
 
     What is deliberately *not* here: the customer's original business
     description, and the model's raw response. Both are already represented by
@@ -339,6 +354,7 @@ def _generation_metadata(
         "llm_model": model,
         "confirmed_at": confirmed_at.isoformat(),
         "confirmed": True,
+        "profile_draft": profile.model_dump(mode="json"),
     }
 
 
@@ -395,3 +411,28 @@ def canonical_vocabularies() -> dict[str, tuple[str, ...]]:
         "preference_levels": tuple(str(p) for p in PreferenceLevel),
         "scoring_dimensions": tuple(str(d) for d in ScoringDimension),
     }
+
+
+def stored_draft(config: dict[str, Any]) -> BusinessProfileDraft | None:
+    """The reviewed draft a confirmed profile was built from, if it has one.
+
+    ``None`` for a profile created any other way — the reference profile every
+    organization is bootstrapped with, and anything submitted directly through
+    ``POST /organization/icp``. Those are configurations somebody wrote, not
+    interpretations somebody approved, and there is no honest way to invent a
+    draft for them. A revision proposal simply cannot be made against one, and
+    says so rather than guessing.
+    """
+    generation = config.get("generation")
+    if not isinstance(generation, dict):
+        return None
+    raw = generation.get("profile_draft")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return BusinessProfileDraft.model_validate(raw)
+    except ValidationError:
+        # A draft written by an older build whose schema has since tightened.
+        # Refusing to propose against it is correct: the alternative is
+        # silently dropping whichever fields no longer validate.
+        return None

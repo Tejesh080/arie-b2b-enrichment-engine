@@ -32,7 +32,17 @@ from typing import Annotated
 from uuid import UUID
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, UploadFile, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from psycopg_pool import ConnectionPool
 
 from arie.api.ingest import ingest_lead
@@ -40,6 +50,7 @@ from arie.api.reads import fetch_lead
 from arie.api.receipt import build_receipt
 from arie.api.schemas import (
     AcceptInvitationRequest,
+    AcceptProposalRequest,
     ApiKeyCreatedResponse,
     ApiKeyResponse,
     BatchProgressResponse,
@@ -49,6 +60,7 @@ from arie.api.schemas import (
     BillingPortalRequest,
     BillingPortalResponse,
     BillingResponse,
+    CanonicalFieldResponse,
     CheckoutSessionResponse,
     CreateApiKeyRequest,
     CreateICPProfileRequest,
@@ -64,10 +76,16 @@ from arie.api.schemas import (
     InvitationResponse,
     LeadCostResponse,
     LeadResponse,
+    MappedColumnResponse,
+    MappingPreviewResponse,
     MemberResponse,
     OnboardingStatusResponse,
     OrganizationBillingResponse,
     OrganizationResponse,
+    OutcomeAnalysisResponse,
+    OutcomeGroupResponse,
+    ProposalResponse,
+    ProposedChangeResponse,
     ProviderStatusResponse,
     ReceiptResponse,
     ReviewDecisionRequest,
@@ -142,11 +160,35 @@ from arie.icp_profiles import (
     list_profiles,
 )
 from arie.identity.resolver import IdentityResolver
+from arie.intelligence.csv_mapping import (
+    CANONICAL_FIELDS,
+    MappingPreview,
+    read_headers_and_samples,
+    resolve_mapping,
+    validate_confirmed_mapping,
+)
+from arie.intelligence.outcomes import (
+    OutcomeAnalysis,
+    analyze_outcomes,
+    interpret_outcomes,
+    parse_outcome_csv,
+)
+from arie.intelligence.proposals import (
+    ProposalRecord,
+    StaleProposalError,
+    accept_proposal,
+    build_revision_proposal,
+    create_proposal,
+    get_proposal,
+    list_proposals,
+    reject_proposal,
+)
 from arie.intelligence.targeting import (
     TargetingGenerationError,
     canonical_vocabularies,
     confirm_targeting_draft,
     generate_targeting_draft,
+    stored_draft,
 )
 from arie.invitations import (
     DuplicateInvitationError,
@@ -525,6 +567,164 @@ own figures in them, which is more useful than anything fixed here, and they
 contain nothing a member cannot already see on their settings page. No branch
 here can emit a prompt, a provider response, or a credential — the only strings
 available are these constants and `arie.llm.budget`'s own."""
+
+
+def _to_mapping_preview_response(preview: MappingPreview) -> MappingPreviewResponse:
+    """Render a mapping preview for the console, labels included.
+
+    The label is resolved here rather than in the console so a canonical field
+    has exactly one customer-facing name, and a frontend build cannot drift
+    into showing `company_domain` to somebody.
+    """
+    return MappingPreviewResponse(
+        columns=[
+            MappedColumnResponse(
+                source_column=column.source_column,
+                canonical_field=column.canonical_field,
+                label=(
+                    CANONICAL_FIELDS[column.canonical_field].label
+                    if column.canonical_field
+                    else None
+                ),
+                confidence=str(column.confidence),
+                reason=column.reason,
+                requires_confirmation=column.requires_confirmation,
+                candidates=list(column.candidates),
+            )
+            for column in preview.columns
+        ],
+        field_map=dict(preview.field_map),
+        ignored_columns=list(preview.ignored_columns),
+        conflicts=list(preview.conflicts),
+        warnings=list(preview.warnings),
+        requires_confirmation=preview.requires_confirmation,
+        usable=preview.usable,
+        mapping_method=str(preview.method),
+        available_fields=[
+            CanonicalFieldResponse(
+                name=field.name,
+                label=field.label,
+                description=field.description,
+                required=field.required,
+            )
+            for field in CANONICAL_FIELDS.values()
+        ],
+        llm_provider=preview.llm_provider,
+        llm_model=preview.llm_model,
+        llm_cost_usd=preview.llm_cost_usd,
+        llm_unavailable_reason=preview.llm_unavailable_reason,
+    )
+
+
+def _confirmed_field_map(content: bytes, mapping: str | None) -> dict[str, str] | None:
+    """Parse and revalidate a client-supplied column mapping.
+
+    Returns ``None`` when no mapping was sent, which leaves `arie.batches`'
+    own alias matching in charge — the pre-M7 behaviour every existing caller
+    still gets.
+
+    Raises a 422 rather than silently ignoring a broken mapping: a customer who
+    just confirmed which column holds their email addresses must not have that
+    answer quietly discarded and the file ingested some other way.
+    """
+    if mapping is None:
+        return None
+    try:
+        parsed = json.loads(mapping)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="the column mapping was not valid JSON",
+        ) from exc
+    if not isinstance(parsed, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="the column mapping must be an object of field name to column name",
+        )
+
+    try:
+        headers, _ = read_headers_and_samples(content)
+    except MalformedCsvError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+
+    validated, problems = validate_confirmed_mapping(headers, parsed)
+    if problems:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=" ".join(problems)
+        )
+    return validated
+
+
+def _to_outcome_analysis_response(
+    analysis: OutcomeAnalysis,
+    *,
+    interpretation: str | None,
+    caveats: list[str],
+    proposal_id: UUID | None,
+) -> OutcomeAnalysisResponse:
+    """Render a deterministic analysis for the console.
+
+    Every figure came from `arie.intelligence.outcomes`; `interpretation` is the
+    only field a model contributed, and its absence is normal rather than an
+    error state a client has to handle specially.
+    """
+    return OutcomeAnalysisResponse(
+        total_rows=analysis.total_rows,
+        labelled_rows=analysis.labelled_rows,
+        positive_count=analysis.positive_count,
+        negative_count=analysis.negative_count,
+        baseline_rate=analysis.baseline_rate,
+        groups=[
+            OutcomeGroupResponse(
+                dimension=group.dimension,
+                group_key=group.group_key,
+                group_label=group.group_label,
+                sample_size=group.sample_size,
+                positive_count=group.positive_count,
+                negative_count=group.negative_count,
+                positive_rate=group.positive_rate,
+                baseline_rate=group.baseline_rate,
+                rate_difference=group.rate_difference,
+                signal=str(group.signal),
+                sentence=group.sentence(),
+            )
+            for group in analysis.groups
+        ],
+        unrecognised_labels=dict(analysis.unrecognised_labels),
+        warnings=list(analysis.warnings),
+        revenue_total_usd=(
+            str(analysis.revenue_total_usd) if analysis.revenue_total_usd is not None else None
+        ),
+        interpretation=interpretation,
+        caveats=caveats,
+        proposal_id=proposal_id,
+    )
+
+
+def _to_proposal_response(record: ProposalRecord) -> ProposalResponse:
+    payload = record.proposal
+    return ProposalResponse(
+        proposal_id=record.proposal_id,
+        organization_id=record.organization_id,
+        profile_id=record.profile_id,
+        profile_version=record.profile_version,
+        source=record.source,
+        status=record.status,
+        summary=record.summary,
+        changes=[ProposedChangeResponse(**change) for change in payload.get("changes", [])],
+        observations=list(payload.get("observations", [])),
+        caveats=list(payload.get("caveats", [])),
+        supporting_statistics=record.supporting_statistics,
+        evidence_strength=record.evidence_strength,
+        sample_size=record.sample_size,
+        created_at=record.created_at,
+        resolved_at=record.resolved_at,
+        resulting_profile_id=record.resulting_profile_id,
+    )
 
 
 def _require_org_admin(auth: AuthContext) -> None:
@@ -1693,6 +1893,163 @@ def register_routes(app: FastAPI) -> None:
             )
         return ICPProfileResponse.model_validate(record)
 
+    # ---------------------------------------------- intelligence: outcomes --
+    #
+    # M7 Slice 3. Optional throughout: ARIE is useful with no historical data,
+    # and every deterministic statistic below is computed with no model and no
+    # cost. A model is reached at most once, after the arithmetic, to write
+    # prose about aggregates it did not produce — and its absence changes
+    # nothing but the prose.
+    #
+    # Analysing writes at most one `profile_revision_proposals` row, which
+    # changes no scoring at all. Accepting one does, which is why accept and
+    # reject are owner/admin like every other targeting write.
+
+    @app.post("/intelligence/outcomes/analyze", response_model=OutcomeAnalysisResponse)
+    def analyze_historical_outcomes(
+        request: Request, state: StateDep, auth: AuthDep, llm: LLMServiceDep, file: UploadFile
+    ) -> OutcomeAnalysisResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by the JWT check above
+        content_length = request.headers.get("content-length")
+        if content_length is not None and int(content_length) > MAX_UPLOAD_CONTENT_LENGTH:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"upload exceeds the {MAX_UPLOAD_CONTENT_LENGTH}-byte limit",
+            )
+        try:
+            dataset = parse_outcome_csv(file.file.read())
+        except MalformedCsvError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+
+        analysis = analyze_outcomes(dataset)
+        now = datetime.now(UTC)
+
+        with state.pool.connection() as conn:
+            profile = get_active_profile(conn, organization_id=auth.organization_id)
+        draft = stored_draft(profile.config) if profile is not None else None
+
+        interpretation = None
+        if analysis.usable and profile is not None:
+            interpretation = interpret_outcomes(
+                llm,
+                organization_id=auth.organization_id,
+                analysis=analysis,
+                profile_summary=profile.name,
+                now=now,
+            )
+
+        proposal_id: UUID | None = None
+        caveats: list[str] = list(interpretation.caveats) if interpretation else []
+
+        if analysis.usable and profile is not None and draft is not None:
+            proposal = build_revision_proposal(analysis, draft, interpretation=interpretation)
+            if proposal is not None:
+                caveats = proposal.caveats
+                with _transaction(state.pool) as conn:
+                    record = create_proposal(
+                        conn,
+                        organization_id=auth.organization_id,
+                        created_by_user_id=auth.user_id,
+                        profile=profile,
+                        proposal=proposal,
+                    )
+                proposal_id = record.proposal_id
+        elif analysis.usable and draft is None:
+            # Nothing to apply changes *to*: this organization's targeting was
+            # written directly rather than described in words, so there is no
+            # draft to adjust. The statistics are still worth showing.
+            caveats = [
+                "ARIE can show you these patterns but cannot suggest a targeting "
+                "change, because this organization's targeting was set up directly "
+                "rather than described in words."
+            ]
+
+        return _to_outcome_analysis_response(
+            analysis,
+            interpretation=interpretation.summary if interpretation else None,
+            caveats=caveats,
+            proposal_id=proposal_id,
+        )
+
+    @app.get("/intelligence/proposals", response_model=list[ProposalResponse])
+    def list_revision_proposals(
+        state: StateDep,
+        auth: AuthDep,
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    ) -> list[ProposalResponse]:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            records = list_proposals(conn, organization_id=auth.organization_id, limit=limit)
+        return [_to_proposal_response(record) for record in records]
+
+    @app.get("/intelligence/proposals/{proposal_id}", response_model=ProposalResponse)
+    def get_revision_proposal(
+        proposal_id: UUID, state: StateDep, auth: AuthDep
+    ) -> ProposalResponse:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            record = get_proposal(
+                conn, organization_id=auth.organization_id, proposal_id=proposal_id
+            )
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such suggestion")
+        return _to_proposal_response(record)
+
+    @app.post("/intelligence/proposals/{proposal_id}/reject", response_model=ProposalResponse)
+    def reject_revision_proposal(
+        proposal_id: UUID, state: StateDep, auth: AuthDep
+    ) -> ProposalResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None
+        with _transaction(state.pool) as conn:
+            record = reject_proposal(
+                conn,
+                organization_id=auth.organization_id,
+                proposal_id=proposal_id,
+                user_id=auth.user_id,
+            )
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="no such open suggestion"
+            )
+        return _to_proposal_response(record)
+
+    @app.post(
+        "/intelligence/proposals/{proposal_id}/accept",
+        response_model=ICPProfileResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def accept_revision_proposal(
+        proposal_id: UUID, payload: AcceptProposalRequest, state: StateDep, auth: AuthDep
+    ) -> ICPProfileResponse:
+        """Apply a suggestion as a new immutable targeting version.
+
+        Returns the created profile rather than the proposal, because the
+        profile is what changed; a client wanting the resolved proposal reads it
+        back by id.
+        """
+        _require_org_admin(auth)
+        assert auth.user_id is not None
+        try:
+            with _transaction(state.pool) as conn:
+                _, created = accept_proposal(
+                    conn,
+                    organization_id=auth.organization_id,
+                    proposal_id=proposal_id,
+                    user_id=auth.user_id,
+                    name=payload.name,
+                    now=datetime.now(UTC),
+                )
+        except StaleProposalError as exc:
+            # 409, not 404 and not 500: the suggestion exists, nothing is
+            # broken, and the request cannot be satisfied because the world
+            # moved on underneath it.
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return ICPProfileResponse.model_validate(created)
+
     # ------------------------------------------------------------ batches --
     #
     # Productization M3, Part 4-6: CSV bulk lead upload. Gated on any
@@ -1707,10 +2064,56 @@ def register_routes(app: FastAPI) -> None:
     # memory at all; `arie.batches.parse_csv`'s own post-read size check is
     # the real, authoritative limit.
 
+    @app.post("/batches/mapping-preview", response_model=MappingPreviewResponse)
+    def preview_batch_mapping(
+        request: Request, state: StateDep, auth: AuthDep, llm: LLMServiceDep, file: UploadFile
+    ) -> MappingPreviewResponse:
+        """What ARIE thinks this file's columns are, without ingesting anything.
+
+        Registered before `POST /batches` only for readability — the paths do
+        not collide. Costs nothing for a file whose headers are all recognised;
+        an ambiguous one spends at most one AI call, and a customer whose
+        budget is exhausted still gets the deterministic answer plus a note.
+        """
+        _require_jwt_session(auth)
+        content_length = request.headers.get("content-length")
+        if content_length is not None and int(content_length) > MAX_UPLOAD_CONTENT_LENGTH:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"upload exceeds the {MAX_UPLOAD_CONTENT_LENGTH}-byte limit",
+            )
+        content = file.file.read()
+        try:
+            preview = resolve_mapping(
+                content,
+                service=llm,
+                organization_id=auth.organization_id,
+                now=datetime.now(UTC),
+            )
+        except MalformedCsvError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+        return _to_mapping_preview_response(preview)
+
     @app.post("/batches", response_model=BatchResponse, status_code=status.HTTP_201_CREATED)
     def upload_batch(
-        request: Request, state: StateDep, auth: AuthDep, file: UploadFile
+        request: Request,
+        state: StateDep,
+        auth: AuthDep,
+        file: UploadFile,
+        mapping: Annotated[str | None, Form()] = None,
     ) -> BatchResponse:
+        """`mapping` is an optional JSON object of canonical field -> the column
+        header in this file, as confirmed on the mapping-preview screen.
+
+        Revalidated here rather than trusted: a client could name a field ARIE
+        cannot store or a column that is not in the file, and the first of those
+        would be a mapping ingestion silently drops while the customer believed
+        it applied. Omitting it leaves `arie.batches`' own alias matching in
+        charge, exactly as before this milestone — every existing caller is
+        unaffected.
+        """
         _require_jwt_session(auth)
         assert auth.user_id is not None  # guaranteed by auth_method == "jwt"
         content_length = request.headers.get("content-length")
@@ -1729,8 +2132,10 @@ def register_routes(app: FastAPI) -> None:
         # quota logic fully outside `arie.batches`' own, already-tested
         # parse/create/enqueue flow rather than threading a new concern
         # through it.
+        field_map = _confirmed_field_map(content, mapping)
+
         try:
-            preview = parse_csv(content, organization_id=auth.organization_id)
+            preview = parse_csv(content, organization_id=auth.organization_id, field_map=field_map)
         except MalformedCsvError as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
@@ -1759,6 +2164,7 @@ def register_routes(app: FastAPI) -> None:
                     created_by_user_id=auth.user_id,
                     filename=file.filename or "upload.csv",
                     content=content,
+                    field_map=field_map,
                 )
                 progress = batch_progress(conn, organization_id=auth.organization_id, batch=record)
         except MalformedCsvError as exc:

@@ -44,7 +44,7 @@ from __future__ import annotations
 import csv
 import io
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
@@ -230,10 +230,30 @@ def _validate_row(
     )
 
 
-def parse_csv(content: bytes, *, organization_id: UUID) -> list[ParsedRow]:
+def parse_csv(
+    content: bytes,
+    *,
+    organization_id: UUID,
+    field_map: Mapping[str, str] | None = None,
+) -> list[ParsedRow]:
     """Parse and validate every row. Raises :class:`MalformedCsvError` for a
     file-level problem; a row-level problem is recorded on that row's
     `ParsedRow` instead of raising.
+
+    `field_map` (canonical field -> the actual header text in this file)
+    overrides :func:`_map_columns`' own alias matching. It exists so M7's
+    smart-column mapping (`arie.intelligence.csv_mapping`) can hand over a
+    mapping a human confirmed for headers this module's deliberately small
+    alias table would never have recognised — "Business", "Team Contact" —
+    without a second ingestion path existing anywhere. Everything after the
+    mapping is unchanged: the same validation, the same
+    :class:`LeadIngestCommand`, the same batch rows.
+
+    Only headers actually present in the file are honoured; a mapping naming a
+    column that is not there is dropped rather than trusted, because a caller
+    could otherwise map `email` to a header that does not exist and turn every
+    row into a silent rejection. The `email` requirement below still applies to
+    the result, so a mapping that resolves to nothing usable fails loudly.
     """
     if len(content) > MAX_FILE_SIZE_BYTES:
         raise MalformedCsvError(f"file exceeds the {MAX_FILE_SIZE_BYTES}-byte limit")
@@ -253,8 +273,13 @@ def parse_csv(content: bytes, *, organization_id: UUID) -> list[ParsedRow]:
     if not fieldnames:
         raise MalformedCsvError("file has no header row")
 
-    field_map = _map_columns(fieldnames)
-    if "email" not in field_map:
+    present = {name for name in fieldnames if name}
+    resolved = (
+        {field: header for field, header in field_map.items() if header in present}
+        if field_map is not None
+        else _map_columns(fieldnames)
+    )
+    if "email" not in resolved:
         raise MalformedCsvError("missing required column: email (or a recognised alias)")
 
     if not raw_rows:
@@ -265,7 +290,7 @@ def parse_csv(content: bytes, *, organization_id: UUID) -> list[ParsedRow]:
         )
 
     return [
-        _validate_row(index, dict(raw), field_map, organization_id=organization_id)
+        _validate_row(index, dict(raw), resolved, organization_id=organization_id)
         for index, raw in enumerate(raw_rows, start=1)
     ]
 
@@ -410,8 +435,14 @@ def create_batch(
     created_by_user_id: UUID,
     filename: str,
     content: bytes,
+    field_map: Mapping[str, str] | None = None,
 ) -> BatchRecord:
     """Parse, persist, and ingest one uploaded CSV. Commits per row.
+
+    `field_map` is passed straight through to :func:`parse_csv` — see there for
+    what it is for. Everything else about a batch is identical whether the
+    columns were recognised by this module's alias table or resolved by M7's
+    mapping step.
 
     Raises :class:`MalformedCsvError` before touching the database at all
     for a file-level problem — no `lead_batches` row is created in that
@@ -423,7 +454,7 @@ def create_batch(
     it back. See the module docstring for what a partial or repeated upload
     means for deduplication.
     """
-    rows = parse_csv(content, organization_id=organization_id)
+    rows = parse_csv(content, organization_id=organization_id, field_map=field_map)
     accepted_rows = sum(1 for row in rows if row.validation_status == "accepted")
     rejected_rows = len(rows) - accepted_rows
 

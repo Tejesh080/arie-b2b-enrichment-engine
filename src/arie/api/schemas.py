@@ -1090,3 +1090,174 @@ class TargetingVocabulariesResponse(BaseModel):
     objectives: list[str]
     preference_levels: list[str]
     scoring_dimensions: list[str]
+
+
+# ------------------------------------------------------- intelligence: csv --
+#
+# M7 Slice 3. `POST /batches/mapping-preview` reads an uploaded file's columns
+# and says what ARIE thinks they are; `POST /batches` gains an optional
+# `mapping` field carrying a customer's confirmed answer. Both are gated the
+# same way `POST /batches` already is (`_require_jwt_session`) — mapping a file
+# is part of uploading it, not a configuration change.
+#
+# The preview is not persisted and nothing is ingested by it. It is a POST
+# because it carries a file.
+
+
+class MappedColumnResponse(BaseModel):
+    """One source column and what ARIE thinks it holds.
+
+    `label` is what a customer is shown; `canonical_field` is the identifier a
+    correction dropdown posts back. Both are present because the console needs
+    the first and the API needs the second — never show the second.
+    """
+
+    source_column: str
+    canonical_field: str | None
+    label: str | None
+    confidence: str
+    reason: str
+    requires_confirmation: bool
+    candidates: list[str] = Field(default_factory=list)
+
+
+class CanonicalFieldResponse(BaseModel):
+    """One target a column may be mapped onto, for a correction dropdown."""
+
+    name: str
+    label: str
+    description: str
+    required: bool
+
+
+class MappingPreviewResponse(BaseModel):
+    """`POST /batches/mapping-preview` — what ARIE understood, before uploading.
+
+    `requires_confirmation` is the only field a simple client needs to branch
+    on: false means the columns can be uploaded as-is, true means show the
+    review screen. `field_map` is echoed so a client that changes nothing can
+    post it straight back.
+    """
+
+    columns: list[MappedColumnResponse]
+    field_map: dict[str, str]
+    ignored_columns: list[str]
+    conflicts: list[str]
+    warnings: list[str]
+    requires_confirmation: bool
+    usable: bool
+    """False when no column resolved to an email address. Ingestion requires
+    one, so this tells a client not to offer Continue at all."""
+    mapping_method: str
+    available_fields: list[CanonicalFieldResponse]
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    llm_cost_usd: str = "0"
+    llm_unavailable_reason: str | None = None
+
+
+# -------------------------------------------------- intelligence: outcomes --
+#
+# M7 Slice 3, Part B/C. Analysing a historical-outcomes CSV writes nothing
+# except, optionally, one proposal row — and a proposal changes no scoring
+# until somebody accepts it. Every write-shaped route here requires an
+# owner/admin JWT session, matching targeting: a suggestion about targeting is
+# a targeting matter. Reading proposals is open to any member.
+
+
+class OutcomeGroupResponse(BaseModel):
+    """One group's historical outcomes, against the customer's own baseline.
+
+    Every number here was computed deterministically by
+    `arie.intelligence.outcomes` — no model produced or could change one.
+    `sentence` is ARIE's own associational phrasing, safe to render as-is.
+    """
+
+    dimension: str
+    group_key: str
+    group_label: str
+    sample_size: int
+    positive_count: int
+    negative_count: int
+    positive_rate: float
+    baseline_rate: float
+    rate_difference: float
+    signal: str
+    sentence: str
+
+
+class OutcomeAnalysisResponse(BaseModel):
+    """`POST /intelligence/outcomes/analyze` — what the customer's past results say.
+
+    `proposal_id` is present only when the statistics supported a suggestion
+    *and* one was stored. Its absence is a normal, honest outcome: most small
+    datasets say nothing actionable.
+    """
+
+    total_rows: int
+    labelled_rows: int
+    positive_count: int
+    negative_count: int
+    baseline_rate: float
+    groups: list[OutcomeGroupResponse]
+    unrecognised_labels: dict[str, int]
+    warnings: list[str]
+    revenue_total_usd: str | None = None
+    interpretation: str | None = None
+    """A model's prose about the aggregates, when one was available. `None`
+    means the statistics stand alone — which they do."""
+    caveats: list[str] = Field(default_factory=list)
+    proposal_id: UUID | None = None
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    llm_cost_usd: str = "0"
+
+
+class ProposedChangeResponse(BaseModel):
+    """One concrete edit a proposal suggests, with its before and after."""
+
+    kind: str
+    dimension: str
+    target: str
+    target_label: str
+    from_value: str
+    to_value: str
+    rationale: str
+
+
+class ProposalResponse(BaseModel):
+    """One revision proposal. Mirrors `arie.intelligence.proposals.ProposalRecord`.
+
+    `status` is the whole point: a `proposed` row has changed nothing, and a
+    console must present it as a suggestion rather than as something that has
+    happened.
+    """
+
+    proposal_id: UUID
+    organization_id: UUID
+    profile_id: UUID
+    profile_version: int
+    source: str
+    status: str
+    summary: str
+    changes: list[ProposedChangeResponse]
+    observations: list[str]
+    caveats: list[str]
+    supporting_statistics: dict[str, Any]
+    evidence_strength: str
+    sample_size: int
+    created_at: datetime
+    resolved_at: datetime | None = None
+    resulting_profile_id: UUID | None = None
+
+
+class AcceptProposalRequest(BaseModel):
+    """`POST /intelligence/proposals/{id}/accept` — apply a suggestion.
+
+    Carries only a name for the profile version this creates. The changes
+    themselves come from the stored proposal, never from the request: a client
+    that could post its own changes would be posting a targeting profile, which
+    is what the targeting endpoints are for.
+    """
+
+    name: Annotated[str, Field(min_length=1, max_length=200)] = "Updated from past results"
