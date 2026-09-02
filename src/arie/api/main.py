@@ -53,10 +53,12 @@ from arie.api.schemas import (
     AcceptProposalRequest,
     ApiKeyCreatedResponse,
     ApiKeyResponse,
+    BatchInsightsResponse,
     BatchProgressResponse,
     BatchResponse,
     BatchRowResponse,
     BatchRowsPageResponse,
+    BatchSummaryResponse,
     BillingPortalRequest,
     BillingPortalResponse,
     BillingResponse,
@@ -69,8 +71,10 @@ from arie.api.schemas import (
     CreateInvitationRequest,
     CreateOrganizationRequest,
     CreateOrganizationResponse,
+    DashboardResponse,
     EffectiveEntitlementsResponse,
     ExecuteResearchRequest,
+    FeedbackInsightsResponse,
     FeedbackResponse,
     HealthResponse,
     ICPProfileResponse,
@@ -135,6 +139,8 @@ from arie.auth import (
     resolve_auth_context,
     resolve_verified_identity,
 )
+from arie.batch_export import batch_export_filename, export_batch_rows_csv
+from arie.batch_insights import compute_batch_insights, generate_batch_summary
 from arie.batches import (
     MAX_FILE_SIZE_BYTES,
     BatchProgress,
@@ -163,8 +169,14 @@ from arie.billing.stripe_gateway import StripeNotConfiguredError, UnknownPlanErr
 from arie.config import DATABASE, FRONTEND, OBSERVABILITY
 from arie.copilot_service import answer_lead_query, answer_list_query
 from arie.credential_resolver import resolve_provider_credential
+from arie.dashboard import load_dashboard
 from arie.evidence.store import PostgresEvidenceStore
 from arie.feedback import get_feedback, submit_feedback
+from arie.feedback_learning_service import (
+    FeedbackInsights,
+    analyze_and_maybe_propose,
+    load_feedback_insights,
+)
 from arie.icp_profiles import (
     create_profile as create_icp_profile_row,
 )
@@ -748,6 +760,46 @@ def _to_proposal_response(record: ProposalRecord) -> ProposalResponse:
         created_at=record.created_at,
         resolved_at=record.resolved_at,
         resulting_profile_id=record.resulting_profile_id,
+    )
+
+
+def _to_feedback_insights_response(insights: FeedbackInsights) -> FeedbackInsightsResponse:
+    pattern = insights.pattern
+    groups = (
+        [
+            OutcomeGroupResponse(
+                dimension=group.dimension,
+                group_key=group.group_key,
+                group_label=group.group_label,
+                sample_size=group.sample_size,
+                positive_count=group.positive_count,
+                negative_count=group.negative_count,
+                positive_rate=group.positive_rate,
+                baseline_rate=group.baseline_rate,
+                rate_difference=group.rate_difference,
+                signal=str(group.signal),
+                sentence=group.sentence(),
+            )
+            for group in pattern.outcome_analysis.groups
+        ]
+        if pattern.outcome_analysis is not None
+        else []
+    )
+    return FeedbackInsightsResponse(
+        total=pattern.total,
+        positive=pattern.positive,
+        negative=pattern.negative,
+        agreement_rate=pattern.agreement_rate,
+        support=str(pattern.support),
+        by_priority=pattern.by_priority,
+        by_profile_version=pattern.by_profile_version,
+        negative_reason_counts=pattern.negative_reason_counts,
+        groups=groups,
+        proposal=(
+            _to_proposal_response(insights.existing_proposal)
+            if insights.existing_proposal is not None
+            else None
+        ),
     )
 
 
@@ -2321,6 +2373,38 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         return ICPProfileResponse.model_validate(created)
 
+    # ---------------------------------------------------- feedback learning --
+    #
+    # M7 Slice 7, Parts A-C. `GET /intelligence/feedback-insights` is purely
+    # read-only — safe on every dashboard refresh, per Part B2's "one
+    # customer action must not mutate profile" rule. `POST /intelligence/
+    # feedback/analyze` is the one place a `USER_FEEDBACK` proposal can be
+    # created (or an already-open one reused) — gated the same as historical-
+    # outcomes analysis, since both create the identical kind of row.
+
+    @app.get("/intelligence/feedback-insights", response_model=FeedbackInsightsResponse)
+    def get_feedback_insights(state: StateDep, auth: AuthDep) -> FeedbackInsightsResponse:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            insights = load_feedback_insights(conn, organization_id=auth.organization_id)
+        return _to_feedback_insights_response(insights)
+
+    @app.post("/intelligence/feedback/analyze", response_model=FeedbackInsightsResponse)
+    def analyze_feedback(
+        state: StateDep, auth: AuthDep, llm: LLMServiceDep
+    ) -> FeedbackInsightsResponse:
+        _require_org_admin(auth)
+        assert auth.user_id is not None  # guaranteed by the JWT check above
+        with _transaction(state.pool) as conn:
+            insights = analyze_and_maybe_propose(
+                conn,
+                llm,
+                organization_id=auth.organization_id,
+                created_by_user_id=auth.user_id,
+                now=datetime.now(UTC),
+            )
+        return _to_feedback_insights_response(insights)
+
     # ------------------------------------------------------------ batches --
     #
     # Productization M3, Part 4-6: CSV bulk lead upload. Gated on any
@@ -2507,6 +2591,97 @@ def register_routes(app: FastAPI) -> None:
             limit=limit,
             offset=offset,
             total=batch.total_rows,
+        )
+
+    # ---------------------------------------------------- batch insights --
+    #
+    # M7 Slice 7, Parts D/E/F/I. `GET /insights` is fully deterministic — no
+    # LLM, safe on a plain page load. `POST /summary` is the one optional AI
+    # call, on its own route so loading the batch page never pays for it.
+    # `GET /export.csv` never touches the LLM either; see
+    # `arie.batch_export`'s own module docstring for the formula-injection
+    # neutralization every cell gets.
+
+    @app.get("/batches/{batch_id}/insights", response_model=BatchInsightsResponse)
+    def get_batch_insights(batch_id: UUID, state: StateDep, auth: AuthDep) -> BatchInsightsResponse:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            batch = get_batch(conn, organization_id=auth.organization_id, batch_id=batch_id)
+            if batch is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail=f"no batch {batch_id}"
+                )
+            insights = compute_batch_insights(
+                conn, organization_id=auth.organization_id, batch=batch
+            )
+        return BatchInsightsResponse.from_insights(insights)
+
+    @app.post("/batches/{batch_id}/summary", response_model=BatchSummaryResponse)
+    def post_batch_summary(
+        batch_id: UUID, state: StateDep, auth: AuthDep, llm: LLMServiceDep
+    ) -> BatchSummaryResponse:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            batch = get_batch(conn, organization_id=auth.organization_id, batch_id=batch_id)
+            if batch is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail=f"no batch {batch_id}"
+                )
+            insights = compute_batch_insights(
+                conn, organization_id=auth.organization_id, batch=batch
+            )
+        summary, source = generate_batch_summary(
+            llm,
+            organization_id=auth.organization_id,
+            batch_id=batch_id,
+            insights=insights,
+            now=datetime.now(UTC),
+        )
+        return BatchSummaryResponse(summary=summary, source=source)
+
+    @app.get("/batches/{batch_id}/export.csv")
+    def export_batch_csv_endpoint(batch_id: UUID, state: StateDep, auth: AuthDep) -> Response:
+        _require_jwt_session(auth)
+        with state.pool.connection() as conn:
+            batch = get_batch(conn, organization_id=auth.organization_id, batch_id=batch_id)
+            if batch is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail=f"no batch {batch_id}"
+                )
+            csv_text = export_batch_rows_csv(
+                conn, organization_id=auth.organization_id, batch_id=batch_id
+            )
+        filename = batch_export_filename(batch.filename)
+        return Response(
+            content=csv_text,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # ----------------------------------------------------------- dashboard --
+    #
+    # M7 Slice 7, Parts H/Q. Read-only, no LLM call — see `arie.dashboard`'s
+    # own module docstring for why this is almost entirely composition of
+    # surfaces that already exist.
+
+    @app.get("/dashboard", response_model=DashboardResponse)
+    def get_dashboard(state: StateDep, auth: AuthDep) -> DashboardResponse:
+        _require_jwt_session(auth)
+        assert auth.user_id is not None  # guaranteed by the JWT check above
+        with state.pool.connection() as conn:
+            summary = load_dashboard(
+                conn, organization_id=auth.organization_id, user_id=auth.user_id
+            )
+            latest_batch_response = None
+            if summary.latest_batch is not None:
+                progress = batch_progress(
+                    conn, organization_id=auth.organization_id, batch=summary.latest_batch
+                )
+                latest_batch_response = _to_batch_response(summary.latest_batch, progress)
+        return DashboardResponse.from_summary(
+            summary,
+            latest_batch=latest_batch_response,
+            open_proposals=[_to_proposal_response(p) for p in summary.open_proposals],
         )
 
     # -------------------------------------------------------------- usage --

@@ -355,11 +355,22 @@ def _strongest(
     return best.signal, best.sample_size
 
 
+_SUMMARY_SUBJECT: dict[ProposalSource, str] = {
+    ProposalSource.HISTORICAL_OUTCOMES: "past results",
+    ProposalSource.USER_FEEDBACK: "recommendations you gave feedback on",
+}
+"""What `build_revision_proposal`'s fallback summary calls the dataset — the
+one word that has to change between "ARIE inspected a spreadsheet you
+uploaded" and "ARIE inspected feedback you clicked", per M7 Slice 7's own
+truthfulness rule: never imply retraining, always "based on your feedback"."""
+
+
 def build_revision_proposal(
     analysis: OutcomeAnalysis,
     current: BusinessProfileDraft,
     *,
     interpretation: OutcomeInterpretation | None = None,
+    source: ProposalSource = ProposalSource.HISTORICAL_OUTCOMES,
 ) -> RevisionProposal | None:
     """Assemble a proposal, or ``None`` when the data does not support one.
 
@@ -370,6 +381,12 @@ def build_revision_proposal(
     `interpretation` is a model's prose about the same aggregates. Optional in
     every sense — the proposal's summary falls back to a sentence assembled
     from the statistics, which is less fluent and exactly as true.
+
+    `source` only changes the deterministic fallback wording (Slice 7 adds
+    `USER_FEEDBACK`, computed by `arie.intelligence.feedback_learning` from an
+    `OutcomeAnalysis` built out of feedback rows rather than an uploaded CSV —
+    every rule below, `derive_changes` included, applies identically either
+    way).
     """
     changes = derive_changes(analysis, current)
     if not changes:
@@ -381,8 +398,9 @@ def build_revision_proposal(
         observations = list(interpretation.observations)
         caveats = list(interpretation.caveats)
     else:
+        subject = _SUMMARY_SUBJECT[source]
         summary = (
-            f"Across {analysis.labelled_rows} past results, some groups had a "
+            f"Based on {analysis.labelled_rows} {subject}, some groups had a "
             f"noticeably different positive-outcome rate from your overall "
             f"{analysis.baseline_rate:.0%}. ARIE has suggested "
             f"{len(changes)} targeting change{'s' if len(changes) != 1 else ''} below."
@@ -395,7 +413,7 @@ def build_revision_proposal(
         "company buys because of what makes it that kind of company.",
     ]
     return RevisionProposal(
-        source=ProposalSource.HISTORICAL_OUTCOMES,
+        source=source,
         summary=summary,
         changes=changes,
         evidence_strength=strength,

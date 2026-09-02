@@ -22,9 +22,11 @@ from arie.api.receipt import DecisionReceipt
 from arie.apikeys import SCOPES
 from arie.approval.workflow import ReviewAction
 from arie.auth import ROLES
+from arie.batch_insights import BatchInsights
 from arie.billing.service import PURCHASABLE_PLANS
 from arie.copilot import CopilotIntent, CopilotResponse, LeadCopilotResponse
 from arie.core.types import LeadStatus
+from arie.dashboard import DashboardSummary
 from arie.feedback import FeedbackReason, FeedbackRecord, FeedbackSentiment
 from arie.icp_profiles import InvalidICPConfigError, validate_config
 from arie.identity.normalize import normalize_domain, normalize_email
@@ -1557,3 +1559,127 @@ class LeadCopilotResponseSchema(BaseModel):
     @classmethod
     def from_result(cls, result: LeadCopilotResponse) -> LeadCopilotResponseSchema:
         return cls.model_validate(result)
+
+
+# ---------------------------------------------------------- feedback learning --
+#
+# M7 Slice 7, Parts A-C. `arie.intelligence.feedback_learning`/
+# `arie.feedback_learning_service`. The insights endpoint is read-only; the
+# analyze endpoint is the one place a `USER_FEEDBACK` proposal can be created,
+# reusing `arie.intelligence.proposals` end to end — see that module and
+# `ProposalResponse` above for accept/reject, unchanged by this slice.
+
+
+class FeedbackInsightsResponse(BaseModel):
+    """`GET /intelligence/feedback-insights` and
+    `POST /intelligence/feedback/analyze` share this shape — the analyze
+    route additionally may have created (or reused) `proposal`, the insights
+    route never does."""
+
+    total: int
+    positive: int
+    negative: int
+    agreement_rate: float | None
+    support: str
+    """One of `arie.intelligence.feedback_learning.FeedbackSupport`:
+    `insufficient_data` / `summary_only` / `eligible`."""
+    by_priority: dict[str, dict[str, int]]
+    by_profile_version: dict[str, dict[str, int]]
+    negative_reason_counts: dict[str, int]
+    groups: list[OutcomeGroupResponse]
+    """Empty unless `support == "eligible"` — see
+    `FeedbackPatternAnalysis.outcome_analysis`."""
+    proposal: ProposalResponse | None
+
+
+# ------------------------------------------------------------- batch insights --
+#
+# M7 Slice 7, Part D. `arie.batch_insights`. Every figure deterministic;
+# `POST /batches/{id}/summary` (Part E) is the one optional LLM call, kept on
+# a separate route so a page load is never what pays for it.
+
+
+class BatchInsightsResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    total_leads: int
+    priority_counts: dict[str, int]
+    decided_leads: int
+    unknown_scoring_observations: int
+    expected_scoring_observations: int
+    unknown_data_rate: float | None
+    human_review_count: int
+    human_review_rate: float | None
+    provider_calls: int
+    leads_with_provider_activity: int
+    modeled_provider_cost_usd: Decimal
+    actual_provider_cost_usd: Decimal
+    actual_provider_cost_known_calls: int
+    llm_calls: int
+    modeled_llm_cost_usd: Decimal
+    feedback_total: int
+    feedback_positive: int
+    feedback_approval_rate: float | None
+
+    @classmethod
+    def from_insights(cls, insights: BatchInsights) -> BatchInsightsResponse:
+        return cls.model_validate(insights)
+
+
+class BatchSummaryResponse(BaseModel):
+    """`POST /batches/{id}/summary` — a model's prose about the deterministic
+    `BatchInsightsResponse` a caller already has, or ARIE's own fallback
+    sentence when AI is unavailable. `source` is never hidden, matching every
+    other AI-optional surface in M7."""
+
+    summary: str
+    source: str
+    """`"ai"` or `"deterministic"`."""
+
+
+# -------------------------------------------------------------------- dashboard --
+#
+# M7 Slice 7, Parts H/Q. `arie.dashboard`. Read-only, no LLM call — a bounded
+# composition of surfaces that already exist.
+
+
+class DashboardFeedbackResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    total: int
+    positive: int
+    negative: int
+    agreement_rate: float | None
+    by_priority: dict[str, dict[str, int]]
+    negative_reason_counts: dict[str, int]
+
+
+class DashboardResponse(BaseModel):
+    priority_counts: dict[str, int]
+    top_leads: list[CopilotLeadReferenceResponse]
+    latest_batch: BatchResponse | None
+    open_proposals: list[ProposalResponse]
+    feedback: DashboardFeedbackResponse
+
+    @classmethod
+    def from_summary(
+        cls,
+        summary: DashboardSummary,
+        *,
+        latest_batch: BatchResponse | None,
+        open_proposals: list[ProposalResponse],
+    ) -> DashboardResponse:
+        """`open_proposals` and `latest_batch` are supplied pre-converted —
+        both already require a response-shaping helper (`_to_proposal_response`
+        / `_to_batch_response`) that lives in `arie.api.main` alongside the
+        route handler, not here, so this classmethod only assembles what it's
+        given rather than importing across that boundary."""
+        return cls(
+            priority_counts=summary.priority_counts,
+            top_leads=[
+                CopilotLeadReferenceResponse.model_validate(lead) for lead in summary.top_leads
+            ],
+            latest_batch=latest_batch,
+            open_proposals=open_proposals,
+            feedback=DashboardFeedbackResponse.model_validate(summary.feedback),
+        )
