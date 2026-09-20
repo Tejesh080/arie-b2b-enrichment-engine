@@ -104,7 +104,7 @@ from arie.evidence.ttl_policy import ttl_for_field
 from arie.icp_profiles import resolve_scoring_config
 from arie.identity.normalize import domain_from_email, normalize_domain, normalize_email
 from arie.identity.validation import (
-    MISMATCH,
+    VERIFIED,
     IdentityValidation,
     RequestedIdentity,
     ReturnedIdentity,
@@ -1160,7 +1160,7 @@ def _validate_person_match(
     identity: _LeadIdentity, provider: EnrichmentProvider, result: ProviderResult
 ) -> tuple[ProviderResult, IdentityValidation | None]:
     """Check a successful person-provider result against the requested
-    identity, and redact its fields if the match is a ``MISMATCH``.
+    identity, and redact its fields unless the match is ``VERIFIED``.
 
     Called on every person-provider result immediately after ``fetch``, in
     both acquisition loops, before evidence is ever persisted — this is the
@@ -1171,11 +1171,31 @@ def _validate_person_match(
     ever *removes* fields, never invents or upgrades a verdict from
     incomplete data.
 
-    The call itself is always billed and ledgered normally — a MISMATCH means
-    "do not score this," not "this call didn't happen" — and the raw
-    ``matched_identity``/``normalization`` audit already carried on
-    ``result.raw`` is untouched, so a reviewer can still see exactly who the
-    provider matched.
+    **Only ``VERIFIED`` (domain + name both independently agree) may score.**
+    Real Hunter person-validation (2026-09-21) reproduced the exact case this
+    module's docstring already named: ``patrick@stripe.com`` matched a real
+    but wrong person. When the caller supplies an expected ``full_name`` a
+    genuine mismatch already read as ``MISMATCH`` and was already excluded —
+    but without one (most cold leads never carry a ``full_name`` before
+    enrichment), the same wrong-person answer reads only as ``PROBABLE``
+    (domain agrees, no independent second signal), and *that* verdict used to
+    pass fields through unchanged. ``PROBABLE`` cannot rule out a same-
+    company wrong-person match by construction — that is exactly what
+    ``arie.identity.validation``'s own docstring says a single signal cannot
+    do — so it must not be trusted merely because the caller happened to omit
+    a name to check. ``UNVERIFIABLE`` (no comparable signal on either side) is
+    strictly weaker evidence than ``PROBABLE`` and is excluded for the same
+    reason. The practical consequence: a lead ingested with no ``full_name``
+    can no longer have person-provider evidence scored at all — full_name is
+    not separately *required* by a standalone check here; it falls out of
+    ``VERIFIED`` being structurally unreachable without one (domain-only
+    agreement never becomes VERIFIED — see ``validate_identity``'s docstring).
+
+    The call itself is always billed and ledgered normally regardless of
+    verdict — excluding a verdict from scoring means "do not score this," not
+    "this call didn't happen" — and the raw ``matched_identity``/
+    ``normalization`` audit already carried on ``result.raw`` is untouched, so
+    a reviewer can still see exactly who the provider matched.
     """
     if provider.entity_type != "person" or result.status is not ProviderStatus.SUCCESS:
         return result, None
@@ -1188,16 +1208,27 @@ def _validate_person_match(
         ReturnedIdentity(
             full_name=matched.get("full_name"),
             email=matched.get("email"),
-            employer_domain=matched.get("employer_domain"),
-            employer_name=matched.get("employer_name"),
+            # Hunter's audit (arie.providers.hunter_contract.HunterPersonIdentity)
+            # keys these "employer_domain"/"employer_name"; Apollo's
+            # (arie.providers.apollo_contract.ApolloPersonIdentity) keys the
+            # same concept "organization_domain"/"organization_name" — a
+            # pre-existing divergence this function never bridged. Harmless
+            # while only MISMATCH mattered (a missing signal read "unknown",
+            # never "mismatch"), but requiring VERIFIED makes it load-bearing:
+            # without this fallback, Apollo's domain signal could never reach
+            # "match", so Apollo person evidence could never reach VERIFIED —
+            # unscoreable regardless of how good the actual match was.
+            employer_domain=matched.get("employer_domain") or matched.get("organization_domain"),
+            employer_name=matched.get("employer_name") or matched.get("organization_name"),
         ),
     )
-    if validation.verdict != MISMATCH:
+    if validation.verdict == VERIFIED:
         return result, validation
     # Contested, not discarded: raw/matched_identity/cost/status all survive
     # on the (otherwise unchanged) result for ledgering and audit — only the
     # scoreable fields are cleared, per the module's "keep the record,
-    # reject the score" rule.
+    # reject the score" rule. Applies to MISMATCH, PROBABLE, and UNVERIFIABLE
+    # alike — anything short of VERIFIED.
     return replace(result, fields={}), validation
 
 
@@ -2096,14 +2127,19 @@ def _acquire_evaluation_parallel(
         if isinstance(normalization, dict) and normalization.get("unmapped"):
             record["unmapped"] = normalization["unmapped"]
         if validation is not None:
-            # Present for VERIFIED/PROBABLE too, not only MISMATCH — the
-            # receipt should always be able to answer "was this person
-            # checked, and against what," not just flag the bad case.
+            # Present for every verdict, not only MISMATCH — the receipt
+            # should always be able to answer "was this person checked, and
+            # against what," not just flag the bad case.
             record["identity_validation"] = {
                 "verdict": validation.verdict,
                 "reasons": list(validation.reasons),
             }
-            if validation.verdict == MISMATCH:
+            if validation.verdict != VERIFIED:
+                # Mirrors _validate_person_match's own gate exactly — this
+                # record's own "fields" above already reflects the same
+                # clearing (result.fields is {} for anything short of
+                # VERIFIED by the time this function runs it), so this flag
+                # is a readable restatement, not a second decision.
                 record["person_evidence_usable_for_scoring"] = False
         person_records[provider.name] = record
 

@@ -114,6 +114,88 @@ def test_provider_returned_a_name_but_domain_was_never_supplied_by_the_lead() ->
     assert result.verdict == VERIFIED  # domain (from email) + name both agree
 
 
+# ============================= Priority 1: free-mail/company-context contract --
+# 2026-09-21 product hardening sprint. Three cases, exactly as specified:
+# (1) business email + name + matching domain, (2) free-mail + explicit
+# company_domain + name, (3) free-mail with no independent company context.
+
+
+def test_case_1_business_email_with_name_and_matching_domain_is_verified() -> None:
+    """Rule 1: ordinary business email, nothing free-mail about it."""
+    requested = RequestedIdentity(
+        email="jane@acme.com", company_domain="acme.com", full_name="Jane Doe"
+    )
+    returned = ReturnedIdentity(full_name="Jane Doe", employer_domain="acme.com")
+    result = validate_identity(requested, returned)
+    assert result.verdict == VERIFIED
+
+
+def test_case_2_free_mail_with_explicit_company_domain_and_name_is_verified() -> None:
+    """Rule 2: a gmail.com lead, but the caller independently supplied the
+    real employer domain at ingestion (e.g. from a form field, a CRM import)
+    -- that supplied domain is what gets checked, never the gmail.com address
+    itself, so this can still legitimately reach VERIFIED."""
+    requested = RequestedIdentity(
+        email="jane.doe@gmail.com", company_domain="acme.com", full_name="Jane Doe"
+    )
+    returned = ReturnedIdentity(full_name="Jane Doe", employer_domain="acme.com")
+    result = validate_identity(requested, returned)
+    assert result.verdict == VERIFIED
+
+
+def test_case_2_free_mail_with_explicit_company_domain_but_provider_disagrees_is_mismatch() -> None:
+    """The explicit company_domain is a real check, not a rubber stamp -- a
+    provider match at a genuinely different company is still a MISMATCH."""
+    requested = RequestedIdentity(
+        email="jane.doe@gmail.com", company_domain="acme.com", full_name="Jane Doe"
+    )
+    returned = ReturnedIdentity(full_name="Jane Doe", employer_domain="othercorp.com")
+    result = validate_identity(requested, returned)
+    assert result.verdict == MISMATCH
+
+
+def test_case_3_free_mail_with_no_company_context_stays_unverifiable_even_with_a_name_match() -> (
+    None
+):
+    """Rule 3: no company_domain supplied, and the email itself is free-mail
+    -- there is nothing legitimate to check the provider's employer domain
+    against. Must NOT fall back to "gmail.com" as if it were an employer
+    domain (that would manufacture a false MISMATCH against every real
+    answer); must NOT quietly promote the agreeing name alone to VERIFIED
+    either. A perfect name match still caps at PROBABLE, one signal short of
+    scoreable (arie.jobs.handlers._validate_person_match requires VERIFIED)."""
+    requested = RequestedIdentity(email="jane.doe@gmail.com", full_name="Jane Doe")
+    returned = ReturnedIdentity(full_name="Jane Doe", employer_domain="acme.com")
+    result = validate_identity(requested, returned)
+    assert result.verdict == PROBABLE
+    assert any("free-mail" in reason for reason in result.reasons), (
+        "the reason must be inspectable and specific -- 'no company context', not a "
+        "silent/generic unknown"
+    )
+
+
+def test_case_3_free_mail_with_no_company_context_and_no_name_is_unverifiable() -> None:
+    requested = RequestedIdentity(email="jane.doe@gmail.com")
+    returned = ReturnedIdentity(full_name="Someone", employer_domain="acme.com")
+    result = validate_identity(requested, returned)
+    assert result.verdict == UNVERIFIABLE
+
+
+def test_free_mail_domain_never_manufactures_a_false_mismatch() -> None:
+    """Before this fix, `_expected_domain` fell back to the email's own
+    domain ("gmail.com") and compared it against the provider's real employer
+    domain -- always disagreeing, always MISMATCH, for every free-mail lead
+    that had no expected name to check either. That verdict was not honest:
+    it looked like "the provider found the wrong person" when the real
+    reason was "there was never anything to check." This must now read
+    UNVERIFIABLE (nothing comparable), not MISMATCH."""
+    requested = RequestedIdentity(email="solo@gmail.com")
+    returned = ReturnedIdentity(full_name="Dana Okafor", employer_domain="northwind.test")
+    result = validate_identity(requested, returned)
+    assert result.verdict != MISMATCH
+    assert result.verdict == UNVERIFIABLE
+
+
 # ---------------------------------------------------------------- name rules --
 
 

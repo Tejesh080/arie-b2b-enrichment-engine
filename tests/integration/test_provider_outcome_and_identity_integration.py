@@ -356,6 +356,118 @@ def test_a_matching_name_and_domain_is_scored_normally(
     assert any(f["provider"] == HUNTER and f["verdict"] == "VERIFIED" for f in findings)
 
 
+def test_a_domain_only_match_with_no_expected_name_is_not_scored(
+    api_client: TestClient,
+    cleanup_ingest: IngestCleanup,
+    cleanup_evidence: list[uuid.UUID],
+    db_conn: psycopg.Connection,
+    live_pool: ConnectionPool,
+    runtime: SimulatedEnrichmentRuntime,
+) -> None:
+    """Priority 2 (2026-09-21 real Hunter person-validation): the lead never
+    supplied an expected `full_name`, so the same wrong-person answer that
+    reads MISMATCH when a name *is* supplied instead reads only PROBABLE
+    (domain agrees, no independent second signal to check). A caller must not
+    get scoreable evidence merely by omitting the one field that would have
+    caught the mismatch -- PROBABLE is not sufficient corroboration on its
+    own, regardless of whose fault the missing name is."""
+    domain = f"stripe-{uuid.uuid4().hex[:8]}.test"
+    hunter = _hunter_provider(
+        _hunter_person(
+            full_name="Patrick Bosmans", title="IT Administrator", role="it", domain=domain
+        )
+    )
+    handlers = _handlers_for(live_pool, runtime, hunter)
+
+    body = _run(
+        api_client,
+        cleanup_ingest,
+        cleanup_evidence,
+        db_conn,
+        live_pool,
+        handlers,
+        domain=domain,
+        email=f"patrick@{domain}",
+        # full_name deliberately omitted -- the exact gap this test closes.
+    )
+
+    sources = _evidence_sources(db_conn, body["person_id"])
+    assert HUNTER not in sources.values(), "PROBABLE-verdict evidence must not be persisted"
+
+    snapshot = _snapshot(db_conn, body["lead_id"])
+    findings = snapshot.get("identity_findings", [])
+    assert any(f["provider"] == HUNTER and f["verdict"] == "PROBABLE" for f in findings), (
+        "sanity check: this scenario must actually produce PROBABLE, not MISMATCH -- "
+        "otherwise this test would pass for the wrong reason"
+    )
+
+
+def test_an_unverifiable_match_is_not_scored(
+    api_client: TestClient,
+    cleanup_ingest: IngestCleanup,
+    cleanup_evidence: list[uuid.UUID],
+    db_conn: psycopg.Connection,
+    live_pool: ConnectionPool,
+    runtime: SimulatedEnrichmentRuntime,
+) -> None:
+    """Zero comparable signals (no expected name, and the provider's answer
+    carries no employer domain to check either) is strictly weaker evidence
+    than PROBABLE's single agreeing signal -- it must not be scored either."""
+    domain = f"acme-{uuid.uuid4().hex[:8]}.test"
+    hunter = _hunter_provider(
+        _hunter_person(full_name="Someone Else", title="Analyst", role="other", domain="")
+    )
+    handlers = _handlers_for(live_pool, runtime, hunter)
+
+    body = _run(
+        api_client,
+        cleanup_ingest,
+        cleanup_evidence,
+        db_conn,
+        live_pool,
+        handlers,
+        domain=domain,
+        email=f"nobody@{domain}",
+    )
+
+    sources = _evidence_sources(db_conn, body["person_id"])
+    assert HUNTER not in sources.values(), "UNVERIFIABLE-verdict evidence must not be persisted"
+
+
+def test_a_provider_miss_never_fabricates_person_evidence(
+    api_client: TestClient,
+    cleanup_ingest: IngestCleanup,
+    cleanup_evidence: list[uuid.UUID],
+    db_conn: psycopg.Connection,
+    live_pool: ConnectionPool,
+    runtime: SimulatedEnrichmentRuntime,
+) -> None:
+    """A miss reaches `_validate_person_match`'s gate at all -- no
+    `matched_identity` to compare, no fields to clear or keep, no finding."""
+    domain = f"co-{uuid.uuid4().hex[:8]}.test"
+    hunter = _hunter_provider(_hunter_miss)
+    handlers = _handlers_for(live_pool, runtime, hunter)
+
+    body = _run(
+        api_client,
+        cleanup_ingest,
+        cleanup_evidence,
+        db_conn,
+        live_pool,
+        handlers,
+        domain=domain,
+        email=f"nobody@{domain}",
+        full_name="Somebody Real",
+    )
+
+    sources = _evidence_sources(db_conn, body["person_id"])
+    assert HUNTER not in sources.values()
+
+    snapshot = _snapshot(db_conn, body["lead_id"])
+    assert snapshot.get("identity_findings", []) == [], "a miss has nothing to compare -- no finding"
+    assert "title_seniority" in snapshot.get("unknown", [])
+
+
 # ==================================================== outcome-cache scenarios --
 
 
@@ -392,6 +504,7 @@ def test_scenario_a_a_full_success_is_not_re_bought(
         handlers,
         domain=domain,
         email=email,
+        full_name="Vera Sales",  # VERIFIED match — required for evidence to be scoreable
     )
     assert counter[0] == 1
     sources = _evidence_sources(db_conn, first["person_id"])
@@ -407,6 +520,7 @@ def test_scenario_a_a_full_success_is_not_re_bought(
         handlers,
         domain=domain,
         email=email,
+        full_name="Vera Sales",
     )
     assert counter[0] == 1, "a full prior success must suppress the identical re-call"
 
@@ -444,6 +558,7 @@ def test_scenario_b_a_partial_success_is_not_re_bought(
         handlers,
         domain=domain,
         email=email,
+        full_name="Sam Founder",  # VERIFIED match — required for evidence to be scoreable
     )
     assert counter[0] == 1
     sources = _evidence_sources(db_conn, first["person_id"])
@@ -459,6 +574,7 @@ def test_scenario_b_a_partial_success_is_not_re_bought(
         handlers,
         domain=domain,
         email=email,
+        full_name="Sam Founder",
     )
     assert counter[0] == 1, "a partial prior success must suppress the identical re-call"
 
@@ -643,6 +759,105 @@ def test_outcome_guard_ttl_expiry_makes_the_provider_askable_again(
 
     guard_expired = ProviderOutcomeGuard(live_pool, LiveOutcomeCacheConfig(miss_ttl_seconds=0.0))
     assert guard_expired.recent_miss(HUNTER, "person", entity_id, organization_id=ORG) is None
+
+
+# ==================================================== Priority 3 (2026-09-21) --
+# The real Hunter/Abstract person-validation re-bought an Abstract company
+# miss after ~47s between two ingests of the same domain. Audit finding: the
+# guard above already covers this generically (entity_type/provider are
+# plain parameters, not Hunter-specific) -- the repeat charge was the
+# deliberately short 30s default `miss_ttl_seconds` being exceeded by real
+# wall-clock elapsed time, not a bypass. These tests pin that the guard is
+# concretely exercised for Abstract/company, not only Hunter/person.
+
+
+def test_outcome_guard_ttl_expiry_for_abstract_company_misses(
+    live_pool: ConnectionPool, cleanup_evidence: list[uuid.UUID]
+) -> None:
+    """Same shape as `test_outcome_guard_ttl_expiry_makes_the_provider_askable_
+    again`, for `abstract_company_enrichment` + `entity_type="company"` by
+    name -- the exact provider/entity-type pair the real validation run hit."""
+    from arie.ledger.store import PostgresCostLedger
+    from arie.providers.live_abstract import PROVIDER_NAME as ABSTRACT
+
+    ledger = PostgresCostLedger(live_pool)
+    entity_id = uuid.uuid4()
+    cleanup_evidence.append(entity_id)
+    write = ledger.record_provider_call(
+        idempotency_key=f"outcome-ttl-abstract-{uuid.uuid4().hex}",
+        provider=ABSTRACT,
+        entity_type="company",
+        entity_id=entity_id,
+        status=ProviderStatus.MISS,
+        cost_usd=0.00165,
+        latency_ms=10.0,
+        organization_id=ORG,
+    )
+    assert write.recorded
+
+    guard_within_ttl = ProviderOutcomeGuard(
+        live_pool, LiveOutcomeCacheConfig(miss_ttl_seconds=3600.0)
+    )
+    assert (
+        guard_within_ttl.recent_miss(ABSTRACT, "company", entity_id, organization_id=ORG)
+        is not None
+    )
+
+    guard_expired = ProviderOutcomeGuard(live_pool, LiveOutcomeCacheConfig(miss_ttl_seconds=0.0))
+    assert guard_expired.recent_miss(ABSTRACT, "company", entity_id, organization_id=ORG) is None
+
+
+def test_an_abstract_company_miss_is_not_re_bought_inside_its_ttl(
+    api_client: TestClient,
+    cleanup_ingest: IngestCleanup,
+    cleanup_evidence: list[uuid.UUID],
+    db_conn: psycopg.Connection,
+    live_pool: ConnectionPool,
+    runtime: SimulatedEnrichmentRuntime,
+) -> None:
+    """End-to-end (not just the guard): a same-domain re-ingest, back to
+    back, well inside the default 30s window, must not pay Abstract twice."""
+    from arie.config import LiveProviderConfig
+    from arie.providers.live_abstract import PROVIDER_NAME as ABSTRACT
+    from arie.providers.live_abstract import AbstractCompanyEnrichmentProvider
+
+    domain = f"co-{uuid.uuid4().hex[:8]}.test"
+    counter = [0]
+
+    def _abstract_miss(request: httpx.Request) -> httpx.Response:
+        counter[0] += 1
+        return httpx.Response(200, json={})
+
+    abstract = AbstractCompanyEnrichmentProvider(
+        config=LiveProviderConfig(
+            api_key="test-key", cost_usd_per_call=0.00165, min_request_interval_seconds=0.0
+        ),
+        client=httpx.Client(transport=httpx.MockTransport(_abstract_miss)),
+    )
+    handlers = build_handlers(
+        live_pool, runtime=runtime, provider_mode="live", live_providers=[abstract]
+    )
+
+    _run(api_client, cleanup_ingest, cleanup_evidence, db_conn, live_pool, handlers, domain=domain)
+    assert counter[0] == 1
+
+    second = _run(
+        api_client, cleanup_ingest, cleanup_evidence, db_conn, live_pool, handlers, domain=domain
+    )
+    assert counter[0] == 1, "a recent Abstract miss must suppress the identical re-call"
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT suppressed_reason, cost_usd, cache_hit FROM provider_calls "
+            "WHERE lead_id = %s AND provider = %s",
+            (second["lead_id"], ABSTRACT),
+        )
+        rows = cur.fetchall()
+    assert len(rows) == 1
+    suppressed_reason, cost_usd, cache_hit = rows[0]
+    assert suppressed_reason == "recent_miss"
+    assert float(cost_usd) == 0.0, "the suppressed row must be truthfully zero-cost"
+    assert cache_hit is True
 
 
 # ============================================ Productization M5 Issue 3 --

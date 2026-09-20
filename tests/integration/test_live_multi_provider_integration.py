@@ -195,22 +195,23 @@ def _ingest(
     prefix: str,
     domain: str | None = None,
     email: str | None = None,
+    full_name: str | None = None,
     mode: str = "normal",
 ) -> dict[str, Any]:
     resolved_domain = domain or f"{prefix}-{uuid.uuid4().hex[:10]}.test"
     resolved_email = email or f"nobody-{uuid.uuid4().hex[:8]}@{resolved_domain}"
     cleanup.domains.append(resolved_domain)
     cleanup.emails.append(resolved_email)
-    response = api_client.post(
-        "/leads",
-        json={
-            "source": source_for("live-multi"),
-            "email": resolved_email,
-            "external_ref": f"live-multi-{uuid.uuid4().hex[:12]}",
-            "company_domain": resolved_domain,
-            "mode": mode,
-        },
-    )
+    payload: dict[str, Any] = {
+        "source": source_for("live-multi"),
+        "email": resolved_email,
+        "external_ref": f"live-multi-{uuid.uuid4().hex[:12]}",
+        "company_domain": resolved_domain,
+        "mode": mode,
+    }
+    if full_name is not None:
+        payload["full_name"] = full_name
+    response = api_client.post("/leads", json=payload)
     assert response.status_code == 201
     body: dict[str, Any] = response.json()
     cleanup.lead_ids.append(uuid.UUID(body["lead_id"]))
@@ -298,9 +299,18 @@ def _run(
     prefix: str,
     domain: str | None = None,
     email: str | None = None,
+    full_name: str | None = None,
     mode: str = "normal",
 ) -> dict[str, Any]:
-    body = _ingest(api_client, cleanup_ingest, prefix=prefix, domain=domain, email=email, mode=mode)
+    body = _ingest(
+        api_client,
+        cleanup_ingest,
+        prefix=prefix,
+        domain=domain,
+        email=email,
+        full_name=full_name,
+        mode=mode,
+    )
     _take_ownership(db_conn, body["job_id"])
     _process_lead(live_pool, handlers, db_conn, body)
     _register_cleanup(db_conn, cleanup_ingest, cleanup_evidence, body)
@@ -352,7 +362,18 @@ def test_case_b_an_open_company_decision_triggers_the_person_lookup(
         ],
     )
     body = _run(
-        api_client, cleanup_ingest, cleanup_evidence, db_conn, live_pool, handlers, prefix="caseb"
+        api_client,
+        cleanup_ingest,
+        cleanup_evidence,
+        db_conn,
+        live_pool,
+        handlers,
+        prefix="caseb",
+        # domain + full_name both matching _apollo_vp_sales's mock response --
+        # VERIFIED (independent domain + name agreement) is required to score
+        # a person-provider result since Priority 2 (2026-09-21).
+        domain="northwind.test",
+        full_name="Dana Okafor",
     )
 
     assert abstract_calls[0] == 1
@@ -572,12 +593,23 @@ def test_a_colleague_reuses_company_evidence_and_is_still_looked_up_individually
     construction; it is asserted because "by construction" is exactly the kind
     of claim a later refactor of the evidence lookup could quietly break.
     """
-    domain = f"colleagues-{uuid.uuid4().hex[:10]}.test"
+    # Fixed to match _apollo_vp_sales's own hardcoded response domain, not the
+    # per-test random domain the rest of this suite generates -- Priority 2
+    # (2026-09-21) requires the requested domain to independently agree with
+    # what the provider actually returns before a match can reach VERIFIED.
+    domain = "northwind.test"
     abstract_calls, apollo_calls = [0], [0]
 
     def _apollo_director(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            200, json={"person": {"title": "Director of Marketing", "name": "Second Person"}}
+            200,
+            json={
+                "person": {
+                    "title": "Director of Marketing",
+                    "name": "Second Person",
+                    "organization": {"name": "Northwind", "primary_domain": domain},
+                }
+            },
         )
 
     first = _run(
@@ -597,6 +629,7 @@ def test_a_colleague_reuses_company_evidence_and_is_still_looked_up_individually
         prefix="colleague-a",
         domain=domain,
         email=f"first-{uuid.uuid4().hex[:8]}@{domain}",
+        full_name="Dana Okafor",  # matches _apollo_vp_sales
     )
     second = _run(
         api_client,
@@ -615,6 +648,7 @@ def test_a_colleague_reuses_company_evidence_and_is_still_looked_up_individually
         prefix="colleague-b",
         domain=domain,
         email=f"second-{uuid.uuid4().hex[:8]}@{domain}",
+        full_name="Second Person",  # matches _apollo_director
     )
 
     assert first["company_id"] == second["company_id"]
@@ -717,7 +751,15 @@ def test_a_company_provider_failure_does_not_stop_the_person_provider(
         ],
     )
     body = _run(
-        api_client, cleanup_ingest, cleanup_evidence, db_conn, live_pool, handlers, prefix="absdown"
+        api_client,
+        cleanup_ingest,
+        cleanup_evidence,
+        db_conn,
+        live_pool,
+        handlers,
+        prefix="absdown",
+        domain="northwind.test",
+        full_name="Dana Okafor",  # matches _apollo_vp_sales -- VERIFIED, required to score
     )
 
     assert apollo_calls[0] == 1
@@ -774,7 +816,17 @@ def test_a_free_mail_lead_skips_the_company_provider_and_still_gets_person_evide
     the domain-keyed provider is genuinely uncallable — but the person provider
     keys on the email, which every ingested lead has. Before Apollo existed
     this lead stopped at ``no_domain_available`` with nothing bought; now the
-    reachable half of the pipeline runs."""
+    reachable half of the pipeline runs.
+
+    Priority 2 (2026-09-21) update: the call still happens and is still
+    billed/ledgered (this test still proves that), but its evidence is no
+    longer scoreable. A free-mail lead has no real employer domain to check a
+    person-provider's answer against — `_expected_domain` falls back to the
+    email's own domain (here "gmail.com"), which can never independently
+    corroborate a real employer domain like Apollo's returned
+    "northwind.test", so the verdict lands short of VERIFIED regardless of
+    name. This is a real, deliberate narrowing of what the free-mail path can
+    score — not a bug this test should paper over."""
     email = f"solo-{uuid.uuid4().hex[:10]}@gmail.com"
     cleanup_ingest.emails.append(email)
     abstract_calls, apollo_calls = [0], [0]
@@ -815,11 +867,11 @@ def test_a_free_mail_lead_skips_the_company_provider_and_still_gets_person_evide
     _register_cleanup(db_conn, cleanup_ingest, cleanup_evidence, body)
 
     assert abstract_calls[0] == 0
-    assert apollo_calls[0] == 1
-    assert _evidence_sources(db_conn, body["person_id"]) == {
-        "title_seniority": APOLLO,
-        "title_function": APOLLO,
-    }
+    assert apollo_calls[0] == 1, "the call itself still happens -- only its evidence is affected"
+    assert _evidence_sources(db_conn, body["person_id"]) == {}, (
+        "a free-mail lead has no real employer domain to verify Apollo's answer against, "
+        "so the match cannot reach VERIFIED and must not be scored"
+    )
 
     receipt = _receipt(api_client, body)
     assert set(_called(receipt)) == {APOLLO}

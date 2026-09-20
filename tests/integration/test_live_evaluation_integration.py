@@ -84,9 +84,9 @@ def _hunter_provider(
 
 
 def _hunter_person(
-    title: str, *, seniority: str | None = None, role: str | None = None
+    title: str, *, seniority: str | None = None, role: str | None = None, domain: str = "northwind.test"
 ) -> dict[str, Any]:
-    employment: dict[str, Any] = {"name": "Northwind", "title": title}
+    employment: dict[str, Any] = {"name": "Northwind", "title": title, "domain": domain}
     if seniority is not None:
         employment["seniority"] = seniority
     if role is not None:
@@ -142,8 +142,11 @@ def _run(
     prefix: str,
     domain: str | None = None,
     email: str | None = None,
+    full_name: str | None = None,
 ) -> dict[str, Any]:
-    body = _ingest(api_client, cleanup_ingest, prefix=prefix, domain=domain, email=email)
+    body = _ingest(
+        api_client, cleanup_ingest, prefix=prefix, domain=domain, email=email, full_name=full_name
+    )
     _take_ownership(db_conn, body["job_id"])
     _process_lead(live_pool, handlers, db_conn, body)
     _register_cleanup(db_conn, cleanup_ingest, cleanup_evidence, body)
@@ -216,7 +219,15 @@ def test_optimized_hunter_success_makes_apollo_redundant_with_no_ledger_row(
         ],
     )
     body = _run(
-        api_client, cleanup_ingest, cleanup_evidence, db_conn, live_pool, handlers, prefix="redun"
+        api_client,
+        cleanup_ingest,
+        cleanup_evidence,
+        db_conn,
+        live_pool,
+        handlers,
+        prefix="redun",
+        domain="northwind.test",
+        full_name="Dana Okafor",  # matches both _hunter_vp_sales and _apollo_vp_sales
     )
 
     assert apollo_calls[0] == 0
@@ -254,7 +265,15 @@ def test_optimized_hunter_miss_falls_through_to_apollo(
         ],
     )
     body = _run(
-        api_client, cleanup_ingest, cleanup_evidence, db_conn, live_pool, handlers, prefix="chain"
+        api_client,
+        cleanup_ingest,
+        cleanup_evidence,
+        db_conn,
+        live_pool,
+        handlers,
+        prefix="chain",
+        domain="northwind.test",
+        full_name="Dana Okafor",  # matches _apollo_vp_sales -- Hunter misses, doesn't matter there
     )
 
     calls = _calls(db_conn, body["lead_id"])
@@ -326,7 +345,15 @@ def test_evaluation_calls_both_person_providers_and_classifies_agreement(
         ],
     )
     body = _run(
-        api_client, cleanup_ingest, cleanup_evidence, db_conn, live_pool, handlers, prefix="evalok"
+        api_client,
+        cleanup_ingest,
+        cleanup_evidence,
+        db_conn,
+        live_pool,
+        handlers,
+        prefix="evalok",
+        domain="northwind.test",
+        full_name="Dana Okafor",  # matches both _hunter_vp_sales and _apollo_vp_sales
     )
 
     assert (hunter_calls[0], apollo_calls[0]) == (1, 1)
@@ -383,7 +410,15 @@ def test_evaluation_conflict_is_contested_not_silently_resolved(
         ],
     )
     body = _run(
-        api_client, cleanup_ingest, cleanup_evidence, db_conn, live_pool, handlers, prefix="evalcf"
+        api_client,
+        cleanup_ingest,
+        cleanup_evidence,
+        db_conn,
+        live_pool,
+        handlers,
+        prefix="evalcf",
+        domain="northwind.test",
+        full_name="Dana Okafor",  # both mocks return this name regardless of title
     )
 
     snapshot = _snapshot(db_conn, body["lead_id"])
@@ -444,6 +479,8 @@ def test_evaluation_one_provider_failing_never_cancels_the_other(
         live_pool,
         handlers,
         prefix=f"iso-{broken[:6]}",
+        domain="northwind.test",
+        full_name="Dana Okafor",  # matches whichever mock survives (both use this name)
     )
 
     calls = _calls(db_conn, body["lead_id"])

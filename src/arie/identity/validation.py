@@ -52,6 +52,36 @@ never scores a lead, and never persists anything — it is a pure function from
 two small, provider-agnostic records to a verdict and its reasons. The caller
 (``arie.jobs.handlers``) decides what a ``MISMATCH`` means for evidence and
 the receipt.
+
+**V1 free-mail / company-context contract (Priority 1, 2026-09-21).** A
+free-mail address (``gmail.com``, ``outlook.com``, ... —
+``arie.identity.normalize.FREE_EMAIL_DOMAINS``) carries no usable employer
+signal of its own — a real corporate email's domain is a reasonable proxy for
+"the company," a personal gmail address is not. Three cases, by design:
+
+1. Business email + expected ``full_name`` + a matching company domain (the
+   email's own domain, or an explicitly supplied ``company_domain`` — see
+   :func:`_expected_domain`) can reach ``VERIFIED``.
+2. Free-mail email + an *explicitly supplied* ``company_domain`` (independent
+   context given at ingestion, never inferred from the email or from a
+   provider's own answer) + expected ``full_name`` can also reach
+   ``VERIFIED`` — the free-mail address itself is simply not what gets
+   compared; the supplied domain is.
+3. Free-mail email with **no** independently supplied ``company_domain`` has
+   nothing legitimate to check the returned employer domain against.
+   :func:`_expected_domain` returns ``None`` rather than falling back to the
+   free-mail domain itself (that would manufacture a false ``MISMATCH``
+   against literally every real answer), and :func:`_domain_signal` records
+   *why* in its reason so this reads as "no company context available," never
+   as a silent, unexplained ``unknown``. The domain signal is then
+   structurally incapable of ever being ``"match"``, so ``VERIFIED`` (which
+   requires domain agreement) is unreachable — capping at ``PROBABLE`` even
+   with a perfect name match, which ``arie.jobs.handlers._validate_person_match``
+   already excludes from scoring.
+
+Nothing here infers a company from an email local-part, guesses one from a
+provider's own output, or promotes ``PROBABLE`` to ``VERIFIED`` — every one of
+those would fabricate corroboration that was never actually supplied.
 """
 
 from __future__ import annotations
@@ -61,7 +91,7 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Literal
 
-from arie.identity.normalize import normalize_domain, normalize_email
+from arie.identity.normalize import domain_from_email, normalize_domain, normalize_email
 
 __all__ = [
     "MISMATCH",
@@ -214,26 +244,51 @@ def _name_signal(
 
 
 def _expected_domain(requested: RequestedIdentity) -> str | None:
+    """The company domain a provider's answer should be checked against, or
+    ``None`` if there genuinely isn't one to check.
+
+    An explicitly supplied ``company_domain`` always wins — that is
+    independent context, supplied at ingestion, not inferred from anything a
+    provider later returns. Absent that, ``domain_from_email`` is the only
+    fallback: for a business email it is a reasonable proxy for the employer
+    domain, but for a free-mail address (gmail.com, outlook.com, ...) it
+    returns ``None`` rather than the free-mail domain itself — comparing a
+    provider's real employer domain against "gmail.com" would manufacture a
+    false disagreement for every single free-mail lead, not an honest "we
+    don't know." See ``_domain_signal``'s free-mail reason for where that
+    distinction is made visible rather than silently folded into "unknown."
+    """
     if requested.company_domain:
         return requested.company_domain
-    _, _, domain = requested.email.partition("@")
-    return domain or None
+    return domain_from_email(requested.email)
 
 
-def _domain_signal(requested: RequestedIdentity, returned: ReturnedIdentity) -> _SIGNAL:
+def _domain_signal(requested: RequestedIdentity, returned: ReturnedIdentity) -> tuple[_SIGNAL, str | None]:
+    """The domain signal, plus an extra reason to surface when there is
+    nothing to compare specifically *because* the lead is free-mail with no
+    independently supplied company context — the V1 free-mail/company-context
+    contract's own audit trail, not a generic "unknown."
+    """
     if not returned.employer_domain:
-        return "unknown"
+        return "unknown", None
     expected = _expected_domain(requested)
-    if not expected:
-        return "unknown"
+    if expected is None:
+        if not requested.company_domain and domain_from_email(requested.email) is None:
+            return (
+                "unknown",
+                "no independent company/domain was supplied at ingestion, and the "
+                "requested email is a free-mail address -- its own domain cannot "
+                "stand in for an employer domain to verify against",
+            )
+        return "unknown", None
     try:
         return (
-            "match"
+            ("match", None)
             if normalize_domain(returned.employer_domain) == normalize_domain(expected)
-            else "mismatch"
+            else ("mismatch", None)
         )
     except ValueError:
-        return "unknown"
+        return "unknown", None
 
 
 def _email_signal(requested: RequestedIdentity, returned: ReturnedIdentity) -> _SIGNAL:
@@ -289,7 +344,7 @@ def validate_identity(
     if returned.full_name is None and returned.employer_domain is None and returned.email is None:
         return IdentityValidation(UNVERIFIABLE, ("provider returned no identity to compare",))
 
-    domain = _domain_signal(requested, returned)
+    domain, domain_unavailable_reason = _domain_signal(requested, returned)
     email = _email_signal(requested, returned)
     name, name_variant_reason = _name_signal(requested, returned)
 
@@ -298,6 +353,8 @@ def validate_identity(
         reasons.append("employer domain matches the requested company")
     elif domain == "mismatch":
         reasons.append("employer domain does not match the requested company")
+    elif domain_unavailable_reason is not None:
+        reasons.append(domain_unavailable_reason)
     if email == "match":
         reasons.append("returned email matches the requested email (not independent corroboration)")
     elif email == "mismatch":
@@ -318,4 +375,10 @@ def validate_identity(
     if agreeing == 1:
         reasons.append("no independent second signal was available to corroborate")
         return IdentityValidation(PROBABLE, tuple(reasons))
-    return IdentityValidation(UNVERIFIABLE, ("no comparable signal was available on both sides",))
+    # Nothing agreed — but `reasons` may still hold a specific, inspectable
+    # explanation (e.g. the free-mail/no-company-context case above) even
+    # though nothing *disagreed* either. Falls back to the generic sentence
+    # only when there is truly nothing more specific to say.
+    if not reasons:
+        reasons.append("no comparable signal was available on both sides")
+    return IdentityValidation(UNVERIFIABLE, tuple(reasons))
