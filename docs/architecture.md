@@ -236,28 +236,43 @@ src/arie/
   scoring/      deterministic scorer and score bounds (no I/O, no model)
   confidence/   calibrated confidence model, feature extraction, tau selection
   policy/       the stopping controller that composes scoring + confidence
-  providers/    EnrichmentProvider Protocol; simulated registry, synthetic-identity fallback, two live adapters (Abstract company, Apollo person) + Apollo's fixture-only normalization contract
+  providers/    EnrichmentProvider Protocol; simulated registry, synthetic-identity fallback, three live adapters (Abstract company, Hunter combined, Apollo person) + fixture-only normalization contracts
   normalization/ canonical taxonomy + the provider->scorer adapter boundary
+  identity/     identity validation — requires a VERIFIED match verdict before any person-provider evidence can reach the scorer
   icp.py        the named reference ICP for Live V1 (descriptive, not a scorer)
-  live/         live-mode autonomy guard and spend caps
+  live/         live-mode autonomy guard, org-scoped execution mode, spend caps (global + per-organization), provider cooldown/outcome guards
   jobs/         Postgres job queue (SKIP LOCKED), worker loop, handlers, heartbeat
   statemachine/ transitions, status groups, optimistic concurrency
   approval/     human review workflow
   evalgen/      frozen synthetic corpus generator (benchmark only)
-  llm/          DeepSeek buying-signal extraction (built, standalone)
-  observability/ OpenTelemetry wiring; trace context across the process boundary
+  llm/          DeepSeek buying-signal extraction (built, standalone) + the shared LLM client the M7 intelligence layer builds on
+  intelligence/ the M7 intelligence layer — LLM interprets business intent, deterministic normalizers turn it into a legal, exactly-100.0-point scoring configuration (see icp_profiles.py's validator); the model has no path to award itself points
+  discovery/    Discovery Pivot — turns a targeting profile into search intent, runs it through a discovery provider, cheaply screens and dedupes results, and promotes survivors into the same canonical lead pipeline above (everything downstream of promotion is the unmodified M1-M7 engine)
+  recommendations.py  the single shared source of `customer_priority`/`next_action`/`evidence_sufficiency` — receipt, batch/list, and dashboard/copilot views all read from this one module, so their semantics can't drift apart
+  copilot.py / copilot_service.py  "Ask ARIE" — plain-English questions answered from an organization's own lead data, never from a model's general knowledge
+  batches.py / batch_insights.py / batch_export.py  CSV bulk upload, per-batch results, aggregate insights, export
+  dashboard.py  organization-level rollups behind the same recommendation semantics as a single receipt
+  feedback.py / feedback_learning_service.py  reviewer feedback capture and aggregate signal back to the organization
+  icp_profiles.py  organization-specific ICP weight configs (validated, exactly-100.0-point ceiling)
+  research.py / research_acquisition.py  "is another piece of evidence worth acquiring at all" — materiality check before a purchase, not after
 
   auth.py       Supabase JWT verification + organization membership
   tenancy.py    the Legacy Organization constant and tenant helpers
   billing/      Stripe gateway, webhook processing, plans/entitlements
   provisioning.py  self-service organization creation
+  provider_configs.py  organization BYOK credential CRUD (Supabase Vault-backed)
+  vault.py      thin wrapper over Supabase Vault's own create/update/delete/resolve primitives — no custom cryptography
   email/        AhaSend/fake senders behind one notifier
   turnstile.py  CAPTCHA seam for self-service signup
   limits.py     lead/CSV/spend quota enforcement (M4; M6 syncs its ceilings)
 
+src/arie_mcp/   the read-only MCP engineering interface (Claude Code connects here) —
+                11 diagnostic tools, a schema-scoped Postgres role with no base-table
+                access, redaction, and a local audit log; see mcp-architecture.md
 bench/          benchmark harness, cost model, multi-seed runner
 migrations/     canonical SQL migrations (source of truth)
 supabase/       generated mirror of migrations/ for Supabase Branching
+specs/          design specs for slices too large for a docstring (e.g. the MCP interface)
 workflows/n8n/  the two edge workflows plus a mock sink
 scripts/        demo CLI, policy lab, migration runner, live provider smoke test,
                 integration-test database designation (test_db.py)

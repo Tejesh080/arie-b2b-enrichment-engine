@@ -4,19 +4,26 @@ ARIE talks to data providers through one `EnrichmentProvider` Protocol. A
 simulated registry and a real vendor adapter both implement it, and the policy
 cannot tell them apart.
 
-> **Which mode runs where.** The public hosted demo runs
-> `PROVIDER_MODE=simulated`: it replays a frozen corpus for known identities and
-synthesizes deterministic evidence for the rest, so no vendor is called
-> and no money is spent. Cost figures there are modelled cost at configured
-> rates. The real adapter below is separate, and was verified with real billed
-> calls. Do not conflate the two.
+> **Which mode runs where.** The public hosted demo (and the login-free
+> `/demo` walkthrough) runs `PROVIDER_MODE=simulated`: it replays a frozen
+> corpus for known identities and synthesizes deterministic evidence for the
+> rest, so no vendor is called and no money is spent. Cost figures there are
+> modelled cost at configured rates. The real adapters below are separate.
+> **Abstract and Hunter have both been exercised with real billed calls**
+> (including a real, reproduced, and now correctly-suppressed vendor
+> identity-mismatch — see Hunter's section below). **Apollo is implemented
+> and contract-tested against fixtures but has not yet made a real call** —
+> that verification isn't required for the current portfolio milestone. Do
+> not conflate simulated and real.
 
 ---
 
 ## The real adapter
 
-ARIE's provider abstraction is wired to one real external service —
-**Abstract API's Company Enrichment endpoint**. The point is that the same
+ARIE's provider abstraction was first wired to one real external service —
+**Abstract API's Company Enrichment endpoint** — with Hunter following the
+same pattern later (see [Third provider](#third-provider-hunter-combined-enrichment)
+below; both have now made real, billed calls). The point is that the same
 `EnrichmentProvider` Protocol the simulator implements also fronts a live
 vendor, without touching the frozen benchmark catalogue.
 
@@ -233,6 +240,16 @@ Apollo's intent and job-change data is deliberately unused: `buying_intent` is
 the largest field in the ruleset and the vendor's methodology is not
 inspectable.
 
+**Live-verification status: implemented and contract-tested, not yet
+operationally validated.** The adapter is complete and green against
+`tests/fixtures/apollo/`, matching Apollo's own published documentation, but
+it has not made a real API call — that verification is deliberately not part
+of the current portfolio milestone (Abstract and Hunter cover the real-call
+proof; a third real vendor account adds verification cost without changing
+the architecture claim). "Contract-tested" and "verified against a live API"
+are kept distinct here on purpose; see the Limitations section for the same
+distinction stated plainly.
+
 ### Third provider: Hunter combined enrichment
 
 Hunter's Combined Enrichment (`GET /v2/combined/find`, `X-API-KEY` header)
@@ -250,6 +267,24 @@ VP), while function keeps the enum-first rule (no coarseness problem). The
 combined response's company half — Abstract's own two fields — rides on the
 result as a canonical-audit preview for the bake-off and is deliberately **not
 persisted as evidence** until measurements justify it.
+
+**Live-verification status: genuinely exercised, not just fixture-tested.**
+Hunter has made real, billed calls across multiple sessions, most recently an
+isolated three-lead validation (disposable Supabase branch, temporary
+`live_shadow` organization, real Vault-backed credentials, $0.01965 total real
+spend — see the README's real-provider-validation section). Observed outcomes
+include a `VERIFIED` identity match whose fields scored normally, a genuine
+miss (no identity found at all), and a **reproducible wrong-person match** at
+the same address across three independent real calls on three different
+occasions — Hunter returning someone else entirely (an "IT Administrator", a
+different "Patrick Bosmans") for a well-known executive's work email. That
+last case is not a bug in this codebase; it is a real vendor data-quality
+defect, and it is exactly why `arie.identity.validation` requires a `VERIFIED`
+match verdict before any person evidence from that call is allowed to reach
+the scorer — an `UNVERIFIED`/`MISMATCH` verdict suppresses the fields
+entirely rather than scoring the wrong person's title. The three-time
+reproduction is the clearest evidence that guard is load-bearing, not
+defensive-only code.
 
 ### Strategies, cooldowns, and the bake-off
 
