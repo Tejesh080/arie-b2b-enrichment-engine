@@ -20,6 +20,7 @@ from arie_mcp import db
 from arie_mcp.envelope import ToolOutcome
 from arie_mcp.errors import NotFoundError
 from arie_mcp.limits import cap_limit, truncate_str
+from arie_mcp.redaction import redact
 
 
 class JobDetail(BaseModel):
@@ -60,13 +61,15 @@ class ListFailedJobsInput(BaseModel):
 
 def _row_to_job_detail(row: dict[str, Any]) -> JobDetail:
     row = dict(row)
-    row["last_error"] = truncate_str(row.get("last_error"))
+    # Redact before truncating — truncating first could cut a secret in half,
+    # leaving an unredacted fragment past the point a pattern still matches.
+    row["last_error"] = truncate_str(redact(row.get("last_error")))
     return JobDetail.model_validate(row)
 
 
 def _row_to_failed_job(row: dict[str, Any]) -> FailedJob:
     row = dict(row)
-    row["last_error"] = truncate_str(row.get("last_error"))
+    row["last_error"] = truncate_str(redact(row.get("last_error")))
     return FailedJob.model_validate(row)
 
 

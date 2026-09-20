@@ -27,7 +27,17 @@ from arie_mcp.audit import AuditLogger
 from arie_mcp.envelope import ToolOutcome, ToolResult, run_tool
 from arie_mcp.errors import DbUnavailableError
 from arie_mcp.settings import Settings, get_settings
-from arie_mcp.tools import health, jobs
+from arie_mcp.tools import (
+    configuration,
+    contract,
+    costs,
+    errors,
+    health,
+    jobs,
+    migrations,
+    providers,
+    routing,
+)
 
 _LOGGER = logging.getLogger("arie_mcp.server")
 
@@ -142,6 +152,222 @@ def build_server(settings: Settings | None = None) -> MCPServer:
             settings=settings,
             audit_logger=audit_logger,
             input_payload=params.model_dump(mode="json"),
+        )
+
+    @mcp.tool(
+        description=(
+            "Read the running API process's live OpenAPI schema (GET "
+            "/openapi.json against ARIE_MCP_API_BASE_URL, default "
+            "http://localhost:8000). The only tool that talks to the API "
+            "process rather than the database. Optional path_prefix filters "
+            "routes; include_schemas=true also returns component schemas "
+            "(bounded — truncated=true if they'd exceed the response cap)."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def inspect_api_contract(
+        path_prefix: str | None = None, include_schemas: bool = False
+    ) -> ToolResult:
+        async def _body() -> ToolOutcome:
+            return await contract.inspect_api_contract_impl(
+                settings.api_base_url,
+                path_prefix=path_prefix,
+                include_schemas=include_schemas,
+                timeout_seconds=settings.tool_timeout_seconds,
+            )
+
+        return await run_tool(
+            "inspect_api_contract",
+            _body,
+            settings=settings,
+            audit_logger=audit_logger,
+            input_payload={"path_prefix": path_prefix, "include_schemas": include_schemas},
+        )
+
+    @mcp.tool(
+        description=(
+            "Applied vs. pending migrations, with checksum-integrity status "
+            "for each applied one. Read-only — no apply capability exists "
+            "here or anywhere in this server."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def inspect_migrations() -> ToolResult:
+        async def _body() -> ToolOutcome:
+            return await migrations.inspect_migrations_impl(
+                pool, statement_timeout_ms=settings.db_statement_timeout_ms
+            )
+
+        return await run_tool(
+            "inspect_migrations",
+            _body,
+            settings=settings,
+            audit_logger=audit_logger,
+            input_payload={},
+        )
+
+    @mcp.tool(
+        description=(
+            "Bounded, aggregated recent-failure summary: job-queue failures "
+            "and provider-call errors/suppressions within window_minutes "
+            "(default 60, max 1440). Counts by category plus up to 20 most "
+            "recent rows of each — never an unbounded raw log dump."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def get_recent_errors(
+        window_minutes: Annotated[int, Field(ge=1, le=1440)] = 60,
+    ) -> ToolResult:
+        async def _body() -> ToolOutcome:
+            return await errors.get_recent_errors_impl(
+                pool,
+                window_minutes=window_minutes,
+                statement_timeout_ms=settings.db_statement_timeout_ms,
+            )
+
+        return await run_tool(
+            "get_recent_errors",
+            _body,
+            settings=settings,
+            audit_logger=audit_logger,
+            input_payload={"window_minutes": window_minutes},
+        )
+
+    @mcp.tool(
+        description=(
+            "The real ARIE live-provider registry (arie.live.providers) — "
+            "which providers are wired, their default cheapest-first "
+            "acquisition order, and whether an order override is "
+            "configured. No DB call; process-static."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def list_providers() -> ToolResult:
+        async def _body() -> ToolOutcome:
+            return await providers.list_providers_impl()
+
+        return await run_tool(
+            "list_providers", _body, settings=settings, audit_logger=audit_logger, input_payload={}
+        )
+
+    @mcp.tool(
+        description=(
+            "One provider's availability: whether it is currently inside a "
+            "quota cooldown (and until when), recent call/error/cache-hit "
+            "counts, and last success/call times. organization_id scopes to "
+            "one tenant; omit it for a global aggregate across all "
+            "organizations. Never returns credentials or raw payloads."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def inspect_provider_health(
+        provider: str, organization_id: UUID | None = None
+    ) -> ToolResult:
+        async def _body() -> ToolOutcome:
+            return await providers.inspect_provider_health_impl(
+                pool,
+                provider,
+                organization_id,
+                statement_timeout_ms=settings.db_statement_timeout_ms,
+            )
+
+        return await run_tool(
+            "inspect_provider_health",
+            _body,
+            settings=settings,
+            audit_logger=audit_logger,
+            input_payload={
+                "provider": provider,
+                "organization_id": str(organization_id) if organization_id else None,
+            },
+        )
+
+    @mcp.tool(
+        description=(
+            "Provider-level enrichment cost rollup (cost_usd/credits_used/"
+            "call_count/cache_hit_count), grouped by provider or by day. "
+            "Bounded to a 90-day maximum lookback regardless of `since`; "
+            "defaults to the last 7 days. Optional provider/organization_id "
+            "filters. No per-lead breakdown."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def get_enrichment_costs(
+        organization_id: UUID | None = None,
+        provider: str | None = None,
+        since: datetime | None = None,
+        group_by: Literal["provider", "day"] = "provider",
+    ) -> ToolResult:
+        async def _body() -> ToolOutcome:
+            return await costs.get_enrichment_costs_impl(
+                pool,
+                organization_id=organization_id,
+                provider=provider,
+                since=since,
+                group_by=group_by,
+                statement_timeout_ms=settings.db_statement_timeout_ms,
+            )
+
+        return await run_tool(
+            "get_enrichment_costs",
+            _body,
+            settings=settings,
+            audit_logger=audit_logger,
+            input_payload={
+                "organization_id": str(organization_id) if organization_id else None,
+                "provider": provider,
+                "since": since.isoformat() if since else None,
+                "group_by": group_by,
+            },
+        )
+
+    @mcp.tool(
+        description=(
+            "Why ARIE continued acquiring evidence, or stopped, for one "
+            "lead: the full voi_decisions step-by-step trail (candidate "
+            "provider, expected value/cost, net EVoI, whether chosen), plus "
+            "the lead's own status/is_shadow. NOT_FOUND if the lead has no "
+            "routing decisions recorded."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def inspect_routing_decision(lead_id: UUID) -> ToolResult:
+        async def _body() -> ToolOutcome:
+            return await routing.inspect_routing_decision_impl(
+                pool, lead_id, statement_timeout_ms=settings.db_statement_timeout_ms
+            )
+
+        return await run_tool(
+            "inspect_routing_decision",
+            _body,
+            settings=settings,
+            audit_logger=audit_logger,
+            input_payload={"lead_id": str(lead_id)},
+        )
+
+    @mcp.tool(
+        description=(
+            "Configuration presence, never values: process-level env-var "
+            "category booleans (is Stripe/Supabase/a provider/etc "
+            "configured — never the key itself), plus — only when "
+            "organization_id is given — that organization's execution_mode "
+            "and resolved plan entitlements (tier name and numeric limits, "
+            "never a Stripe customer/subscription id)."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def inspect_configuration(organization_id: UUID | None = None) -> ToolResult:
+        async def _body() -> ToolOutcome:
+            return await configuration.inspect_configuration_impl(
+                pool, organization_id, statement_timeout_ms=settings.db_statement_timeout_ms
+            )
+
+        return await run_tool(
+            "inspect_configuration",
+            _body,
+            settings=settings,
+            audit_logger=audit_logger,
+            input_payload={"organization_id": str(organization_id) if organization_id else None},
         )
 
     return mcp

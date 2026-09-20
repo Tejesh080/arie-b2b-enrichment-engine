@@ -197,6 +197,98 @@ def delete_job_and_lead(conn: psycopg.Connection[Any], seeded: SeededJob) -> Non
         cur.execute("DELETE FROM leads WHERE lead_id = %s", (str(seeded.lead_id),))
 
 
+@dataclass(frozen=True)
+class SeededScenario:
+    """A full investigation scenario: one lead with a dead-lettered job, a
+    quota-exhausted provider_calls error, and a voi_decisions step — enough
+    for the extended debugging workflow (get_system_health ->
+    get_recent_errors -> list_failed_jobs -> inspect_job ->
+    inspect_provider_health -> get_enrichment_costs ->
+    inspect_routing_decision) to have something real to find at every step.
+    """
+
+    job: SeededJob
+    provider: str
+    call_id: uuid.UUID
+    decision_id: uuid.UUID
+
+
+def seed_full_scenario(
+    conn: psycopg.Connection[Any], *, provider: str = "abstract_company_enrichment"
+) -> SeededScenario:
+    job = seed_job(conn)
+    marker = uuid.uuid4().hex[:8]
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            INSERT INTO provider_calls (
+                lead_id, provider, entity_type, entity_id, idempotency_key,
+                completed_at, cost_usd, status, cache_hit, error_kind, organization_id
+            )
+            VALUES (
+                %(lead_id)s, %(provider)s, 'company', %(entity_id)s, %(idempotency_key)s,
+                now(), 0.0, 'error', false, 'quota_exhausted', %(organization_id)s
+            )
+            RETURNING call_id
+            """,
+            {
+                "lead_id": job.lead_id,
+                "provider": provider,
+                "entity_id": uuid.uuid4(),
+                "idempotency_key": f"tests-mcp-scenario-{marker}",
+                "organization_id": str(LEGACY_ORGANIZATION_ID),
+            },
+        )
+        call_row = cur.fetchone()
+        assert call_row is not None
+
+        cur.execute(
+            """
+            INSERT INTO voi_decisions (
+                lead_id, step_number, candidate_provider, p_flips_decision,
+                business_value, expected_cost, latency_penalty, net_evoi, chosen,
+                confidence_before, confidence_after, organization_id
+            )
+            VALUES (
+                %(lead_id)s, 1, %(provider)s, 0.35, 10.0, 0.00165, 0.001, 3.4, true,
+                0.5, 0.7, %(organization_id)s
+            )
+            RETURNING decision_id
+            """,
+            {
+                "lead_id": job.lead_id,
+                "provider": provider,
+                "organization_id": str(LEGACY_ORGANIZATION_ID),
+            },
+        )
+        decision_row = cur.fetchone()
+        assert decision_row is not None
+
+    return SeededScenario(
+        job=job,
+        provider=provider,
+        call_id=call_row["call_id"],
+        decision_id=decision_row["decision_id"],
+    )
+
+
+def delete_full_scenario(conn: psycopg.Connection[Any], scenario: SeededScenario) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM voi_decisions WHERE decision_id = %s", (str(scenario.decision_id),)
+        )
+        cur.execute("DELETE FROM provider_calls WHERE call_id = %s", (str(scenario.call_id),))
+    delete_job_and_lead(conn, scenario.job)
+
+
+@pytest.fixture
+def seeded_scenario(admin_conn: psycopg.Connection[Any]) -> Iterator[SeededScenario]:
+    scenario = seed_full_scenario(admin_conn)
+    yield scenario
+    delete_full_scenario(admin_conn, scenario)
+
+
 @pytest.fixture
 def seeded_dead_letter_job(admin_conn: psycopg.Connection[Any]) -> Iterator[SeededJob]:
     seeded = seed_job(admin_conn)

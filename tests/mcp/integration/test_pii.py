@@ -62,17 +62,18 @@ async def test_list_failed_jobs_never_leaks_name_email_or_domain(
     assert seeded_pii_job["domain"] not in blob
 
 
-async def test_last_error_is_length_capped_not_pii_redacted(
+async def test_last_error_redacts_emails_but_not_a_bare_name(
     mcp_readonly_database_url: str, admin_conn: psycopg.Connection[Any]
 ) -> None:
-    """Documents a known, spec-accepted limitation (spec § 8) rather than
-    leaving it implicit: ``last_error`` is truncated but not pattern-redacted
-    — if application code ever puts a name or email into an exception
-    message, it passes through (capped at ``MAX_STRING_LEN``) rather than
-    being scrubbed. The two tests above prove the guarantee this project
+    """Documents the precise, narrow boundary redaction actually draws
+    (spec: "do not attempt broad probabilistic PII detection"): the email
+    address is caught by ``arie_mcp.redaction``'s pattern set and replaced;
+    a bare human name with no accompanying email/URL/token shape is not —
+    that would require fuzzy name detection this project deliberately
+    doesn't attempt. The two tests above prove the guarantee this project
     actually makes (no ``persons``/``companies`` join is reachable); this
-    test proves the boundary of that guarantee is exactly where the spec
-    says it is, not further.
+    test proves the boundary of the narrower ``last_error`` redaction is
+    exactly where the spec says it is, not further.
     """
     seeded = seed_job(
         admin_conn,
@@ -86,10 +87,15 @@ async def test_last_error_is_length_capped_not_pii_redacted(
             pool.close()
 
         last_error = outcome.data["job"]["last_error"]
-        assert len(last_error) == MAX_STRING_LEN
-        # The name/email are still present within the capped string — this
-        # is the documented limitation, asserted explicitly rather than
-        # silently relied upon.
+        # <= not ==: redaction can shrink the string below the cap (an
+        # email replaced by the shorter "[REDACTED]" marker), so "never
+        # exceeds the cap" is the actual invariant, not "always exactly it".
+        assert len(last_error) <= MAX_STRING_LEN
+        assert "jordan.ellis@example-corp.test" not in last_error
+        assert "[REDACTED]" in last_error
+        # The bare name has no email/URL/token shape of its own, so it is
+        # not caught — the documented, narrow limitation, asserted
+        # explicitly rather than silently relied upon.
         assert "Jordan Ellis" in last_error
     finally:
         delete_job_and_lead(admin_conn, seeded)

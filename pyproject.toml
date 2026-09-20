@@ -46,6 +46,7 @@ dev = [
 # read-only DB role; install both together (`pip install -e ".[dev,service,mcp]"`).
 mcp = [
     "mcp>=2.2,<3",
+    "httpx>=0.27",  # inspect_api_contract only; already a `service` dep, declared here too so `.[mcp]` alone is sufficient
 ]
 
 [project.scripts]

@@ -17,7 +17,7 @@ import pytest
 from mcp.client import Client
 from mcp.client.stdio import StdioServerParameters
 
-from tests.mcp.conftest import SeededJob
+from tests.mcp.conftest import SeededJob, SeededScenario
 
 pytestmark = pytest.mark.integration
 
@@ -79,3 +79,89 @@ async def test_debugging_workflow_finds_and_explains_a_seeded_failure(
     assert len(lines) == 3
     tools_called = [json.loads(line)["tool"] for line in lines]
     assert tools_called == ["get_system_health", "list_failed_jobs", "inspect_job"]
+
+
+async def test_extended_investigation_workflow_covers_all_seven_diagnostic_steps(
+    mcp_readonly_database_url: str, audit_log_dir: str, seeded_scenario: SeededScenario
+) -> None:
+    """The fuller investigation shape slice 2 adds: after finding and
+    inspecting a failing job, an agent also asks whether the *provider* it
+    depended on is healthy, what it's been costing, and why ARIE's own
+    acquisition policy made the choices it did for that lead. Each step's
+    assertion checks the seeded scenario's actual data, not a plausible-
+    looking shape.
+    """
+    params = _server_params(mcp_readonly_database_url, audit_log_dir)
+    job = seeded_scenario.job
+
+    async with Client(server=params) as client:
+        # 1. get_system_health
+        health = (await client.call_tool("get_system_health", {})).structured_content
+        assert health["data"]["database_reachable"] is True
+        assert health["data"]["queue"]["dead_letter"] >= 1
+
+        # 2. get_recent_errors — the provider error this scenario seeded
+        # should show up in the provider-errors-by-kind breakdown.
+        recent = (
+            await client.call_tool("get_recent_errors", {"window_minutes": 1440})
+        ).structured_content
+        assert recent["data"]["provider_error_count"] >= 1
+        kinds = {row["key"] for row in recent["data"]["provider_errors_by_kind"]}
+        assert "quota_exhausted" in kinds
+
+        # 3. list_failed_jobs — the seeded job is in it.
+        listed = (
+            await client.call_tool("list_failed_jobs", {"status": "dead_letter", "limit": 100})
+        ).structured_content
+        job_ids = {j["job_id"] for j in listed["data"]["jobs"]}
+        assert str(job.job_id) in job_ids
+
+        # 4. inspect_job — the same job's own detail.
+        detail = (
+            await client.call_tool("inspect_job", {"job_id": str(job.job_id)})
+        ).structured_content["data"]["job"]
+        assert detail["status"] == "dead_letter"
+        assert detail["lead_id"] == str(job.lead_id)
+
+        # 5. inspect_provider_health — the provider this scenario's error
+        # belongs to should now show a quota-cooldown signal.
+        health_report = (
+            await client.call_tool(
+                "inspect_provider_health", {"provider": seeded_scenario.provider}
+            )
+        ).structured_content
+        assert health_report["ok"] is True
+        assert health_report["data"]["last_quota_error_at"] is not None
+
+        # 6. get_enrichment_costs — the seeded provider_calls row (cost_usd
+        # 0.0, an error call) is included in that provider's rollup.
+        costs_report = (
+            await client.call_tool("get_enrichment_costs", {"provider": seeded_scenario.provider})
+        ).structured_content
+        assert costs_report["ok"] is True
+        rollup_providers = {row["group_key"] for row in costs_report["data"]["rows"]}
+        assert seeded_scenario.provider in rollup_providers
+
+        # 7. inspect_routing_decision — the voi_decisions step this
+        # scenario seeded for the same lead.
+        routing = (
+            await client.call_tool("inspect_routing_decision", {"lead_id": str(job.lead_id)})
+        ).structured_content
+        assert routing["ok"] is True
+        assert routing["data"]["lead_id"] == str(job.lead_id)
+        assert routing["data"]["steps"][0]["candidate_provider"] == seeded_scenario.provider
+        assert routing["data"]["steps"][0]["chosen"] is True
+
+    audit_files = list(Path(audit_log_dir).glob("*.jsonl"))
+    assert len(audit_files) == 1
+    lines = audit_files[0].read_text(encoding="utf-8").strip().splitlines()
+    tools_called = [json.loads(line)["tool"] for line in lines]
+    assert tools_called == [
+        "get_system_health",
+        "get_recent_errors",
+        "list_failed_jobs",
+        "inspect_job",
+        "inspect_provider_health",
+        "get_enrichment_costs",
+        "inspect_routing_decision",
+    ]

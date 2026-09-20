@@ -21,6 +21,14 @@ _MCP_DIAG_VIEWS = (
     "v_worker_heartbeats",
     "v_job_detail",
     "v_failed_jobs",
+    "v_provider_call_errors",
+    "v_provider_quota_signal",
+    "v_provider_activity",
+    "v_cost_rollup",
+    "v_voi_decisions",
+    "v_lead_summary",
+    "v_organization_summary",
+    "v_organization_billing_summary",
 )
 
 
@@ -37,7 +45,21 @@ def test_every_mcp_diag_view_is_readable(readonly_conn: psycopg.Connection, view
         cur.fetchall()  # must not raise
 
 
-@pytest.mark.parametrize("table_name", ["leads", "jobs", "persons", "companies", "provider_calls"])
+@pytest.mark.parametrize(
+    "table_name",
+    [
+        "leads",
+        "jobs",
+        "persons",
+        "companies",
+        "provider_calls",
+        "voi_decisions",
+        "organizations",
+        "organization_billing",
+        "worker_heartbeats",
+        "schema_migrations",
+    ],
+)
 def test_public_base_tables_are_not_directly_selectable(
     readonly_conn: psycopg.Connection, table_name: str
 ) -> None:
@@ -117,3 +139,34 @@ def test_statement_timeout_role_default_is_five_seconds(readonly_conn: psycopg.C
         row = cur.fetchone()
         assert row is not None
     assert row[0] == "5s"
+
+
+def test_organization_billing_summary_view_excludes_stripe_columns(
+    readonly_conn: psycopg.Connection,
+) -> None:
+    """Schema-level check, not a runtime probe: even if a future edit to
+    the view's SELECT list were reviewed carelessly, this fails the moment
+    a Stripe column becomes selectable — it doesn't depend on a row
+    existing to catch it.
+    """
+    with readonly_conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'mcp_diag' AND table_name = 'v_organization_billing_summary'"
+        )
+        columns = {row[0] for row in cur.fetchall()}
+    assert columns == {"organization_id", "plan", "status"}
+    assert "stripe_customer_id" not in columns
+    assert "stripe_subscription_id" not in columns
+
+
+def test_provider_call_errors_view_excludes_raw_response_ref(
+    readonly_conn: psycopg.Connection,
+) -> None:
+    with readonly_conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'mcp_diag' AND table_name = 'v_provider_call_errors'"
+        )
+        columns = {row[0] for row in cur.fetchall()}
+    assert "raw_response_ref" not in columns
