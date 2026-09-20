@@ -234,7 +234,7 @@ def test_autonomous_lead_receipt_matches_persisted_state(
 
     with db_conn.cursor() as cur:
         cur.execute(
-            "SELECT provider, cache_hit FROM provider_calls WHERE lead_id = %s",
+            "SELECT provider, cache_hit, cost_usd FROM provider_calls WHERE lead_id = %s",
             (body["lead_id"],),
         )
         db_calls = cur.fetchall()
@@ -288,6 +288,20 @@ def test_autonomous_lead_receipt_matches_persisted_state(
 
     assert receipt["evidence"]["provider_calls"] == sum(1 for row in db_calls if not row[1])
     assert receipt["evidence"]["cache_hits"] == sum(1 for row in db_calls if row[1])
+
+    # Cost invariant: the receipt's total is not a second computation that
+    # could silently drift from the ledger it is supposed to summarize --
+    # `arie.api.receipt.build_receipt` sources it from the same
+    # `cost_ledger.lead_cost()` `provider_calls` reads from, but nothing
+    # before this asserted that wiring end to end against a real,
+    # non-trivial multi-provider pipeline run. A cache hit is billed at
+    # zero cost (`PostgresCostLedger.record_provider_call`'s own contract),
+    # so it must never inflate this total.
+    expected_provider_cost = sum((row[2] for row in db_calls if not row[1]), start=Decimal(0))
+    assert Decimal(str(receipt["cost"]["provider_cost_usd"])) == expected_provider_cost
+    assert Decimal(str(receipt["cost"]["total_cost_usd"])) == expected_provider_cost + Decimal(
+        str(receipt["cost"]["model_cost_usd"])
+    )
 
     assert receipt["versions"]["policy"] == "calibrated_bounds"
     assert receipt["versions"]["scorer"] == "icp-1.0.0"
