@@ -257,6 +257,12 @@ class ReceiptDecisionResponse(BaseModel):
     autonomous: bool
     final_status: LeadStatus
     human_override: bool
+    evidence_sufficiency: str
+    """`"settled"` or `"insufficient_evidence"` — see
+    `arie.api.receipt.SETTLED`/`INSUFFICIENT_EVIDENCE`. Additive: computed on
+    every read, present on every receipt regardless of when it was decided —
+    unlike `autonomy_guard` this is never `None`, since it needs only
+    `score.bounds`/thresholds, which every decided receipt already has."""
     autonomy_guard: str | None = None
     """Live V1 Foundation. Additive and nullable: `None` for every simulated
     receipt, which is every receipt an existing consumer has ever seen, so no
@@ -424,6 +430,12 @@ class LeadRecommendationResponse(BaseModel):
     profile_version: int | None
     shadow: bool
     execution_mode: str | None
+    evidence_sufficiency: str | None = None
+    """`"settled"` / `"insufficient_evidence"` / `None` — see
+    `arie.recommendations.DecisionSignal.evidence_sufficiency`. `None` for a
+    batch-list-derived recommendation (not computed there), never for one
+    built from a full receipt. Additive and defaulted so an existing client
+    deserializing a response without this key does not break."""
 
     @classmethod
     def from_recommendation(cls, recommendation: LeadRecommendation) -> LeadRecommendationResponse:
@@ -443,6 +455,7 @@ class LeadRecommendationResponse(BaseModel):
             profile_version=recommendation.profile_version,
             shadow=recommendation.shadow,
             execution_mode=recommendation.execution_mode,
+            evidence_sufficiency=recommendation.evidence_sufficiency,
         )
 
 
@@ -1189,6 +1202,11 @@ class BatchRowResponse(BaseModel):
     next_action: NextAction | None = None
     short_reason: str | None = None
     confidence_band: ConfidenceBand | None = None
+    evidence_sufficiency: str | None = None
+    """Priority 2 (2026-09-21). `"settled"` / `"insufficient_evidence"` /
+    `None` (no decision yet) — see `arie.batches.BatchRowRecord`. Lets a list
+    view distinguish a settled `priority="skip"` from one that only reads
+    that way because the underlying decision's evidence is still incomplete."""
 
 
 class BatchRowsPageResponse(BaseModel):

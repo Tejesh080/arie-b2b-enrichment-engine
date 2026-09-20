@@ -32,6 +32,7 @@ from arie.jobs.handlers import SimulatedEnrichmentRuntime, build_handlers, build
 from arie.jobs.queue import PostgresJobQueue
 from arie.jobs.worker import JobHandler, run_worker_cycle
 from arie.providers.catalog import ALL_PROVIDERS
+from arie.scoring.rules import settled_decision
 from arie.tenancy import LEGACY_ORGANIZATION_ID as ORG
 
 pytestmark = pytest.mark.integration
@@ -270,6 +271,23 @@ def test_autonomous_lead_receipt_matches_persisted_state(
         <= receipt["score"]["value"]
         <= receipt["score"]["bounds"]["upper"]
     )
+
+    # evidence_sufficiency is derived, not stored -- recomputed here from the
+    # receipt's own bounds/thresholds via the same shared function
+    # arie.api.receipt.build_receipt calls, so this proves the wiring rather
+    # than restating the literal expected string.
+    expected_sufficiency = (
+        "settled"
+        if settled_decision(
+            receipt["score"]["bounds"]["lower"],
+            receipt["score"]["bounds"]["upper"],
+            receipt["score"]["threshold_qualify"],
+            receipt["score"]["threshold_reject"],
+        )
+        is not None
+        else "insufficient_evidence"
+    )
+    assert receipt["decision"]["evidence_sufficiency"] == expected_sufficiency
 
     assert receipt["stopping"]["reason_code"] in (
         "decision_settled",

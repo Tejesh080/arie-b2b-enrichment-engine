@@ -397,3 +397,27 @@ def decide(total_score: float) -> Decision:
     if total_score < config.reject_threshold:
         return Decision.REJECT
     return Decision.ESCALATE_HUMAN
+
+
+def settled_decision(
+    lower: float, upper: float, qualify_threshold: float, reject_threshold: float
+) -> Decision | None:
+    """The decision, if no unknown evidence between `lower` and `upper` could
+    change it — `None` if the reachable interval still straddles a boundary.
+
+    A pure function of the four numbers a Decision Receipt already stores
+    (``score.bounds.lower/upper``, ``score.threshold_qualify/reject``), so a
+    caller with only a receipt in hand — never a live ``ScoreBounds`` — can
+    still ask "was this recommendation settled" without reimplementing the
+    comparison. :meth:`arie.scoring.engine.ScoreBounds.settled_decision`
+    calls this with the *live* config's thresholds; a receipt caller
+    (``arie.api.receipt.build_receipt``) calls it with the thresholds actually
+    in effect *at decision time*, which is the only version safe to compare
+    stored bounds against — the two are deliberately never conflated."""
+    if lower >= qualify_threshold:
+        return Decision.AUTO_ROUTE
+    if upper < reject_threshold:
+        return Decision.REJECT
+    if lower >= reject_threshold and upper < qualify_threshold:
+        return Decision.ESCALATE_HUMAN
+    return None

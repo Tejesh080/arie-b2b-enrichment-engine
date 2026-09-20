@@ -43,8 +43,9 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from arie.api.receipt import DecisionReceipt
+from arie.api.receipt import INSUFFICIENT_EVIDENCE, SETTLED, DecisionReceipt
 from arie.core.types import Decision, LeadStatus
+from arie.scoring.rules import settled_decision as _settled_decision
 from arie.statemachine.transitions import AWAITING_REVIEW, FAILURE, REJECTED
 
 __all__ = [
@@ -174,6 +175,15 @@ class DecisionSignal:
     """`None` when this signal's source did not fetch provider-call history
     (a batch list row) — see `LeadRecommendation.research_status`'s own note.
     Always populated for a signal built from a full receipt."""
+    evidence_sufficiency: str | None
+    """`arie.api.receipt.SETTLED`/`INSUFFICIENT_EVIDENCE`, or `None` when this
+    signal's source did not have `score.bounds`/thresholds to compute it (a
+    batch list row does not currently select them — the same, deliberate
+    "not computed here" gap `research_status` already documents). Always
+    populated for a signal built from a full receipt. `None` is treated as
+    "unknown, preserve existing behaviour" everywhere below, never as
+    `INSUFFICIENT_EVIDENCE` — an absent signal must never silently downgrade
+    a lead's priority."""
 
     @classmethod
     def from_receipt(cls, receipt: DecisionReceipt) -> DecisionSignal:
@@ -191,6 +201,9 @@ class DecisionSignal:
             shadow=receipt.shadow,
             execution_mode=receipt.execution_mode,
             research_status=_research_status_from_calls(receipt),
+            evidence_sufficiency=(
+                receipt.decision.evidence_sufficiency if receipt.decision else None
+            ),
         )
 
     @classmethod
@@ -204,6 +217,10 @@ class DecisionSignal:
         score_value: float | None,
         evidence_snapshot: dict[str, Any] | None,
         profile_version: int | None,
+        score_lower: float | None = None,
+        score_upper: float | None = None,
+        threshold_qualify: float | None = None,
+        threshold_reject: float | None = None,
     ) -> DecisionSignal:
         """Build a signal from one `decision_receipts` row joined straight into
         a bulk listing query (`arie.batches.list_batch_rows`) — the same
@@ -215,6 +232,16 @@ class DecisionSignal:
         why), so this signal honestly says "not computed" rather than
         guessing. `GET /leads/{lead_id}/recommendation` uses
         :meth:`from_receipt` instead, which always knows.
+
+        `evidence_sufficiency` **is** computed here, the same way
+        `arie.api.receipt.build_receipt` computes it — via the identical
+        shared `arie.scoring.rules.settled_decision` — whenever the caller
+        supplies bounds and thresholds (Priority 2, 2026-09-21:
+        `arie.batches` now joins `score_lower`/`score_upper` and the
+        organization's active profile thresholds). The four extra arguments
+        default to `None` so a caller that genuinely cannot supply them still
+        gets an honest `None` rather than a guess — never a second,
+        divergent notion of "settled."
         """
         snapshot: dict[str, Any] = evidence_snapshot or {}
         known = tuple(
@@ -223,6 +250,19 @@ class DecisionSignal:
             if entry.get("field") != "disqualifying_flag"
         )
         unknown: tuple[str, ...] = tuple(snapshot.get("unknown", ()))
+        evidence_sufficiency: str | None = None
+        if (
+            score_lower is not None
+            and score_upper is not None
+            and threshold_qualify is not None
+            and threshold_reject is not None
+        ):
+            evidence_sufficiency = (
+                SETTLED
+                if _settled_decision(score_lower, score_upper, threshold_qualify, threshold_reject)
+                is not None
+                else INSUFFICIENT_EVIDENCE
+            )
         return cls(
             decided=decision is not None,
             lead_status=lead_status,
@@ -235,6 +275,7 @@ class DecisionSignal:
             shadow=shadow,
             execution_mode=snapshot.get("execution_mode"),
             research_status=None,
+            evidence_sufficiency=evidence_sufficiency,
         )
 
 
@@ -273,6 +314,18 @@ def derive_customer_priority(signal: DecisionSignal) -> CustomerPriority:
     if status in FAILURE or status in AWAITING_REVIEW:
         return CustomerPriority.REVIEW
     if status in REJECTED:
+        # A REJECTED lead is this system's one path to an authoritative
+        # negative outcome with no human in the loop (autonomous, simulated-
+        # mode reject -> SYNCED — see arie.live.safety for why live mode can
+        # never reach here at all). `evidence_sufficiency` was computed from
+        # the same score bounds regardless of *how* the lead got here, so a
+        # reject whose reachable score range still crosses QUALIFY_THRESHOLD
+        # is uncertainty, not a rejection — the identical principle this
+        # function already applies to `not signal.decided`, above. `None`
+        # (not computed for this signal's source) preserves the pre-existing
+        # SKIP rather than guessing.
+        if signal.evidence_sufficiency == INSUFFICIENT_EVIDENCE:
+            return CustomerPriority.REVIEW
         return CustomerPriority.SKIP
 
     # QUALIFIED (AUTO_ROUTED / ROUTED / MANUAL_REVIEW) or a shadow evaluation
@@ -354,6 +407,16 @@ def _deterministic_short_reason(
         return "Processing hit a problem before ARIE could finish evaluating this lead."
     if status in AWAITING_REVIEW:
         return "This lead is waiting on a human review before it can move forward."
+    if status in REJECTED and signal.evidence_sufficiency == INSUFFICIENT_EVIDENCE:
+        # Mirrors derive_customer_priority's own REVIEW-not-SKIP branch — a
+        # rejection whose reachable score range could still cross into
+        # qualifying territory is not yet a settled "no", so the sentence
+        # must not read as one either.
+        return (
+            "ARIE's evidence on this lead is incomplete — the outcome could still "
+            "change with more information, even though the current recommendation "
+            "is reject."
+        )
     if priority is CustomerPriority.SKIP:
         return "This lead falls outside your targeting profile."
 
@@ -395,6 +458,11 @@ class LeadRecommendation:
     profile_version: int | None
     shadow: bool
     execution_mode: str | None
+    evidence_sufficiency: str | None
+    """`arie.api.receipt.SETTLED`/`INSUFFICIENT_EVIDENCE`/`None` — see
+    `DecisionSignal.evidence_sufficiency`. Carried through unchanged so a
+    caller reading only `LeadRecommendation` (not the full receipt) can still
+    tell a settled outcome from one unresolved evidence could still flip."""
 
     @property
     def is_decided(self) -> bool:
@@ -428,6 +496,7 @@ def build_recommendation(lead_id: UUID, signal: DecisionSignal) -> LeadRecommend
         profile_version=signal.profile_version,
         shadow=signal.shadow,
         execution_mode=signal.execution_mode,
+        evidence_sufficiency=signal.evidence_sufficiency,
     )
 
 

@@ -10,6 +10,7 @@ same rules.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
@@ -53,6 +54,7 @@ def _signal(
     shadow: bool = False,
     execution_mode: str | None = "simulated",
     research_status: ResearchStatus | None = ResearchStatus.RESEARCHED,
+    evidence_sufficiency: str | None = "settled",
 ) -> DecisionSignal:
     return DecisionSignal(
         decided=decided,
@@ -66,6 +68,7 @@ def _signal(
         shadow=shadow,
         execution_mode=execution_mode,
         research_status=research_status,
+        evidence_sufficiency=evidence_sufficiency,
     )
 
 
@@ -115,6 +118,36 @@ def test_clear_reject_is_skip() -> None:
         recommended_action=str(Decision.REJECT),
         confidence=0.9,
         score=20.0,
+        evidence_sufficiency="settled",
+    )
+    assert derive_customer_priority(signal) is CustomerPriority.SKIP
+
+
+def test_reject_with_insufficient_evidence_is_review_not_skip() -> None:
+    """The real Steli Efti case (Hunter person-validation, 2026-09-21):
+    score=20, bounds=[0,100], recommended_action="reject". The reachable
+    range still crosses QUALIFY_THRESHOLD (65), so a human must not be shown
+    a flat "skip" — that would present unresolved evidence as a settled no."""
+    signal = _signal(
+        lead_status=LeadStatus.SYNCED,
+        recommended_action=str(Decision.REJECT),
+        confidence=0.457,
+        score=20.0,
+        evidence_sufficiency="insufficient_evidence",
+    )
+    assert derive_customer_priority(signal) is CustomerPriority.REVIEW
+
+
+def test_reject_with_unknown_evidence_sufficiency_preserves_skip() -> None:
+    """A batch-list signal (`from_decision_row`) never computes
+    `evidence_sufficiency` — `None` must fall back to the pre-existing SKIP
+    behaviour rather than being treated as insufficient evidence."""
+    signal = _signal(
+        lead_status=LeadStatus.SYNCED,
+        recommended_action=str(Decision.REJECT),
+        confidence=0.9,
+        score=20.0,
+        evidence_sufficiency=None,
     )
     assert derive_customer_priority(signal) is CustomerPriority.SKIP
 
@@ -257,6 +290,55 @@ def test_batch_list_signal_omits_research_status_honestly() -> None:
     assert rec.priority is CustomerPriority.CONTACT_FIRST
     assert rec.research_status is ResearchStatus.NOT_PERFORMED
     assert rec.execution_mode == "simulated"
+    assert signal.evidence_sufficiency is None, (
+        "not supplied bounds/thresholds in this call -- must stay None, never a guess"
+    )
+
+
+def test_batch_list_signal_computes_evidence_sufficiency_when_bounds_are_supplied() -> None:
+    """Priority 2 (2026-09-21): `arie.batches` now joins score_lower/
+    score_upper and the org's profile thresholds, so `from_decision_row` can
+    compute this the same way `from_receipt` does -- via the identical shared
+    `settled_decision`, never a second notion of what "settled" means."""
+    signal = DecisionSignal.from_decision_row(
+        lead_status=LeadStatus.SYNCED,
+        shadow=False,
+        decision=str(Decision.REJECT),
+        confidence=0.457,
+        score_value=20.0,
+        evidence_snapshot={"known": [], "unknown": ["employee_count"]},
+        profile_version=None,
+        score_lower=0.0,
+        score_upper=100.0,
+        threshold_qualify=65.0,
+        threshold_reject=55.0,
+    )
+    assert signal.evidence_sufficiency == "insufficient_evidence"
+    rec = build_recommendation(LEAD_ID, signal)
+    assert rec.evidence_sufficiency == "insufficient_evidence"
+    assert rec.priority is CustomerPriority.REVIEW, (
+        "the batch/list path must reach the identical REVIEW-not-SKIP downgrade "
+        "as the single-lead receipt path -- same shared derive_customer_priority"
+    )
+
+
+def test_batch_list_signal_settled_reject_stays_skip() -> None:
+    signal = DecisionSignal.from_decision_row(
+        lead_status=LeadStatus.SYNCED,
+        shadow=False,
+        decision=str(Decision.REJECT),
+        confidence=0.95,
+        score_value=10.0,
+        evidence_snapshot={"known": [], "unknown": []},
+        profile_version=None,
+        score_lower=10.0,
+        score_upper=10.0,
+        threshold_qualify=65.0,
+        threshold_reject=55.0,
+    )
+    assert signal.evidence_sufficiency == "settled"
+    rec = build_recommendation(LEAD_ID, signal)
+    assert rec.priority is CustomerPriority.SKIP
 
 
 # --------------------------------------------------- DecisionSignal.from_receipt --
@@ -281,6 +363,7 @@ def _receipt(
             autonomous=True,
             final_status=lead_status,
             human_override=False,
+            evidence_sufficiency="settled",
         ),
         score=ReceiptScore(
             value=82.0,
@@ -332,3 +415,27 @@ def test_from_receipt_research_status_reflects_no_provider_calls() -> None:
     signal = DecisionSignal.from_receipt(receipt)
     rec = build_recommendation(LEAD_ID, signal)
     assert rec.research_status is ResearchStatus.NOT_PERFORMED
+
+
+def test_from_receipt_carries_evidence_sufficiency_through() -> None:
+    receipt = _receipt()
+    signal = DecisionSignal.from_receipt(receipt)
+    assert signal.evidence_sufficiency == "settled"
+    rec = build_recommendation(LEAD_ID, signal)
+    assert rec.evidence_sufficiency == "settled"
+
+
+def test_from_receipt_insufficient_evidence_end_to_end() -> None:
+    """A REJECT decision whose receipt says INSUFFICIENT_EVIDENCE must reach
+    CustomerPriority.REVIEW and an honest short_reason through the full
+    receipt -> DecisionSignal -> LeadRecommendation chain, not just the
+    direct-signal unit test above."""
+    receipt = _receipt(decision=str(Decision.REJECT), lead_status=LeadStatus.SYNCED)
+    receipt = replace(
+        receipt, decision=replace(receipt.decision, evidence_sufficiency="insufficient_evidence")
+    )
+    signal = DecisionSignal.from_receipt(receipt)
+    rec = build_recommendation(LEAD_ID, signal)
+    assert rec.priority is CustomerPriority.REVIEW
+    assert "incomplete" in rec.short_reason
+    assert rec.evidence_sufficiency == "insufficient_evidence"

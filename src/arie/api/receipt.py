@@ -45,6 +45,7 @@ from arie.live.safety import LIVE_GUARD_REASON
 from arie.live.strategy import LIVE_POLICY_NAMES as LIVE_POLICY_NAME_SET
 from arie.providers.catalog import ALL_PROVIDERS
 from arie.scoring.rules import QUALIFY_THRESHOLD, REJECT_THRESHOLD
+from arie.scoring.rules import settled_decision as _settled_decision
 from arie.statemachine.transitions import FAILURE
 
 LIVE_PROVIDER_NAMES: tuple[str, ...] = REGISTERED_LIVE_PROVIDER_NAMES
@@ -56,6 +57,21 @@ optimized and evaluation strategies plus the legacy single-provider name that
 stored rows still carry."""
 
 RECEIPT_VERSION = "1"
+
+SETTLED = "settled"
+"""`ReceiptDecision.evidence_sufficiency`: no unknown evidence within the
+reachable score range (`score.bounds`) could change `recommended_action` —
+see `arie.scoring.rules.settled_decision`."""
+
+INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+"""`ReceiptDecision.evidence_sufficiency`: the reachable score range still
+straddles a decision boundary — some resolution of the still-unknown fields
+could produce a *different* recommendation than the one recorded. This is
+never a claim that `recommended_action` is wrong, only that it is not yet
+provably final. Added so a reviewer (or `arie.recommendations`) never has to
+infer this from raw bounds arithmetic themselves — see the real, verified
+Steli Efti case (score=20, bounds=[0,100], recommended_action="reject") this
+was built to stop misreading as a confident rejection."""
 
 _STOP_REASON_EXPLANATIONS: dict[str, str] = {
     "decision_settled": (
@@ -134,6 +150,15 @@ class ReceiptDecision:
     human_override: bool
     """True only once a human has responded with a `final_decision` that differs from
     `original_decision` — the same comparison `v_escalation_rate.human_overrode` makes."""
+    evidence_sufficiency: str
+    """`SETTLED` or `INSUFFICIENT_EVIDENCE` (this module's constants) — whether
+    `score.bounds` still straddles a different decision than `recommended_action`.
+    Computed on every read from already-stored `score.bounds`/thresholds via
+    `arie.scoring.rules.settled_decision` — never a stored column, so this is
+    correct for every receipt ever written, not only ones decided after this
+    field existed. `recommended_action` itself is never rewritten or qualified
+    by this — a caller that only reads `recommended_action` sees exactly the
+    same value as before this field existed."""
     autonomy_guard: str | None = None
     """Why autonomous action was withheld regardless of the recommendation, or
     `None` when no guard applied.
@@ -533,6 +558,14 @@ def build_receipt(
 
     snapshot = receipt_row["evidence_snapshot"] or {}
     threshold_qualify, threshold_reject = _decision_thresholds(conn, receipt_row["icp_profile_id"])
+    score_lower = float(receipt_row["score_lower"])
+    score_upper = float(receipt_row["score_upper"])
+    evidence_sufficiency = (
+        SETTLED
+        if _settled_decision(score_lower, score_upper, threshold_qualify, threshold_reject)
+        is not None
+        else INSUFFICIENT_EVIDENCE
+    )
     return DecisionReceipt(
         receipt_version=RECEIPT_VERSION,
         lead_id=lead_id,
@@ -546,6 +579,7 @@ def build_receipt(
             autonomous=receipt_row["autonomous"],
             final_status=lead.status,
             human_override=human_override,
+            evidence_sufficiency=evidence_sufficiency,
             autonomy_guard=(
                 LIVE_GUARD_REASON if receipt_row["policy_name"] in LIVE_POLICY_NAME_SET else None
             ),
@@ -554,9 +588,7 @@ def build_receipt(
             value=float(receipt_row["score_value"]),
             threshold_qualify=threshold_qualify,
             threshold_reject=threshold_reject,
-            bounds=ReceiptScoreBounds(
-                lower=float(receipt_row["score_lower"]), upper=float(receipt_row["score_upper"])
-            ),
+            bounds=ReceiptScoreBounds(lower=score_lower, upper=score_upper),
             confidence=float(receipt_row["confidence"]),
             tau=float(receipt_row["tau"]),
         ),

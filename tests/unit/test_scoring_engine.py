@@ -32,6 +32,7 @@ from arie.scoring.rules import (
     REJECT_THRESHOLD,
     field_points,
     score_facts,
+    settled_decision,
 )
 
 NOW = datetime(2026, 8, 16, 12, 0, 0)
@@ -210,6 +211,48 @@ def test_open_decision_is_reported_as_unsettled() -> None:
     bounds = compute_bounds(facts)
     assert bounds.settled_decision is None
     assert bounds.width > 0
+
+
+# --- arie.scoring.rules.settled_decision (the receipt-facing standalone) ----
+#
+# ScoreBounds.settled_decision delegates to this; these pin the shared,
+# reusable function directly against arbitrary (lower, upper, thresholds) —
+# the exact shape arie.api.receipt.build_receipt calls it with, using a
+# receipt's own frozen thresholds rather than the live active_config().
+
+
+def test_settled_decision_function_matches_the_real_steli_efti_case() -> None:
+    """Hunter person-validation, 2026-09-21: score=20, bounds=[0,100],
+    recommended_action="reject". Must report unsettled -- QUALIFY_THRESHOLD
+    (65) is still reachable."""
+    assert settled_decision(0.0, 100.0, QUALIFY_THRESHOLD, REJECT_THRESHOLD) is None
+
+
+def test_settled_decision_function_settles_reject_below_the_floor() -> None:
+    assert settled_decision(0.0, 40.0, QUALIFY_THRESHOLD, REJECT_THRESHOLD) is Decision.REJECT
+
+
+def test_settled_decision_function_settles_auto_route_above_the_ceiling() -> None:
+    assert settled_decision(70.0, 90.0, QUALIFY_THRESHOLD, REJECT_THRESHOLD) is Decision.AUTO_ROUTE
+
+
+def test_settled_decision_function_settles_inside_the_borderline_band() -> None:
+    assert (
+        settled_decision(56.0, 64.0, QUALIFY_THRESHOLD, REJECT_THRESHOLD)
+        is Decision.ESCALATE_HUMAN
+    )
+
+
+def test_settled_decision_function_uses_the_thresholds_it_is_given_not_active_config() -> None:
+    """A receipt must be judged against the thresholds in effect *at decision
+    time*, never whatever the live process config happens to be now -- this
+    function takes them as plain arguments precisely so a caller never has to
+    reach for active_config()."""
+    assert settled_decision(20.0, 60.0, qualify_threshold=50.0, reject_threshold=10.0) is None
+    assert (
+        settled_decision(20.0, 60.0, qualify_threshold=200.0, reject_threshold=10.0)
+        is Decision.ESCALATE_HUMAN
+    )
 
 
 def test_bounds_always_contain_the_current_score() -> None:

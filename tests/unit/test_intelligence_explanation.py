@@ -82,6 +82,7 @@ def _recommendation(**overrides: object) -> LeadRecommendation:
         profile_version=1,
         shadow=False,
         execution_mode="simulated",
+        evidence_sufficiency="settled",
     )
     base.update(overrides)
     return LeadRecommendation(**base)  # type: ignore[arg-type]

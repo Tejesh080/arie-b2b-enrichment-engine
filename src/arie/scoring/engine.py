@@ -42,6 +42,7 @@ from arie.scoring.rules import (
     is_known,
     score_facts,
 )
+from arie.scoring.rules import settled_decision as _settled_decision
 
 
 @dataclass(frozen=True)
@@ -57,18 +58,15 @@ class ScoreBounds:
         """The decision, if no unknown evidence could change it.
 
         ``None`` means the interval straddles a boundary and the outcome is
-        still genuinely open.
+        still genuinely open. Delegates to `arie.scoring.rules.settled_decision`
+        against the *live* config's thresholds — see that function's docstring
+        for why a receipt (frozen, decision-time thresholds) calls it directly
+        instead of going through this property.
         """
         config = active_config()
-        if self.lower >= config.qualify_threshold:
-            return Decision.AUTO_ROUTE
-        if self.upper < config.reject_threshold:
-            return Decision.REJECT
-        if self.lower >= config.reject_threshold and self.upper < config.qualify_threshold:
-            # The entire reachable range sits inside the borderline band, so
-            # the lead is provably one a human should look at.
-            return Decision.ESCALATE_HUMAN
-        return None
+        return _settled_decision(
+            self.lower, self.upper, config.qualify_threshold, config.reject_threshold
+        )
 
     @property
     def is_settled(self) -> bool:
