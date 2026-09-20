@@ -40,7 +40,7 @@ from arie.config import LIVE_PROVIDER
 from arie.core.types import LeadStatus
 from arie.evalgen.schema import EvalLead
 from arie.jobs.handlers import SimulatedEnrichmentRuntime, build_handlers, build_runtime
-from arie.jobs.queue import ClaimedJob
+from arie.jobs.queue import ClaimedJob, PostgresJobQueue
 from arie.jobs.worker import JobContext, JobHandler
 from arie.live import provider_availability
 from arie.organizations import set_execution_mode
@@ -150,7 +150,10 @@ def _take_ownership(db_conn: psycopg.Connection, job_id: str) -> None:
 
 
 def _process(
-    live_pool: ConnectionPool, handlers: dict[str, JobHandler], body: dict[str, object]
+    live_pool: ConnectionPool,
+    handlers: dict[str, JobHandler],
+    body: dict[str, object],
+    job_queue: PostgresJobQueue,
 ) -> None:
     job_id = uuid.UUID(str(body["job_id"]))
     lead_id = uuid.UUID(str(body["lead_id"]))
@@ -173,6 +176,17 @@ def _process(
                 lead_version=row[1],
             )
         )
+        # Mirrors arie.jobs.worker.run_worker_cycle's own ordering: mark the
+        # job done in the same transaction as the handler's own writes, right
+        # after the handler returns. Omitting this was the real bug this
+        # module's regression test pins — see
+        # test_process_helper_marks_the_claimed_job_done's docstring for the
+        # incident it reproduces. `_take_ownership` claims the row exactly as
+        # a real worker's `claim()` would; without this call the row is never
+        # released, and a later, unrelated worker polling broadly for
+        # `compute_score` jobs eventually reclaims and re-fails it against a
+        # lead that has already (correctly) moved past `NEW`.
+        job_queue.complete(conn, job_id, worker_id=_TEST_WORKER_ID)
         conn.commit()
 
 
@@ -182,6 +196,14 @@ def _lead_status(db_conn: psycopg.Connection, lead_id: str) -> LeadStatus:
         row = cur.fetchone()
     assert row is not None
     return LeadStatus(row[0])
+
+
+def _job_status(db_conn: psycopg.Connection, job_id: str) -> str:
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT status FROM jobs WHERE job_id = %s", (job_id,))
+        row = cur.fetchone()
+    assert row is not None
+    return str(row[0])
 
 
 def _provider_call_rows(db_conn: psycopg.Connection, lead_id: str) -> list[tuple[str, str, bool]]:
@@ -212,6 +234,7 @@ def test_simulated_organization_runs_the_ordinary_simulated_path_in_a_live_worke
     live_pool: ConnectionPool,
     live_handlers: dict[str, JobHandler],
     db_conn: psycopg.Connection,
+    job_queue: PostgresJobQueue,
     cleanup_ingest: IngestCleanup,
     mocked_abstract_adapter: None,
 ) -> None:
@@ -229,7 +252,7 @@ def test_simulated_organization_runs_the_ordinary_simulated_path_in_a_live_worke
     body = _ingest(client, cleanup_ingest)
     _take_ownership(db_conn, str(body["job_id"]))
 
-    _process(live_pool, live_handlers, body)
+    _process(live_pool, live_handlers, body, job_queue)
 
     rows = _provider_call_rows(db_conn, str(body["lead_id"]))
     real_provider_names = {
@@ -251,11 +274,58 @@ def test_simulated_organization_runs_the_ordinary_simulated_path_in_a_live_worke
     assert status is not LeadStatus.NEW  # reached a real terminal, not stuck
 
 
+def test_process_helper_marks_the_claimed_job_done(
+    app_state_with_vault: AppState,
+    live_pool: ConnectionPool,
+    live_handlers: dict[str, JobHandler],
+    db_conn: psycopg.Connection,
+    job_queue: PostgresJobQueue,
+    cleanup_ingest: IngestCleanup,
+    mocked_abstract_adapter: None,
+) -> None:
+    """Regression test for a real dead-letter incident, found via the MCP
+    `list_failed_jobs`/`inspect_job` tools: genuine `compute_score` jobs in
+    the local dev database dead-lettered with
+    "compute_score expects a NEW lead; lead X is AWAITING_HUMAN" even though
+    each was the lead's *only* job and the lead's own `lead_events` timeline
+    showed it reaching that status through this exact synchronous handler
+    call — not a second, competing job.
+
+    Root cause: `_take_ownership` claims the job row (`status='processing'`)
+    via raw SQL, exactly as a real worker's `claim()` would, but `_process`
+    never called `job_queue.complete()` the way `run_worker_cycle` always
+    does after a handler returns — see `arie.jobs.worker`'s own call to
+    `queue.complete()` immediately after invoking the handler. The job row
+    was left stranded at `status='processing'` forever. Once its lease aged
+    past `claim()`'s default `lease_seconds` window, a *later*, unrelated
+    worker polling broadly for `job_types=["compute_score"]` (as
+    `test_demo_smoke_integration.py` and `test_icp_profiles_integration.py`
+    both do) reclaimed it, found the lead already past `NEW` — because the
+    real work this test performed had already, correctly, moved it there —
+    and dead-lettered it after exhausting its retry budget, purely because
+    nothing had ever told the queue this job's work was done.
+
+    This asserts the job row itself reaches `status='done'`, the one
+    property `_take_ownership` + `_process` must guarantee to behave like a
+    real worker cycle and never leak a claimable job for someone else's
+    worker to rediscover and misdiagnose.
+    """
+    client, _org_id = _org_client(app_state_with_vault, db_conn, execution_mode="simulated")
+    body = _ingest(client, cleanup_ingest)
+    job_id = str(body["job_id"])
+    _take_ownership(db_conn, job_id)
+
+    _process(live_pool, live_handlers, body, job_queue)
+
+    assert _job_status(db_conn, job_id) == "done"
+
+
 def test_two_organizations_on_one_handler_set_behave_independently(
     app_state_with_vault: AppState,
     live_pool: ConnectionPool,
     live_handlers: dict[str, JobHandler],
     db_conn: psycopg.Connection,
+    job_queue: PostgresJobQueue,
     cleanup_ingest: IngestCleanup,
     mocked_abstract_adapter: None,
 ) -> None:
@@ -285,8 +355,8 @@ def test_two_organizations_on_one_handler_set_behave_independently(
 
     # Same handler set (`live_handlers`), same worker, processed one after
     # the other - proves the dispatch is per-job, not per-process.
-    _process(live_pool, live_handlers, sim_body)
-    _process(live_pool, live_handlers, shadow_body)
+    _process(live_pool, live_handlers, sim_body, job_queue)
+    _process(live_pool, live_handlers, shadow_body, job_queue)
 
     real_provider_names = {
         ABSTRACT_PROVIDER_NAME,
@@ -317,6 +387,7 @@ def test_live_shadow_organization_acquires_real_evidence_but_never_routes(
     live_pool: ConnectionPool,
     live_handlers: dict[str, JobHandler],
     db_conn: psycopg.Connection,
+    job_queue: PostgresJobQueue,
     cleanup_ingest: IngestCleanup,
     mocked_abstract_adapter: None,
 ) -> None:
@@ -332,7 +403,7 @@ def test_live_shadow_organization_acquires_real_evidence_but_never_routes(
     lead_id = str(body["lead_id"])
     _take_ownership(db_conn, str(body["job_id"]))
 
-    _process(live_pool, live_handlers, body)
+    _process(live_pool, live_handlers, body, job_queue)
 
     rows = _provider_call_rows(db_conn, lead_id)
     assert len(rows) == 1
@@ -358,6 +429,7 @@ def test_live_human_only_organization_routes_to_awaiting_human(
     live_pool: ConnectionPool,
     live_handlers: dict[str, JobHandler],
     db_conn: psycopg.Connection,
+    job_queue: PostgresJobQueue,
     cleanup_ingest: IngestCleanup,
     mocked_abstract_adapter: None,
 ) -> None:
@@ -373,7 +445,7 @@ def test_live_human_only_organization_routes_to_awaiting_human(
     lead_id = str(body["lead_id"])
     _take_ownership(db_conn, str(body["job_id"]))
 
-    _process(live_pool, live_handlers, body)
+    _process(live_pool, live_handlers, body, job_queue)
 
     rows = _provider_call_rows(db_conn, lead_id)
     assert len(rows) == 1
@@ -394,6 +466,7 @@ def test_the_raw_credential_never_appears_in_the_ledger_or_receipt(
     live_pool: ConnectionPool,
     live_handlers: dict[str, JobHandler],
     db_conn: psycopg.Connection,
+    job_queue: PostgresJobQueue,
     cleanup_ingest: IngestCleanup,
     mocked_abstract_adapter: None,
 ) -> None:
@@ -410,7 +483,7 @@ def test_the_raw_credential_never_appears_in_the_ledger_or_receipt(
     lead_id = str(body["lead_id"])
     _take_ownership(db_conn, str(body["job_id"]))
 
-    _process(live_pool, live_handlers, body)
+    _process(live_pool, live_handlers, body, job_queue)
 
     with db_conn.cursor() as cur:
         cur.execute("SELECT * FROM provider_calls WHERE lead_id = %s", (lead_id,))
