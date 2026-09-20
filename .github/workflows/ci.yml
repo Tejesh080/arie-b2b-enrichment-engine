@@ -14,7 +14,11 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - run: pip install -e ".[dev,service]"
+      # mcp: src/arie_mcp and tests/mcp are under `src`/`tests`, which lint,
+      # type check, and (non-integration) unit tests already walk — without
+      # this extra those imports fail to resolve/collect, not "pass with a
+      # gap".
+      - run: pip install -e ".[dev,service,mcp]"
       - name: Lint
         run: ruff check src tests bench scripts
       - name: Format check
@@ -67,7 +71,9 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - run: pip install -e ".[dev,service]"
+      # mcp: tests/mcp/integration/* (pytest.mark.integration) needs arie_mcp
+      # and the mcp SDK importable to run for real against this container.
+      - run: pip install -e ".[dev,service,mcp]"
       - name: Designate the service container as a test database
         # The suite refuses to write to a database that has not been marked.
         # Here that is a formality — the container is born and destroyed with

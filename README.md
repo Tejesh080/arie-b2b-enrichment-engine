@@ -241,6 +241,7 @@ frozen corpus, and prints their receipts.
 | [benchmark.md](docs/benchmark.md) | Dataset design, measured results, every assumption |
 | [deployment.md](docs/deployment.md) | Hosted topology, config, migrations, rollback |
 | [provider-integration.md](docs/provider-integration.md) | The real adapter, and shadow mode |
+| [mcp-architecture.md](docs/mcp-architecture.md) | The read-only MCP engineering interface Claude Code connects to |
 | [portfolio.md](docs/portfolio.md) | Short explanations, and what not to claim |
 | [docs/adr/](docs/adr/) | Decision records, including the negative result |
 
