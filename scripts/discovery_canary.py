@@ -106,6 +106,8 @@ def main() -> int:
         domain: str,
         target_summary: str,
         now: datetime,
+        source_url: str | None = None,
+        seller_offering: str = "",
     ) -> VerificationResult:
         return verify_candidate(
             real_llm,
@@ -113,6 +115,8 @@ def main() -> int:
             domain=domain,
             target_summary=target_summary,
             now=now,
+            source_url=source_url,
+            seller_offering=seller_offering,
         )
 
     with pool.connection() as conn:
