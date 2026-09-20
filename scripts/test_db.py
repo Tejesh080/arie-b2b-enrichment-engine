@@ -27,6 +27,22 @@ command whose name says what it does. An environment variable cannot forge it.
 
 ``designate`` creates the database if it does not exist, so there is no separate
 ``createdb`` step to forget.
+
+**A long-lived local `arie_test` accumulates state across sessions, and that
+state can produce test failures that are not code bugs.** Once marked, this
+script's own populated-database guard no longer objects to *this* database —
+by design, so a normal `make test-all` run against an already-designated
+database is never refused — but nothing resets it between separate manual
+`pytest` invocations days or weeks apart. Confirmed during the 2026-09
+reliability sprint: `test_pipeline_integration.py` and
+`test_icp_profiles_integration.py` failures that were 100% reproducible
+against a `arie_test` reused since 2026-08-31 vanished entirely (673/673
+passed) against a freshly designated database — stale cached evidence and a
+mutated `LEGACY_ORGANIZATION_ID` ICP profile, not application bugs. CI never
+sees this (its Postgres service container is born and destroyed with the
+job); a local investigation that finds integration failures should designate
+a fresh database (a new name, e.g. ``arie_test_2``) before concluding a
+failure is real, exactly as this sprint's report does.
 """
 
 from __future__ import annotations
