@@ -21,6 +21,7 @@ from arie.batches import BatchRecord, list_batches
 from arie.copilot import CopilotLeadReference, rank_work_today, to_reference
 from arie.copilot_service import _fetch_lead_pool
 from arie.feedback import FeedbackAggregate, aggregate_feedback
+from arie.icp_profiles import resolve_scoring_config
 from arie.intelligence.proposals import ProposalRecord, list_proposals
 from arie.recommendations import CustomerPriority
 
@@ -50,7 +51,18 @@ class DashboardSummary:
 def load_dashboard(
     conn: psycopg.Connection, *, organization_id: UUID, user_id: UUID
 ) -> DashboardSummary:
-    pool = _fetch_lead_pool(conn, organization_id=organization_id, user_id=user_id)
+    # Priority (2026-09-21 narrow consistency fix): thresholds resolved the
+    # same way arie.copilot_service.answer_list_query does, so a lead's
+    # evidence_sufficiency (and therefore priority) never disagrees between
+    # the Top Leads widget and Ask ARIE for the identical lead.
+    scoring_config = resolve_scoring_config(conn, organization_id=organization_id)
+    pool = _fetch_lead_pool(
+        conn,
+        organization_id=organization_id,
+        user_id=user_id,
+        threshold_qualify=scoring_config.qualify_threshold,
+        threshold_reject=scoring_config.reject_threshold,
+    )
     summaries = [row.summary for row in pool]
 
     priority_counts = {str(p): 0 for p in CustomerPriority}

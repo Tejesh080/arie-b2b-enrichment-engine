@@ -227,6 +227,14 @@ class LeadSummary:
     feedback_sentiment: str | None
     profile_version: int | None
     created_at_iso: str
+    evidence_sufficiency: str | None
+    """Priority (2026-09-21 narrow consistency fix). `"settled"` /
+    `"insufficient_evidence"` / `None` (no decision yet) — see
+    `arie.recommendations.DecisionSignal.evidence_sufficiency`. Computed by
+    `arie.copilot_service._row_to_pool_row` via the identical shared
+    `arie.scoring.rules.settled_decision` the single-lead receipt and batch
+    list paths already use — never a second notion of "settled" for the
+    dashboard/Top Leads/Ask ARIE surface."""
 
 
 def to_reference(summary: LeadSummary) -> CopilotLeadReference:
@@ -238,6 +246,7 @@ def to_reference(summary: LeadSummary) -> CopilotLeadReference:
         score=summary.score,
         why=summary.short_reason,
         next_action=summary.next_action,
+        evidence_sufficiency=summary.evidence_sufficiency,
     )
 
 
@@ -255,6 +264,9 @@ class CopilotLeadReference:
     score: float | None
     why: str
     next_action: NextAction
+    evidence_sufficiency: str | None = None
+    """See `LeadSummary`'s field of the same name. Defaulted for backward
+    compatibility with any existing direct construction."""
 
 
 @dataclass(frozen=True)

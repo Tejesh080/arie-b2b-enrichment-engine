@@ -242,6 +242,107 @@ def test_needs_research_requires_a_material_unknown_field(
     assert "Settled Co" not in companies
 
 
+# ============= narrow consistency fix (2026-09-21): evidence_sufficiency =====
+#
+# arie/copilot_service.py::_row_to_pool_row previously called
+# DecisionSignal.from_decision_row without bounds/thresholds, so every
+# copilot/dashboard lead's evidence_sufficiency stayed None and a REJECTED,
+# insufficient-evidence lead showed the same flat "skip" priority as a
+# genuinely settled one -- the same gap Priority 2 already closed for
+# arie/batches.py. These tests pin the fix using the identical shared
+# settled_decision the single-lead receipt and batch list paths already use.
+
+
+def test_settled_reject_is_skip_in_copilot_list(
+    api_client: TestClient, make_decided_lead: MakeDecidedLead
+) -> None:
+    make_decided_lead(
+        company_name="Settled Reject Co",
+        status="SYNCED",
+        decision="reject",
+        confidence=0.95,
+        score=10.0,
+        score_lower=10.0,
+        score_upper=10.0,  # entire reachable range is below REJECT_THRESHOLD -- settled
+    )
+
+    response = api_client.post("/copilot/query", json={"question": "Show my top leads"})
+    assert response.status_code == 200
+    leads = {lead["company"]: lead for lead in response.json()["leads"]}
+    assert leads["Settled Reject Co"]["priority"] == "skip"
+    assert leads["Settled Reject Co"]["evidence_sufficiency"] == "settled"
+
+
+def test_insufficient_evidence_reject_is_review_not_skip_in_copilot_list(
+    api_client: TestClient, make_decided_lead: MakeDecidedLead
+) -> None:
+    """The real Steli Efti case (Hunter person-validation, 2026-09-21):
+    score=20, bounds=[0,100], recommended_action="reject". Must not read as
+    a flat "skip" in the dashboard/Top Leads/Ask ARIE list -- the reachable
+    range still crosses QUALIFY_THRESHOLD (65)."""
+    make_decided_lead(
+        company_name="Insufficient Evidence Co",
+        status="SYNCED",
+        decision="reject",
+        confidence=0.457,
+        score=20.0,
+        score_lower=0.0,
+        score_upper=100.0,
+    )
+
+    response = api_client.post("/copilot/query", json={"question": "Show my top leads"})
+    assert response.status_code == 200
+    leads = {lead["company"]: lead for lead in response.json()["leads"]}
+    assert leads["Insufficient Evidence Co"]["priority"] == "review"
+    assert leads["Insufficient Evidence Co"]["evidence_sufficiency"] == "insufficient_evidence"
+    # The "why" text is the honest caveat, not a bare verdict -- the raw
+    # machine recommendation itself stays inspectable via the single-lead
+    # receipt/recommendation endpoints (see the agreement test below).
+    assert "incomplete" in leads["Insufficient Evidence Co"]["why"].lower()
+
+
+def test_copilot_ranking_agrees_with_the_same_leads_receipt_and_recommendation(
+    api_client: TestClient, make_decided_lead: MakeDecidedLead
+) -> None:
+    """Cross-surface consistency: the copilot list, the single-lead
+    recommendation, and the raw Decision Receipt must all describe the exact
+    same lead identically -- same priority, same evidence_sufficiency, and
+    the receipt (Advanced Details) still carries the unqualified raw
+    recommended_action regardless of what the list/recommendation surfaces
+    show."""
+    lead_id = make_decided_lead(
+        company_name="Cross Surface Co",
+        status="SYNCED",
+        decision="reject",
+        confidence=0.457,
+        score=20.0,
+        score_lower=0.0,
+        score_upper=100.0,
+    )
+
+    list_response = api_client.post("/copilot/query", json={"question": "Show my top leads"})
+    assert list_response.status_code == 200
+    list_lead = next(
+        lead for lead in list_response.json()["leads"] if lead["company"] == "Cross Surface Co"
+    )
+
+    recommendation = api_client.get(f"/leads/{lead_id}/recommendation").json()
+    receipt = api_client.get(f"/leads/{lead_id}/receipt").json()
+
+    assert list_lead["priority"] == recommendation["priority"] == "review"
+    assert (
+        list_lead["evidence_sufficiency"]
+        == recommendation["evidence_sufficiency"]
+        == receipt["decision"]["evidence_sufficiency"]
+        == "insufficient_evidence"
+    )
+    # Advanced Details (the receipt) still carries the raw, unqualified
+    # recommendation -- nothing hides it, only the list/recommendation
+    # priority is the softened one.
+    assert receipt["decision"]["recommended_action"] == "reject"
+    assert recommendation["machine_decision"] == "reject"
+
+
 def test_industry_filter_is_case_insensitive(
     api_client: TestClient, make_decided_lead: MakeDecidedLead
 ) -> None:

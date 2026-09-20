@@ -208,8 +208,12 @@ def _escape_ilike(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _row_to_pool_row(row: dict[str, Any]) -> _PoolRow:
+def _row_to_pool_row(
+    row: dict[str, Any], *, threshold_qualify: float, threshold_reject: float
+) -> _PoolRow:
     snapshot = row["evidence_snapshot"] or {}
+    score_lower = float(row["score_lower"]) if row["score_lower"] is not None else None
+    score_upper = float(row["score_upper"]) if row["score_upper"] is not None else None
     signal = DecisionSignal.from_decision_row(
         lead_status=LeadStatus(row["lead_status"]),
         shadow=bool(row["is_shadow"]),
@@ -218,6 +222,10 @@ def _row_to_pool_row(row: dict[str, Any]) -> _PoolRow:
         score_value=float(row["score_value"]) if row["score_value"] is not None else None,
         evidence_snapshot=snapshot,
         profile_version=row["icp_profile_version"],
+        score_lower=score_lower,
+        score_upper=score_upper,
+        threshold_qualify=threshold_qualify,
+        threshold_reject=threshold_reject,
     )
     recommendation = build_recommendation(row["lead_id"], signal)
     summary = LeadSummary(
@@ -236,6 +244,7 @@ def _row_to_pool_row(row: dict[str, Any]) -> _PoolRow:
         feedback_sentiment=row["feedback_sentiment"],
         profile_version=recommendation.profile_version,
         created_at_iso=row["created_at"].isoformat(),
+        evidence_sufficiency=recommendation.evidence_sufficiency,
     )
     # Matches `DecisionSignal.from_decision_row`'s own filter exactly: the
     # disqualifier is a gate, not a scored field, and must never appear
@@ -249,15 +258,21 @@ def _row_to_pool_row(row: dict[str, Any]) -> _PoolRow:
     return _PoolRow(
         summary=summary,
         score_value=float(row["score_value"]) if row["score_value"] is not None else None,
-        score_lower=float(row["score_lower"]) if row["score_lower"] is not None else None,
-        score_upper=float(row["score_upper"]) if row["score_upper"] is not None else None,
+        score_lower=score_lower,
+        score_upper=score_upper,
         known_fields=known,
         unknown_fields=unknown,
     )
 
 
 def _fetch_lead_pool(
-    conn: psycopg.Connection, *, organization_id: UUID, user_id: UUID, limit: int = POOL_LIMIT
+    conn: psycopg.Connection,
+    *,
+    organization_id: UUID,
+    user_id: UUID,
+    threshold_qualify: float,
+    threshold_reject: float,
+    limit: int = POOL_LIMIT,
 ) -> list[_PoolRow]:
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -265,11 +280,20 @@ def _fetch_lead_pool(
             {"organization_id": organization_id, "user_id": user_id, "limit": limit},
         )
         rows = cur.fetchall()
-    return [_row_to_pool_row(row) for row in rows]
+    return [
+        _row_to_pool_row(row, threshold_qualify=threshold_qualify, threshold_reject=threshold_reject)
+        for row in rows
+    ]
 
 
 def _fetch_by_company_names(
-    conn: psycopg.Connection, *, organization_id: UUID, user_id: UUID, names: tuple[str, ...]
+    conn: psycopg.Connection,
+    *,
+    organization_id: UUID,
+    user_id: UUID,
+    names: tuple[str, ...],
+    threshold_qualify: float,
+    threshold_reject: float,
 ) -> list[_PoolRow]:
     """One targeted, still-fixed query per name — bounded to
     `arie.copilot.LeadListQueryPlan.company_names`'s own max length (5), so
@@ -292,7 +316,11 @@ def _fetch_by_company_names(
             if row["lead_id"] in seen:
                 continue
             seen.add(row["lead_id"])
-            results.append(_row_to_pool_row(row))
+            results.append(
+                _row_to_pool_row(
+                    row, threshold_qualify=threshold_qualify, threshold_reject=threshold_reject
+                )
+            )
     return results
 
 
@@ -577,6 +605,12 @@ def answer_list_query(
 ) -> CopilotResponse:
     profile = get_active_profile(conn, organization_id=organization_id)
     profile_name = profile.name if profile is not None else "your targeting profile"
+    # Priority (2026-09-21 narrow consistency fix): resolved unconditionally,
+    # not only for NEEDS_RESEARCH -- every list answer's leads now carry
+    # evidence_sufficiency (see _row_to_pool_row), which needs the org's real
+    # thresholds regardless of intent. Reuses the exact same resolver
+    # NEEDS_RESEARCH's own _is_researchable check already called here.
+    scoring_config = resolve_scoring_config(conn, organization_id=organization_id)
 
     plan, llm_used = classify_list_intent(
         llm, organization_id=organization_id, question=question, profile_name=profile_name, now=now
@@ -600,7 +634,13 @@ def answer_list_query(
 
     if plan.intent is CopilotIntent.FEEDBACK_SUMMARY:
         aggregate = aggregate_feedback(conn, organization_id=organization_id)
-        rows = _fetch_lead_pool(conn, organization_id=organization_id, user_id=user_id)
+        rows = _fetch_lead_pool(
+            conn,
+            organization_id=organization_id,
+            user_id=user_id,
+            threshold_qualify=scoring_config.qualify_threshold,
+            threshold_reject=scoring_config.reject_threshold,
+        )
         candidates = _select_candidates(plan.intent, rows, scoring_config=None)
         candidates = _apply_plan_filters(candidates, plan)
         candidates = _sort_summaries(candidates, plan.sort)[:limit]
@@ -613,13 +653,18 @@ def answer_list_query(
             llm_used=llm_used,
         )
 
-    scoring_config = (
-        resolve_scoring_config(conn, organization_id=organization_id)
-        if plan.intent is CopilotIntent.NEEDS_RESEARCH
-        else None
+    rows = _fetch_lead_pool(
+        conn,
+        organization_id=organization_id,
+        user_id=user_id,
+        threshold_qualify=scoring_config.qualify_threshold,
+        threshold_reject=scoring_config.reject_threshold,
     )
-    rows = _fetch_lead_pool(conn, organization_id=organization_id, user_id=user_id)
-    candidates = _select_candidates(plan.intent, rows, scoring_config=scoring_config)
+    candidates = _select_candidates(
+        plan.intent,
+        rows,
+        scoring_config=scoring_config if plan.intent is CopilotIntent.NEEDS_RESEARCH else None,
+    )
     candidates = _apply_plan_filters(candidates, plan)
     if plan.intent is not CopilotIntent.WORK_TODAY:
         candidates = _sort_summaries(candidates, plan.sort)
@@ -681,11 +726,14 @@ def _answer_compare(
             llm_used=False,
         )
 
+    scoring_config = resolve_scoring_config(conn, organization_id=organization_id)
     rows = _fetch_by_company_names(
         conn,
         organization_id=organization_id,
         user_id=user_id,
         names=tuple(plan.company_names[:COMPARE_MAX_LEADS]),
+        threshold_qualify=scoring_config.qualify_threshold,
+        threshold_reject=scoring_config.reject_threshold,
     )
     if len(rows) < COMPARE_MIN_LEADS:
         return CopilotResponse(

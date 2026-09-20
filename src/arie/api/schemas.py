@@ -1533,6 +1533,10 @@ class CopilotLeadReferenceResponse(BaseModel):
     score: float | None
     why: str
     next_action: NextAction
+    evidence_sufficiency: str | None = None
+    """Priority (2026-09-21 narrow consistency fix). See
+    `arie.copilot.LeadSummary`'s field of the same name. Additive and
+    defaulted for backward compatibility."""
 
 
 class CopilotResponseSchema(BaseModel):

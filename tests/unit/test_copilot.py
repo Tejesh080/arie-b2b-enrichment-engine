@@ -41,6 +41,7 @@ def _summary(
     score: float | None = 70.0,
     confidence: float | None = 0.8,
     confidence_band: ConfidenceBand | None = ConfidenceBand.HIGH,
+    evidence_sufficiency: str | None = "settled",
 ) -> LeadSummary:
     return LeadSummary(
         lead_id=lead_id,
@@ -58,6 +59,7 @@ def _summary(
         feedback_sentiment=None,
         profile_version=1,
         created_at_iso="2026-09-01T00:00:00+00:00",
+        evidence_sufficiency=evidence_sufficiency,
     )
 
 
