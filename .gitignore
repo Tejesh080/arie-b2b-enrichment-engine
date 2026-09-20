@@ -68,3 +68,7 @@ supabase/.temp/
 
 # Provider bake-off run artifacts (may contain real identities from user-supplied CSVs)
 data/evaluation/runs/
+
+# arie_mcp local JSONL audit logs (specs/mcp-engineering-interface.md § 12) —
+# host-local by design, never committed.
+var/

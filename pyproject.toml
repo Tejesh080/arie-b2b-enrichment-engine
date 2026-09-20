@@ -35,10 +35,17 @@ service = [
 dev = [
     "pytest>=8.2",
     "pytest-cov>=5.0",
+    "pytest-asyncio>=0.24",  # arie_mcp's tools are async (mcp SDK/anyio); the rest of this codebase is sync
     "ruff>=0.5",
     "mypy>=1.10",
     "pandas-stubs",
     "types-PyYAML",  # PyYAML itself arrives via uvicorn[standard]; the compose-contract test parses docker-compose.yml
+]
+# specs/mcp-engineering-interface.md — a local, stdio-only MCP server exposing
+# read-only runtime diagnostics. Depends on `service`'s psycopg for its own
+# read-only DB role; install both together (`pip install -e ".[dev,service,mcp]"`).
+mcp = [
+    "mcp>=2.2,<3",
 ]
 
 [project.scripts]
@@ -86,6 +93,11 @@ markers = [
     "integration: requires a live database (skipped by default in CI)",
     "slow: long-running benchmark tests",
 ]
+# Only arie_mcp's own tests (tests/mcp/) contain async test functions — the
+# rest of this codebase is synchronous. "auto" scopes itself to whatever a
+# test file actually declares as async, so it changes nothing for every
+# other test in tests/.
+asyncio_mode = "auto"
 
 [tool.coverage.run]
 source = ["src/arie"]
