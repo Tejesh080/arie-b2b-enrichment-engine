@@ -66,6 +66,7 @@ from arie.recommendations import (
     NextAction,
     build_recommendation,
 )
+from arie.scoring.rules import QUALIFY_THRESHOLD, REJECT_THRESHOLD
 from arie.statemachine.transitions import AWAITING_REVIEW, FAILURE, QUALIFIED, REJECTED
 
 __all__ = [
@@ -334,6 +335,12 @@ class BatchRowRecord:
     next_action: NextAction | None
     short_reason: str | None
     confidence_band: ConfidenceBand | None
+    evidence_sufficiency: str | None = None
+    """Priority 2 (2026-09-21). `"settled"` / `"insufficient_evidence"` — see
+    `arie.recommendations.DecisionSignal.evidence_sufficiency`, computed here
+    via the exact same shared `arie.scoring.rules.settled_decision` the
+    single-lead receipt path uses. `None` wherever `priority` is (no decision
+    yet), never a stand-in for `SKIP`."""
 
 
 @dataclass(frozen=True)
@@ -410,10 +417,14 @@ _SELECT_BATCHES_FOR_ORG = """
 _SELECT_BATCH_ROWS = """
     SELECT r.batch_id, r.row_number, r.raw_row, r.validation_status, r.validation_error,
            r.lead_id, l.status AS lead_status, l.is_shadow,
-           dr.decision, dr.confidence, dr.score_value, dr.evidence_snapshot, dr.icp_profile_version
+           dr.decision, dr.confidence, dr.score_value, dr.score_lower, dr.score_upper,
+           dr.evidence_snapshot, dr.icp_profile_version,
+           p.config->>'qualify_threshold' AS profile_qualify_threshold,
+           p.config->>'reject_threshold' AS profile_reject_threshold
     FROM lead_batch_rows r
     LEFT JOIN leads l ON l.lead_id = r.lead_id
     LEFT JOIN decision_receipts dr ON dr.lead_id = r.lead_id
+    LEFT JOIN organization_icp_profiles p ON p.profile_id = dr.icp_profile_id
     WHERE r.batch_id = %(batch_id)s AND r.organization_id = %(organization_id)s
     ORDER BY r.row_number ASC
     LIMIT %(limit)s OFFSET %(offset)s
@@ -572,7 +583,23 @@ def _row_to_batch_row(row: dict[str, Any]) -> BatchRowRecord:
     next_action: NextAction | None = None
     short_reason: str | None = None
     band: ConfidenceBand | None = None
+    evidence_sufficiency: str | None = None
     if row["lead_id"] is not None and row["lead_status"] is not None:
+        # Priority 2 (2026-09-21): thresholds are the organization's active
+        # profile's own (joined via icp_profile_id -> organization_icp_profiles),
+        # falling back to the reference constants exactly like
+        # arie.api.receipt._decision_thresholds does for a profile-less
+        # receipt — never a second, divergent notion of what "settled" means.
+        threshold_qualify = (
+            float(row["profile_qualify_threshold"])
+            if row.get("profile_qualify_threshold") is not None
+            else QUALIFY_THRESHOLD
+        )
+        threshold_reject = (
+            float(row["profile_reject_threshold"])
+            if row.get("profile_reject_threshold") is not None
+            else REJECT_THRESHOLD
+        )
         signal = DecisionSignal.from_decision_row(
             lead_status=LeadStatus(row["lead_status"]),
             shadow=bool(row["is_shadow"]),
@@ -581,12 +608,17 @@ def _row_to_batch_row(row: dict[str, Any]) -> BatchRowRecord:
             score_value=float(row["score_value"]) if row["score_value"] is not None else None,
             evidence_snapshot=row["evidence_snapshot"],
             profile_version=row["icp_profile_version"],
+            score_lower=float(row["score_lower"]) if row["score_lower"] is not None else None,
+            score_upper=float(row["score_upper"]) if row["score_upper"] is not None else None,
+            threshold_qualify=threshold_qualify,
+            threshold_reject=threshold_reject,
         )
         recommendation = build_recommendation(row["lead_id"], signal)
         priority = recommendation.priority
         next_action = recommendation.next_action
         short_reason = recommendation.short_reason
         band = recommendation.confidence_band
+        evidence_sufficiency = recommendation.evidence_sufficiency
 
     return BatchRowRecord(
         batch_id=row["batch_id"],
@@ -600,6 +632,7 @@ def _row_to_batch_row(row: dict[str, Any]) -> BatchRowRecord:
         next_action=next_action,
         short_reason=short_reason,
         confidence_band=band,
+        evidence_sufficiency=evidence_sufficiency,
     )
 
 

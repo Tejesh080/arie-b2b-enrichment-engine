@@ -29,6 +29,7 @@ from arie.evalgen.schema import EvalLead
 from arie.jobs.handlers import SimulatedEnrichmentRuntime, build_handlers, build_runtime
 from arie.jobs.queue import PostgresJobQueue
 from arie.jobs.worker import JobHandler, run_worker_cycle
+from arie.scoring.rules import settled_decision
 from arie.tenancy import LEGACY_ORGANIZATION_ID
 
 pytestmark = pytest.mark.integration
@@ -446,3 +447,28 @@ def test_batch_progress_reflects_real_outcomes_after_processing(
     assert final["progress"]["qualified_count"] == 1
     assert final["progress"]["review_count"] == 1
     assert final["progress"]["processing_count"] == 0
+
+    # Priority 2 (2026-09-21): the batch list must now carry
+    # evidence_sufficiency for every decided row, computed via the exact
+    # shared arie.scoring.rules.settled_decision the single-lead receipt uses
+    # -- cross-checked here against each lead's own receipt bounds/thresholds
+    # rather than asserting a specific literal string, so this proves the
+    # wiring rather than restating it.
+    final_rows = api_client.get(f"/batches/{body['batch_id']}/leads").json()["items"]
+    assert final_rows, "batch must have rows to check"
+    for row in final_rows:
+        assert row["lead_id"] is not None
+        receipt = api_client.get(f"/leads/{row['lead_id']}/receipt").json()
+        assert receipt["status"] == "decided"
+        expected = (
+            "settled"
+            if settled_decision(
+                receipt["score"]["bounds"]["lower"],
+                receipt["score"]["bounds"]["upper"],
+                receipt["score"]["threshold_qualify"],
+                receipt["score"]["threshold_reject"],
+            )
+            is not None
+            else "insufficient_evidence"
+        )
+        assert row["evidence_sufficiency"] == expected
