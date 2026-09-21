@@ -58,9 +58,35 @@ class Settings:
         default_factory=lambda: float(_env_int("ARIE_MCP_TOOL_TIMEOUT_SECONDS", 10))
     )
 
+    # --- Remote (Streamable HTTP) transport only. Unused by the stdio
+    # entrypoint (arie_mcp.server) -- reading an unset value there is
+    # harmless, but nothing in that path ever does.
+    http_host: str = field(default_factory=lambda: os.getenv("ARIE_MCP_HTTP_HOST", "0.0.0.0"))
+    http_port: int = field(default_factory=lambda: _env_int("PORT", 8000))
+    """Railway injects ``PORT``; the same variable every other service in
+    this repo already reads (see the Dockerfile's own CMD)."""
+
+    public_url: str = field(default_factory=lambda: os.getenv("ARIE_MCP_PUBLIC_URL", ""))
+    """This service's own public HTTPS origin (e.g.
+    ``https://arie-mcp-production.up.railway.app``), no trailing slash.
+    Doubles as the OAuth issuer and the MCP resource URL -- both must be
+    the URL a client actually reaches this server at, never inferred from
+    ``http_host``/``http_port``, which are the local bind address."""
+
+    owner_password: str = field(default_factory=lambda: os.getenv("MCP_OWNER_PASSWORD", ""))
+    """Gates the ``/login`` page the OAuth authorization flow redirects to.
+    One operator, one password -- there is no username, and no default:
+    an unset value means the remote server refuses to start (see
+    ``http_server.py``) rather than serving a diagnostic interface with a
+    login step nothing actually protects."""
+
     @property
     def database_configured(self) -> bool:
         return bool(self.readonly_database_url)
+
+    @property
+    def remote_auth_configured(self) -> bool:
+        return bool(self.public_url and self.owner_password)
 
 
 def get_settings() -> Settings:

@@ -7,10 +7,16 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Dependency layer first so source edits don't invalidate the pip cache.
+# `mcp` alongside `service`: one image, three roles (api/worker/arie-mcp,
+# picked by start command at deploy time, same as api vs worker already
+# are) rather than a second Dockerfile. Neither the api nor the worker
+# process ever imports anything under arie_mcp/, so this adds dependencies
+# to the image without changing either one's behavior.
 COPY pyproject.toml README.md ./
 RUN pip install --upgrade pip && \
     mkdir -p src/arie && touch src/arie/__init__.py && \
-    pip install -e ".[service]"
+    mkdir -p src/arie_mcp && touch src/arie_mcp/__init__.py && \
+    pip install -e ".[service,mcp]"
 
 COPY src/ src/
 COPY migrations/ migrations/

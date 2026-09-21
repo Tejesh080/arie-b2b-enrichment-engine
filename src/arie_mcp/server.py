@@ -1,7 +1,14 @@
-"""The stdio MCP server entrypoint.
+"""The stdio MCP server entrypoint, and the shared tool registry both
+transports serve.
 
-Launch: ``python -m arie_mcp.server``. Transport is stdio only in V0.1
-(spec § 5) — there is no network listener anywhere in this module.
+Launch: ``python -m arie_mcp.server``. This module's own ``main()`` is
+stdio-only (spec § 5) — no network listener, no auth, unchanged since V0.1.
+:func:`build_server` is what's shared: it registers all 11 read-only tools
+once, identically regardless of caller, and optionally accepts OAuth wiring
+that only the remote entrypoint (``arie_mcp.http_server``, a separate
+process/deployment) ever supplies — see that module for the Streamable HTTP
++ OAuth transport. Tool implementations are never duplicated between the two;
+only how a caller reaches them differs.
 
 Pool, settings, and the audit logger are built once in :func:`build_server`
 and captured by each tool's closure — a single-process, single-instance
@@ -14,9 +21,11 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
+from mcp.server.auth.provider import OAuthAuthorizationServerProvider, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 from psycopg_pool import ConnectionPool
@@ -58,14 +67,37 @@ _INSTRUCTIONS = (
 )
 
 
-def build_server(settings: Settings | None = None) -> MCPServer:
+def build_server(
+    settings: Settings | None = None,
+    *,
+    auth_server_provider: OAuthAuthorizationServerProvider[Any, Any, Any] | None = None,
+    token_verifier: TokenVerifier | None = None,
+    auth: AuthSettings | None = None,
+) -> MCPServer:
+    """Build the one tool registry both transports serve.
+
+    The 11 tools below are registered identically regardless of caller —
+    stdio (``main``, below) always calls this with every ``auth*`` argument
+    left at its default ``None``, exactly as before this parameter existed.
+    The remote Streamable HTTP entrypoint (``arie_mcp.http_server``) is the
+    only caller that ever passes them; nothing about *which* tools exist or
+    what they do changes with transport, only how — or whether — a caller
+    must authenticate to reach them.
+    """
     settings = settings or get_settings()
     audit_logger = AuditLogger(settings.audit_log_dir)
     pool: ConnectionPool | None = (
         db.build_pool(settings.readonly_database_url) if settings.database_configured else None
     )
 
-    mcp = MCPServer(name="arie-mcp", version=__version__, instructions=_INSTRUCTIONS)
+    mcp = MCPServer(
+        name="arie-mcp",
+        version=__version__,
+        instructions=_INSTRUCTIONS,
+        auth_server_provider=auth_server_provider,
+        token_verifier=token_verifier,
+        auth=auth,
+    )
 
     @mcp.tool(
         description=(

@@ -1,7 +1,7 @@
 # MCP engineering interface
 
-A local, stdio-only [Model Context Protocol](https://modelcontextprotocol.io)
-server (`src/arie_mcp/`) that gives Claude Code eleven read-only tools for
+A [Model Context Protocol](https://modelcontextprotocol.io) server
+(`src/arie_mcp/`) that gives an AI agent eleven read-only tools for
 inspecting this system's *runtime* state — job queue health, provider
 errors, enrichment spend, routing decisions, schema drift — without shelling
 out arbitrarily or being handed credentials wide enough to write anything.
@@ -9,9 +9,26 @@ Full design rationale lives in
 [specs/mcp-engineering-interface.md](../specs/mcp-engineering-interface.md);
 this document is the "what actually exists and how to use it" companion.
 
-> **Status.** V0.1, read-only, validated by a real Claude Code session
-> against a local development database (this document's examples are from
-> that session, not a mock). No state-changing tool exists yet — see
+**Two transports, one tool registry.** `arie_mcp.server.build_server()`
+registers all eleven tools exactly once; both entrypoints below call it —
+neither redefines a tool or its DB access.
+
+- **stdio** (`src/arie_mcp/server.py`, `python -m arie_mcp.server`) — local
+  only, no auth (nothing to authenticate: it's a subprocess Claude Code
+  itself launches and owns). Unchanged since V0.1.
+- **Streamable HTTP + OAuth** (`src/arie_mcp/http_server.py`, `python -m
+  arie_mcp.http_server`) — the remote transport, deployed as its own Railway
+  service (`arie-mcp`, alongside `arie-api` and `arie-worker` in the same
+  project — a third role on the same image, picked by Custom Start Command
+  exactly as the worker already is). See
+  [Remote transport](#remote-transport-streamable-http--oauth) below.
+
+> **Status.** V0.1, read-only. Originally validated stdio-only against a
+> local development database; the remote transport has since been added and
+> verified end-to-end (local OAuth + Streamable HTTP round trip, and against
+> the deployed Railway service with the production `arie_mcp_readonly` role)
+> — see [Remote transport](#remote-transport-streamable-http--oauth). No
+> state-changing tool exists in either transport — see
 > [Known limitations](#known-limitations).
 
 ---
@@ -133,6 +150,73 @@ interpolation exists precisely so it never has to hold one. Instead:
    `tests/mcp/conftest.py`'s `mcp_readonly_password` fixture generates and
    sets a random, session-scoped password on the disposable test database
    itself, every run.
+
+## Remote transport (Streamable HTTP + OAuth)
+
+The point of the remote transport is to reach these same eleven tools from
+an ordinary Claude conversation — Claude.ai, Desktop, mobile, or Cowork —
+added once as a **Custom Connector**, with no local process, no PowerShell,
+and no environment variable on the caller's own machine. Everything below
+is additional to stdio, not a replacement for it — `python -m
+arie_mcp.server` is unchanged and still the right choice for local
+Claude Code development.
+
+**Deployment.** A third Railway service, `arie-mcp`, in the same project as
+`arie-api` and `arie-worker` — same repo, same Dockerfile (now installing
+the `mcp` extra alongside `service` so one image serves all three roles),
+Custom Start Command `python -m arie_mcp.http_server`, Healthcheck Path
+`/healthz` (a bare liveness probe with no DB dependency and no auth — never
+`get_system_health`, which is an authenticated tool that queries the
+database and would take the whole service out of rotation over a transient
+DB hiccup). Neither `arie-api` nor `arie-worker` was touched to add this.
+
+**Database.** `MCP_READONLY_DATABASE_URL` on this service only, pointed at
+production's `arie_mcp_readonly` role (same role, same `mcp_diag`-only
+grants, same `default_transaction_read_only`/5s statement timeout as the
+local stdio setup above) — never `DATABASE_URL`. `arie_mcp.server
+.build_server()` is the single call site both transports use to open this
+connection; the remote entrypoint never opens a second one.
+
+**Authentication.** OAuth 2.1 with Dynamic Client Registration (RFC 7591)
+and PKCE (S256) — the mechanism Claude's own connector documentation
+recommends for a server with no existing multi-tenant client population,
+using the MCP Python SDK's own `mcp.server.auth` machinery (the real
+`/authorize`/`/token`/`/register`/`/revoke` routes and discovery metadata,
+not a hand-rolled protocol) rather than a bearer token or API key. One
+service, acting as both the OAuth authorization server and the resource
+server — the same "legacy combined AS+RS" shape the SDK's own bundled
+`examples/servers/simple-auth` reference uses, appropriate here because
+there is exactly one legitimate caller population (the server's owner, via
+Claude) rather than a multi-tenant client base that would justify splitting
+the two. `src/arie_mcp/auth.py` (`ArieOAuthProvider`) is the whole
+implementation:
+
+- **One password, no username** (`MCP_OWNER_PASSWORD`, no default — the
+  server refuses to start without it, loudly, rather than binding a public
+  port with nothing protecting it). Compared with `secrets.compare_digest`;
+  gated further by a per-source-IP rate limit (10 attempts/hour) on the
+  login endpoint.
+- **In-memory client/code/token storage.** Correct for one replica (this
+  service holds no product traffic and never scales horizontally) and
+  simplest to audit. A redeploy invalidates every session — Claude re-runs
+  DCR and the owner signs in again once; an inconvenience, not a
+  correctness gap.
+- **Refresh tokens, rotated.** Access tokens live one hour; refresh tokens
+  live 90 days and are rotated (old one invalidated, new one issued) on
+  every use, per OAuth 2.1's token-theft mitigation for public clients —
+  every DCR-registered client is one. Claude refreshes proactively (five
+  minutes before expiry) and reactively (on a 401), so a connected session
+  stays usable indefinitely without the owner repeating the consent flow.
+- **No write path, same as stdio.** The provider only ever issues tokens
+  scoped to reading the eleven existing tools; there is no code path here
+  that could authorize anything else, because nothing else exists to
+  authorize.
+
+**Endpoint:** `https://arie-mcp-production.up.railway.app/mcp` (Streamable
+HTTP). Login page at `/login`, OAuth discovery at
+`/.well-known/oauth-authorization-server` and
+`/.well-known/oauth-protected-resource`, both served automatically by the
+SDK's auth routes.
 
 ## Security boundary
 
