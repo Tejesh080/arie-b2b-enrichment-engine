@@ -3,7 +3,7 @@ transports serve.
 
 Launch: ``python -m arie_mcp.server``. This module's own ``main()`` is
 stdio-only (spec § 5) — no network listener, no auth, unchanged since V0.1.
-:func:`build_server` is what's shared: it registers all 11 read-only tools
+:func:`build_server` is what's shared: it registers all 13 read-only tools
 once, identically regardless of caller, and optionally accepts OAuth wiring
 that only the remote entrypoint (``arie_mcp.http_server``, a separate
 process/deployment) ever supplies — see that module for the Streamable HTTP
@@ -43,7 +43,9 @@ from arie_mcp.tools import (
     errors,
     health,
     jobs,
+    leads,
     migrations,
+    organizations,
     providers,
     routing,
 )
@@ -76,7 +78,7 @@ def build_server(
 ) -> MCPServer:
     """Build the one tool registry both transports serve.
 
-    The 11 tools below are registered identically regardless of caller —
+    The 13 tools below are registered identically regardless of caller —
     stdio (``main``, below) always calls this with every ``auth*`` argument
     left at its default ``None``, exactly as before this parameter existed.
     The remote Streamable HTTP entrypoint (``arie_mcp.http_server``) is the
@@ -286,7 +288,10 @@ def build_server(
         description=(
             "One provider's availability: whether it is currently inside a "
             "quota cooldown (and until when), recent call/error/cache-hit "
-            "counts, and last success/call times. organization_id scopes to "
+            "counts, and last success/call times. call_count here is every "
+            "consultation including cache hits (contrast get_enrichment_costs' "
+            "call_count, which counts only cost-bearing/non-cache-hit calls — "
+            "see each field's own description). organization_id scopes to "
             "one tenant; omit it for a global aggregate across all "
             "organizations. Never returns credentials or raw payloads."
         ),
@@ -318,6 +323,9 @@ def build_server(
         description=(
             "Provider-level enrichment cost rollup (cost_usd/credits_used/"
             "call_count/cache_hit_count), grouped by provider or by day. "
+            "call_count here excludes cache hits — it is cost-bearing calls "
+            "only (contrast inspect_provider_health's own call_count, which "
+            "includes cache hits — see each field's own description). "
             "Bounded to a 90-day maximum lookback regardless of `since`; "
             "defaults to the last 7 days. Optional provider/organization_id "
             "filters. No per-lead breakdown."
@@ -400,6 +408,80 @@ def build_server(
             settings=settings,
             audit_logger=audit_logger,
             input_payload={"organization_id": str(organization_id) if organization_id else None},
+        )
+
+    @mcp.tool(
+        description=(
+            "List organizations (tenants) so a caller can discover an "
+            "organization_id to pass to inspect_provider_health/"
+            "get_enrichment_costs/inspect_configuration/list_recent_leads "
+            "without already having one from outside MCP. Newest first, "
+            "capped at 50 rows regardless of the requested limit; "
+            "`truncated=true` means more rows exist beyond the cap. Each row: "
+            "organization_id, slug (a stable label — never the organization's "
+            "own business name), status, execution_mode, billing_plan, and a "
+            "lead_count/last_lead_created_at activity summary. No member, "
+            "billing-secret, or provider-secret field of any kind."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def list_organizations(
+        limit: Annotated[int, Field(ge=1, le=50)] = 20,
+    ) -> ToolResult:
+        async def _body() -> ToolOutcome:
+            return await organizations.list_organizations_impl(
+                pool, limit=limit, statement_timeout_ms=settings.db_statement_timeout_ms
+            )
+
+        return await run_tool(
+            "list_organizations",
+            _body,
+            settings=settings,
+            audit_logger=audit_logger,
+            input_payload={"limit": limit},
+        )
+
+    @mcp.tool(
+        description=(
+            "List recent leads so a caller can discover a lead_id to pass to "
+            "inspect_routing_decision without already having one from "
+            "outside MCP. Newest first, optionally filtered by "
+            "organization_id, capped at 50 rows regardless of the requested "
+            "limit; `truncated=true` means more rows exist beyond the cap. "
+            "Each row: lead_id, organization_id, status, is_shadow, "
+            "created_at/updated_at, that lead's decision_receipt scalar "
+            "fields where one exists (receipt_decision/receipt_autonomous/"
+            "receipt_confidence/receipt_score_value/receipt_score_lower/"
+            "receipt_score_upper/receipt_stop_reason — null if compute_score "
+            "never completed for this lead), and its most recent job's id/"
+            "status for chaining into inspect_job. Does not include "
+            "evidence_sufficiency (that verdict needs per-organization ICP "
+            "thresholds this tool does not resolve — use the score bounds' "
+            "width as a proxy) or any email/name/company/raw-evidence field."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def list_recent_leads(
+        organization_id: UUID | None = None,
+        limit: Annotated[int, Field(ge=1, le=50)] = 20,
+    ) -> ToolResult:
+        async def _body() -> ToolOutcome:
+            return await leads.list_recent_leads_impl(
+                pool,
+                organization_id=organization_id,
+                limit=limit,
+                statement_timeout_ms=settings.db_statement_timeout_ms,
+            )
+
+        return await run_tool(
+            "list_recent_leads",
+            _body,
+            settings=settings,
+            audit_logger=audit_logger,
+            input_payload={
+                "organization_id": str(organization_id) if organization_id else None,
+                "limit": limit,
+            },
         )
 
     return mcp

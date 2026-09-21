@@ -66,6 +66,13 @@ class ProviderHealth(BaseModel):
     cooling_down_until: datetime | None
     last_quota_error_at: datetime | None
     call_count: int
+    """Total provider *consultations*, cache hits included — every row in
+    provider_calls for this provider/scope, regardless of whether it cost
+    anything. Compare get_enrichment_costs' own call_count, which counts only
+    the subset that was NOT a cache hit (cost-bearing activity). The two are
+    intentionally different questions ("was this provider consulted" vs "did
+    consulting it cost money"), not disagreeing measurements of one thing —
+    cache_hit_count is consistent between both tools."""
     error_count: int
     error_rate: float | None
     cache_hit_count: int

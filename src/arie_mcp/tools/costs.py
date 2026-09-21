@@ -28,6 +28,12 @@ class CostRollupRow(BaseModel):
     cost_usd: float
     credits_used: float | None
     call_count: int
+    """Cost-bearing calls only — cache hits are excluded (a cache hit does
+    not invoke the vendor and is reported separately in cache_hit_count).
+    Compare inspect_provider_health's own call_count, which counts every
+    consultation including cache hits — the two tools answer different
+    questions ("did this cost money" vs "was this provider consulted at
+    all"), not disagreeing measurements of the same thing."""
     cache_hit_count: int
 
 
