@@ -2,7 +2,8 @@
 
 Interview-ready framing for this project — what to say, in how much time, and
 what not to claim. Every number here is pulled from
-[`README.md`](../README.md), [`benchmark.md`](benchmark.md#results), and
+[`README.md`](../README.md), [`benchmark.md`](benchmark.md#results),
+[`case-study-realistic-pilot.md`](case-study-realistic-pilot.md), and
 [`deployment.md`](deployment.md), not restated from memory; if any of those
 change, this page is stale until it's updated to match.
 
@@ -20,14 +21,18 @@ change, this page is stale until it's updated to match.
 > side, permanently. When the evidence genuinely isn't enough, it says so
 > rather than defaulting to a false "no."
 >
-> I validated it two ways. A 10-seed synthetic benchmark, honestly reported —
+> I validated it three ways. A 10-seed synthetic benchmark, honestly reported —
 > including where my founding hypothesis, expected-value-of-information
-> reasoning, lost to a much simpler policy. And a small real-money live run
-> against real vendors in a disposable, fully isolated environment, where it
-> caught and correctly suppressed a real vendor sending back the wrong
-> person's data. Live autonomous action on real-provider evidence stays
-> hard-disabled in code until that's been validated at more than three leads —
-> that's a deliberate line, not a gap I missed.
+> reasoning, lost to a much simpler policy. A 140-real-company pilot through
+> the actual production pipeline, which reduced modeled spend 36.6-48.9%
+> versus two baselines at 93.6% decision agreement — then a blinded review of
+> those same companies' real-world fit that found a 30% disagreement rate and
+> traced it to exactly how simulated evidence gets generated. And a small
+> real-money live run against real vendors in a disposable, fully isolated
+> environment, where it caught and correctly suppressed a real vendor sending
+> back the wrong person's data. Live autonomous action on real-provider
+> evidence stays hard-disabled in code until that's been validated at far more
+> than a handful of leads — that's a deliberate line, not a gap I missed.
 
 ---
 
@@ -95,6 +100,13 @@ Single-tenant proof, no paying customer yet.
 Pick the ones that fit the role. All are load-bearing on the actual repo —
 verify against current code/docs before using if this page is old.
 
+- Built and rigorously evaluated a cost-aware B2B lead-scoring engine on 140
+  real companies through its production pipeline — 36-49% lower modeled
+  enrichment spend than baseline strategies at 93.6% decision agreement,
+  verified via exact (140/140) reproduction against real receipts — then
+  designed blinded and live-provider validations that surfaced and honestly
+  reported a real-world accuracy gap the initial metrics alone would have
+  hidden.
 - Designed and benchmarked a cost-aware lead-enrichment stopping policy
   against a synthetic ground-truth dataset (10 seeds, 300 held-out leads per
   seed), then selected the policy that actually won on a pre-registered bar
@@ -173,6 +185,31 @@ acquisition, real cost if a live provider is enabled, a real
 (`SHADOW_EVALUATED`) instead of an authoritative branch, and never opens a
 human review. Pipeline metrics explicitly exclude shadow leads.
 
+**What did the 140-company realistic pilot actually prove, and what didn't it?**
+It proved the acquisition/stopping economics are real on real company
+identities running through the real production pipeline, not just synthetic
+benchmark leads: 36.6% less modeled spend than a tuned waterfall, 48.9% less
+than full enrichment, 93.6% decision agreement with both, reproduced 140/140
+exactly against real production receipts before any number was trusted. It
+did **not** prove real-world lead-ranking accuracy — a follow-up blinded
+review of the same companies found a 30% stark-disagreement rate with
+independently-researched company fit, traced to exactly how ARIE's simulated
+evidence is generated for any company outside its benchmark corpus. Full
+write-up: [case-study-realistic-pilot.md](case-study-realistic-pilot.md).
+
+**Did real Abstract/Hunter evidence fix the accuracy gap the pilot found?**
+Not in the small reality-check sample (8 leads). In a small named-contact
+diagnostic, Hunter Combined produced usable title evidence for only one of
+four contacts; correct matches were identity-consistent, suggesting the
+observed limitation was evidence availability/coverage rather than
+wrong-person matching — a larger provider benchmark would be needed before
+selecting or rejecting Hunter for production use. Separately, Abstract
+usually returned company evidence, but several outputs conflicted materially
+with independently researched company facts, and ARIE currently lacks a
+company-level identity/consistency gate analogous to its person-evidence
+identity checks. Neither finding is a population-level provider verdict —
+both samples are 4-8 contacts.
+
 **What did the real-provider validation actually prove, and what didn't it?**
 It proved the live architecture is wired correctly end to end — real BYOK
 credentials resolved per organization, real vendor calls made and cost
@@ -215,6 +252,23 @@ testing beyond five concurrent submissions.
 
 **Safe claims**
 
+- A 140-real-company pilot through ARIE's actual production pipeline (real
+  org, real ICP confirmation, real CSV upload, real job queue, real Decision
+  Receipts): 36.6% less modeled enrichment spend than a tuned waterfall,
+  48.9% less than full enrichment, 93.6% decision agreement with both,
+  reproduced 140/140 exactly against real production receipts before any
+  number was trusted. These are modeled/simulated-evidence economics, not a
+  real-world accuracy claim.
+- A follow-up blinded review of the same 140 companies (30 sampled by ARIE's
+  own output tiers, independently fit-assessed from public information)
+  found a 30% stark-disagreement rate with real-world company fit — reported
+  as a genuine product limitation, traced to a specific, diagnosed mechanism
+  in how simulated evidence is generated, not hidden or minimized.
+- A real Abstract + Hunter live-shadow reality check (8 leads, real provider
+  calls, all external actions safety-disabled, all outcomes
+  `SHADOW_EVALUATED`) plus targeted, code-level Hunter diagnostics, both
+  reported at their true small sample size with no population-level provider
+  claim drawn from either.
 - A synthetic benchmark, honestly reported across 10 seeds, showing a
   calibrated two-rule stopping policy cuts modeled API spend ~41.6% versus a
   tuned waterfall baseline, at a measured ~2.3pp agreement cost — selected
@@ -263,3 +317,22 @@ testing beyond five concurrent submissions.
 - "ARIE autonomously qualifies real leads" — it does not, and is blocked in
   code from doing so. A lead enriched by a real provider always ends at a
   human. See [provider-integration.md](provider-integration.md).
+- "The 140-company pilot proves ARIE ranks real leads correctly" — the
+  opposite is closer to true: the blinded review found a 30% stark
+  disagreement with real-world fit, and the 93.6%/36.6%/48.9% figures are
+  modeled-evidence economics, not an accuracy claim. The two must never be
+  blended into one "ARIE works" statement.
+- "Hunter is bad" or "Hunter only has 25% coverage" — the sample is far too
+  small (4-8 contacts) to support a provider verdict either way. Say instead:
+  *"In a small named-contact diagnostic, Hunter Combined produced usable
+  title evidence for only one of four contacts. Correct matches were
+  identity-consistent, suggesting the observed limitation was evidence
+  availability/coverage rather than wrong-person matching. A larger provider
+  benchmark would be required before selecting or rejecting Hunter for
+  production use."*
+- Any claim that Abstract's company data is generally unreliable from the
+  live-shadow sample — say instead: *"In the small live-shadow sample,
+  Abstract usually returned company evidence, but several outputs conflicted
+  materially with independently researched company facts. ARIE currently
+  lacks a company-level identity/consistency gate analogous to its
+  person-evidence identity checks."*

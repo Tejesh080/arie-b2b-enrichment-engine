@@ -191,6 +191,37 @@ Method, dataset design and every parameter assumption:
 
 ---
 
+## Realistic pilot: 140 real companies
+
+A third kind of evidence, larger than the n=3 real-provider validation above
+and closer to real usage than the synthetic benchmark: 140 real, named
+companies run through ARIE's actual production API — real org, real
+ICP-confirmation flow, real CSV upload, real job queue, real Decision
+Receipts — evaluating the full "buy only what's necessary" thesis end to end,
+not just the policy in isolation.
+
+**Reduced modeled enrichment spend 36.6% versus a tuned waterfall and 48.9%
+versus full enrichment across the 140-company set, at 93.6% policy-decision
+agreement with both** — reproduced 140/140 exactly against real production
+receipts in an offline replay before any number was trusted. 55% of leads
+stopped before the full evidence cascade; 16.4% escalated to human review.
+
+These are modeled/simulated-evidence economics, not a real-world accuracy
+claim. A follow-up blinded review of 30 companies — independently
+fit-assessed from public information, sampled by ARIE's own output tiers —
+found a 30% stark-disagreement rate with real-world company fit, traced to
+exactly how simulated evidence is generated for any company outside ARIE's
+benchmark corpus. A further real-provider (Abstract + Hunter) live-shadow
+reality check on 8 of those companies, and a set of code-level Hunter
+diagnostics, investigated whether real evidence closes that gap and
+surfaced specific, honestly-reported provider-coverage and
+company-identity-validation limitations rather than resolving it.
+
+Full write-up, including what didn't hold up and why:
+[case-study-realistic-pilot.md](docs/case-study-realistic-pilot.md).
+
+---
+
 ## Engineering depth
 
 - **Postgres `SKIP LOCKED` job queue**, no Redis/Celery/Temporal — a worker
@@ -342,6 +373,7 @@ the frozen corpus, and prints their receipts.
 |---|---|
 | [architecture.md](docs/architecture.md) | How it works, the invariants, what's where in the code |
 | [benchmark.md](docs/benchmark.md) | Dataset design, measured results, every assumption |
+| [case-study-realistic-pilot.md](docs/case-study-realistic-pilot.md) | 140 real companies through the real pipeline, a blinded human-fit review, and a real-provider reality check |
 | [deployment.md](docs/deployment.md) | Hosted topology, config, migrations, rollback |
 | [provider-integration.md](docs/provider-integration.md) | The real adapters, live verification status, and shadow mode |
 | [mcp-architecture.md](docs/mcp-architecture.md) | The read-only MCP engineering interface Claude Code connects to |
