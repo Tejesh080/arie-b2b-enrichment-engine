@@ -236,7 +236,7 @@ Two of the surfaces this shows up in, beyond the core decision loop:
 
 | Ask ARIE | Find Customers |
 |---|---|
-| ![Ask ARIE answering "show my best leads" with a grounded list pulled from already-decided leads, not a chat completion](docs/assets/ask-arie.png) | ![Find Customers showing a populated opportunity list with a fit score, verified-website evidence, and a named contact per candidate](docs/assets/find-customers.png) |
+| ![Ask ARIE answering a plain-English question with a grounded list pulled from already-decided leads, not a chat completion](docs/assets/ask-arie.png) | ![Find Customers showing a populated opportunity list with a fit score, verified-website evidence, and a named contact per candidate](docs/assets/find-customers.png) |
 | Plain-English questions answered from what ARIE already decided — never a re-score. | Discovery Pivot: the same evidence discipline pointed upstream, screening candidates before spending. |
 
 ---
