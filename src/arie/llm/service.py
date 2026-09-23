@@ -290,7 +290,7 @@ class LLMService:
             provider.model,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-        )
+        ) + provider.estimate_guardrail_cost_usd(guarded_chars=len(rendered))
         return per_attempt * max(1, self._config.max_attempts)
 
     def _record(
@@ -321,11 +321,27 @@ class LLMService:
             if not attempt.billable:
                 continue
             key = f"{idempotency_key}:attempt{index}" if idempotency_key else None
+            # `cost_usd` is passed only when there is guardrail spend the
+            # token-derived price would miss. Omitting it otherwise keeps every
+            # existing provider on the ledger's own arithmetic, unchanged —
+            # and keeps this from becoming a second place that prices tokens.
+            guardrail_spend = attempt.usage.guardrail_cost_usd
+            total_cost = (
+                model_call_cost_usd(
+                    outcome.model,
+                    prompt_tokens=attempt.usage.prompt_tokens,
+                    completion_tokens=attempt.usage.completion_tokens,
+                )
+                + guardrail_spend
+                if guardrail_spend
+                else None
+            )
             write = self._ledger.record_model_call(
                 model=outcome.model,
                 purpose=str(purpose),
                 prompt_tokens=attempt.usage.prompt_tokens,
                 completion_tokens=attempt.usage.completion_tokens,
+                cost_usd=total_cost,
                 organization_id=organization_id,
                 lead_id=lead_id,
                 latency_ms=attempt.latency_ms,

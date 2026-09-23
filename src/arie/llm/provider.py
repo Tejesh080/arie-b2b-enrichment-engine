@@ -43,6 +43,7 @@ from arie.ledger.pricing import model_call_cost_usd
 
 __all__ = [
     "LLMCompletion",
+    "LLMGuardrailInterventionError",
     "LLMMessage",
     "LLMProvider",
     "LLMProviderError",
@@ -122,10 +123,31 @@ class LLMUsage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
 
+    guardrail_text_units: int = 0
+    """Billable Bedrock guardrail text units consumed by this call, summed
+    across every policy that assessed it (``arie.ledger.pricing``).
+
+    Zero for every provider that has no guardrail, which is every provider but
+    ``bedrock`` — so this field changes no existing accounting. It is carried
+    on *usage* rather than derived later because it is a vendor-reported
+    quantity, exactly like a token count, and because it has to survive being
+    summed across the attempts of one structured generation."""
+
+    guardrail_cost_usd: Decimal = Decimal(0)
+    """What :attr:`guardrail_text_units` cost, priced per policy at the point
+    the per-policy counts were still available.
+
+    Money rather than units because the four policies bill at different rates,
+    and collapsing them to a single unit count before pricing would lose the
+    information needed to price them correctly. Kept alongside the raw total so
+    a cost view can show both "how much was assessed" and "what it cost"."""
+
     def __add__(self, other: LLMUsage) -> LLMUsage:
         return LLMUsage(
             prompt_tokens=self.prompt_tokens + other.prompt_tokens,
             completion_tokens=self.completion_tokens + other.completion_tokens,
+            guardrail_text_units=self.guardrail_text_units + other.guardrail_text_units,
+            guardrail_cost_usd=self.guardrail_cost_usd + other.guardrail_cost_usd,
         )
 
 
@@ -163,7 +185,17 @@ class LLMProviderError(RuntimeError):
     reaches the provider as an ``Authorization`` header and is not otherwise
     held in a formattable position — ``tests/unit/test_llm_provider.py`` pins
     that.
+
+    ``usage`` is set only by a provider that knows the failed call was *billed*
+    and knows what it consumed — today, a Bedrock guardrail intervention, where
+    AWS charges for the assessment that did the blocking. It defaults to
+    ``None``, meaning "nothing to ledger", which is what every existing raise
+    site means and why they did not have to change.
     """
+
+    def __init__(self, message: str, *, usage: LLMUsage | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage
 
 
 class LLMTransportError(LLMProviderError):
@@ -180,6 +212,23 @@ class LLMResponseError(LLMProviderError):
     The vendor billed for it. The caller is expected to ledger the attempt
     anyway where token counts are known — the same rule
     ``arie.llm.deepseek.ExtractionAttempt`` applies, for the same reason.
+    """
+
+
+class LLMGuardrailInterventionError(LLMResponseError):
+    """A content guardrail blocked the request or the response.
+
+    Not a model failure and not a transport failure: the vendor worked exactly
+    as configured. It is a :class:`LLMResponseError` because no usable
+    completion came back, and it is its own type because the caller's correct
+    reaction differs in one way that matters — **it must not be retried**. A
+    repair retry resends the same customer input to the same guardrail for the
+    same verdict, so retrying buys a second bill and no new information.
+    ``arie.llm.structured`` treats it as terminal for that reason.
+
+    Carries :attr:`LLMProviderError.usage` so the blocked attempt's guardrail
+    spend still reaches the ledger. A guardrail that quietly blocked traffic
+    for free in every cost view would be the most expensive kind of invisible.
     """
 
 
@@ -267,11 +316,26 @@ class LLMProvider(ABC):
         than returning zero — see that module for why a free fallback is worse
         than a failure.
         """
-        return model_call_cost_usd(
-            self.model,
-            prompt_tokens=usage.prompt_tokens,
-            completion_tokens=usage.completion_tokens,
+        return (
+            model_call_cost_usd(
+                self.model,
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+            )
+            + usage.guardrail_cost_usd
         )
+
+    def estimate_guardrail_cost_usd(self, *, guarded_chars: int) -> Decimal:
+        """Pessimistic guardrail cost for a call about to send `guarded_chars`.
+
+        Zero for every provider without a guardrail, so the pre-call estimate
+        in ``arie.llm.service`` is unchanged for all of them. Bedrock overrides
+        it because its guardrail can cost an order of magnitude more than the
+        model call it protects, and a budget that counted only tokens would
+        authorize spend it had not measured — which is the one thing
+        ``authorize_llm_call`` exists to prevent.
+        """
+        return Decimal(0)
 
     def close(self) -> None:
         """Release any transport resource. Idempotent; default is a no-op."""

@@ -56,6 +56,7 @@ from pydantic import BaseModel, ValidationError
 from arie.config import INTELLIGENCE, IntelligenceConfig
 from arie.llm.provider import (
     LLMCompletion,
+    LLMGuardrailInterventionError,
     LLMMessage,
     LLMProvider,
     LLMProviderError,
@@ -72,6 +73,7 @@ __all__ = [
     "generate_structured",
     "render_untrusted",
     "sanitize_untrusted",
+    "strip_code_fence",
 ]
 
 _TRACER = get_tracer("arie.llm.structured")
@@ -250,6 +252,36 @@ def render_untrusted(blocks: Sequence[UntrustedBlock], *, max_chars: int) -> tup
     return "\n\n".join(parts), truncated
 
 
+_CODE_FENCE = re.compile(
+    r"\A```[a-zA-Z0-9_+-]*[ \t]*\r?\n(?P<body>.*?)\r?\n?[ \t]*```\Z", re.DOTALL
+)
+"""A whole response that is one markdown code fence, with an optional language
+tag. Anchored at both ends on purpose: this unwraps an envelope, it does not
+hunt for JSON inside prose. A model that wrote a paragraph and then a fenced
+example has not answered the question, and silently extracting the example
+would turn "the model ignored the schema" into a plausible wrong answer."""
+
+
+def strip_code_fence(text: str) -> str:
+    """Unwrap a response that is entirely a markdown code fence.
+
+    Every provider's instructions say "no markdown code fences", and this
+    exists because saying so is not sufficient. On the Ask ARIE benchmark
+    ``google.gemma-3-4b-it`` fenced **every** response — the JSON inside was
+    correct and the intent was usually right, but first-attempt validity was
+    0% until the envelope was removed, and each failure bought a repair retry
+    at full price. ``amazon.nova-micro-v1:0`` never fences, so this is a no-op
+    for the default model and insurance against the next one.
+
+    Stripping here rather than in a provider keeps it true for every vendor at
+    once, and keeps :func:`generate_structured`'s promise that validation
+    happens exactly once, in one place.
+    """
+    stripped = text.strip()
+    match = _CODE_FENCE.match(stripped)
+    return match.group("body").strip() if match else stripped
+
+
 def _repair_note(error: str) -> str:
     # ARIE's own error text, never the model's — this is a system message, and
     # echoing model-authored prose back into the instruction layer would be a
@@ -335,14 +367,31 @@ def generate_structured(
                 continue
             except LLMProviderError as exc:
                 # LLMResponseError and anything else a provider defines. A
-                # completion may have been billed, but the provider could not
-                # read token counts out of it, so there is nothing to ledger.
+                # completion may have been billed, but the provider usually
+                # could not read token counts out of it, so there is nothing to
+                # ledger — `usage` stays None and the attempt is non-billable,
+                # exactly as before. A provider that *does* know what a failed
+                # call consumed (a Bedrock guardrail intervention, where AWS
+                # charges for the assessment that blocked it) attaches it, and
+                # that spend reaches the ledger rather than vanishing.
                 failure = f"provider: {exc}"
+                billed = exc.usage
                 attempts.append(
                     StructuredAttempt(
-                        usage=LLMUsage(), latency_ms=0.0, billable=False, error=failure
+                        usage=billed or LLMUsage(),
+                        latency_ms=0.0,
+                        billable=billed is not None,
+                        error=failure,
                     )
                 )
+                if isinstance(exc, LLMGuardrailInterventionError):
+                    # Terminal, not retryable. The repair note changes ARIE's
+                    # instructions, never the customer's question, so a second
+                    # attempt sends the same blocked input to the same
+                    # guardrail for the same verdict — buying one more
+                    # assessment and no new information.
+                    span.add_event("llm.structured.guardrail_intervened")
+                    break
                 continue
 
             parsed, error = _validate(completion, model_type)
@@ -393,7 +442,7 @@ def _validate(completion: LLMCompletion, model_type: type[T]) -> tuple[T | None,
         return None, (
             "the response was cut off at the output-token limit, so its JSON is incomplete"
         )
-    text = completion.text.strip()
+    text = strip_code_fence(completion.text)
     if not text:
         return None, "the model returned an empty response"
     try:
@@ -402,8 +451,7 @@ def _validate(completion: LLMCompletion, model_type: type[T]) -> tuple[T | None,
         return None, f"schema validation failed: {exc.errors(include_url=False)}"
     except ValueError as exc:
         # model_validate_json raises ValueError for a body that is not JSON at
-        # all — a model that answered in prose, or wrapped the object in a
-        # markdown fence despite being told not to.
+        # all — a model that answered in prose, for instance.
         return None, f"response was not valid JSON: {exc}"
 
 

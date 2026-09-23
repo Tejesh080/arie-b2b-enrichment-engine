@@ -97,7 +97,105 @@ MODEL_PRICES: dict[str, ModelPrice] = {
         usd_per_1m_input_tokens=Decimal("0"),
         usd_per_1m_output_tokens=Decimal("0"),
     ),
+    # Amazon Bedrock, us-east-1, standard on-demand. Unlike every other entry
+    # in this table these figures were read from the AWS Price List API
+    # (`aws pricing get-products --service-code AmazonBedrock`, usagetype
+    # `USE1-NovaMicro-*` / `USE1-Gemma-3-4B-IT-*`, effective 2026-09-01) rather
+    # than transcribed from a pricing page — but they are still *list* prices,
+    # so the warning at the top of this module applies unchanged. Batch, flex
+    # and priority tiers are cheaper/dearer and are deliberately not modelled:
+    # ARIE issues ordinary synchronous Converse calls only.
+    #
+    # Nova Micro is the Ask ARIE default (`DEFAULT_BEDROCK_MODEL`). Note the
+    # shape: cheaper input than Gemma, dearer output. That favours ARIE, whose
+    # copilot calls are ~1,400 input tokens against ~20 output.
+    "amazon.nova-micro-v1:0": ModelPrice(
+        model="amazon.nova-micro-v1:0",
+        tier="cheap",
+        usd_per_1m_input_tokens=Decimal("0.035"),
+        usd_per_1m_output_tokens=Decimal("0.14"),
+    ),
+    # Retained, though not the default, so the benchmark that chose Nova over
+    # it stays runnable — see `arie.llm.bedrock_provider.BEDROCK_MODELS`.
+    "google.gemma-3-4b-it": ModelPrice(
+        model="google.gemma-3-4b-it",
+        tier="cheap",
+        usd_per_1m_input_tokens=Decimal("0.04"),
+        usd_per_1m_output_tokens=Decimal("0.08"),
+    ),
 }
+
+GUARDRAIL_TEXT_UNIT_CHARS = 1_000
+"""Characters per billable Bedrock guardrail "text unit", rounded up.
+
+A guardrail is **not** billed by tokens, which is why it cannot be folded into
+:class:`ModelPrice` and why this module grew a second pricing concept rather
+than a third model entry."""
+
+GUARDRAIL_UNIT_PRICES: dict[str, Decimal] = {
+    "topic": Decimal("0.00015"),
+    "content": Decimal("0.00015"),
+    "sensitive_information": Decimal("0.00010"),
+    "contextual_grounding": Decimal("0.00010"),
+    "word": Decimal("0"),
+}
+"""USD per text unit, per policy, us-east-1 — from the AWS Price List API
+(``USE1-Guardrail-*UnitsConsumed``, effective 2026-09-01).
+
+``word`` is genuinely $0.00 (AWS does not charge for word policies), which is
+the one place in this module a zero is a real price rather than a missing one —
+the same named-exception reasoning ``fake-llm`` gets above.
+
+These rates matter more than their size suggests. On an Ask ARIE intent
+classification the guardrail costs roughly **sixteen times** the model call it
+protects, so a cost model that counted only tokens would be wrong by an order
+of magnitude in the direction that hides spend."""
+
+
+def guardrail_cost_usd(
+    *,
+    topic_units: int = 0,
+    content_units: int = 0,
+    sensitive_information_units: int = 0,
+    contextual_grounding_units: int = 0,
+    word_units: int = 0,
+) -> Decimal:
+    """What one guardrail application cost, from its per-policy unit counts.
+
+    Counts come from Bedrock's own ``invocationMetrics.usage`` block, so this
+    is arithmetic over *reported* usage against a list price — the same
+    derived-not-measured status every model cost in this module has.
+
+    Raises ``ValueError`` on a negative count, matching
+    :meth:`ModelPrice.cost_usd`: a negative unit count is a parsing bug, and
+    silently pricing it as a credit would understate spend.
+    """
+    counts = {
+        "topic": topic_units,
+        "content": content_units,
+        "sensitive_information": sensitive_information_units,
+        "contextual_grounding": contextual_grounding_units,
+        "word": word_units,
+    }
+    negative = {name: n for name, n in counts.items() if n < 0}
+    if negative:
+        raise ValueError(f"guardrail unit counts must be non-negative, got {negative}")
+    return sum(
+        (GUARDRAIL_UNIT_PRICES[name] * Decimal(n) for name, n in counts.items()),
+        Decimal(0),
+    )
+
+
+def estimated_guardrail_units(chars: int) -> int:
+    """Billable text units for `chars` characters of guarded content.
+
+    Rounded **up**, and at least one unit for any non-empty content: a 12-
+    character question is billed as a whole unit, and an estimate that rounded
+    down would promise a budget it cannot keep.
+    """
+    if chars <= 0:
+        return 0
+    return -(-chars // GUARDRAIL_TEXT_UNIT_CHARS)
 
 
 def price_for(model: str) -> ModelPrice:

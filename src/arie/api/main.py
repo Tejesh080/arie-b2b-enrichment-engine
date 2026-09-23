@@ -248,6 +248,7 @@ from arie.limits import (
 )
 from arie.live.outcome_cache import ProviderOutcomeGuard
 from arie.llm.budget import LLMBudgetReason
+from arie.llm.factory import copilot_config
 from arie.llm.service import LLMService
 from arie.members import (
     CannotActOnSelfError,
@@ -463,6 +464,26 @@ def get_llm_service(state: StateDep) -> LLMService:
 
 
 LLMServiceDep = Annotated[LLMService, Depends(get_llm_service)]
+
+
+def get_copilot_llm_service(state: StateDep) -> LLMService:
+    """Model access for Ask ARIE, which may be pinned to a different provider.
+
+    Identical to :func:`get_llm_service` unless ``COPILOT_LLM_PROVIDER`` is
+    set — ``arie.llm.factory.copilot_config`` returns the deployment config
+    unchanged when it is not, so an unset deployment has one provider and one
+    code path exactly as before.
+
+    A second dependency rather than a branch inside the first, because the
+    override must reach *only* the two copilot routes. CSV mapping, research
+    planning, targeting and discovery screening keep ``LLM_PROVIDER``, which is
+    what makes this experiment reversible by unsetting one variable rather than
+    by remembering which features were migrated.
+    """
+    return LLMService(state.pool, config=copilot_config())
+
+
+CopilotLLMServiceDep = Annotated[LLMService, Depends(get_copilot_llm_service)]
 
 
 def _extract_bearer_token(request: Request) -> str:
@@ -1267,7 +1288,7 @@ def register_routes(app: FastAPI) -> None:
 
     @app.post("/copilot/query", response_model=CopilotResponseSchema)
     def post_copilot_query(
-        payload: CopilotQueryRequest, state: StateDep, auth: AuthDep, llm: LLMServiceDep
+        payload: CopilotQueryRequest, state: StateDep, auth: AuthDep, llm: CopilotLLMServiceDep
     ) -> CopilotResponseSchema:
         _require_jwt_session(auth)
         assert auth.user_id is not None  # guaranteed by the JWT check above
@@ -1288,7 +1309,7 @@ def register_routes(app: FastAPI) -> None:
         payload: LeadCopilotRequest,
         state: StateDep,
         auth: AuthDep,
-        llm: LLMServiceDep,
+        llm: CopilotLLMServiceDep,
     ) -> LeadCopilotResponseSchema:
         _require_jwt_session(auth)
         with state.pool.connection() as conn:

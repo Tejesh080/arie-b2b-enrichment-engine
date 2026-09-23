@@ -327,6 +327,104 @@ class IntelligenceConfig:
     the truncation is enforced at the prompt-rendering boundary, so no caller
     can forget it."""
 
+    copilot_provider: str = field(
+        default_factory=lambda: os.getenv("COPILOT_LLM_PROVIDER", "").strip()
+    )
+    """Provider override for Ask ARIE only (``arie.copilot_service``), or ``""``
+    for "no override".
+
+    Deliberately not a global switch. The Bedrock work is an experiment scoped
+    to one surface, and an experiment that silently moved CSV mapping, research
+    planning and discovery screening onto a new vendor at the same time would
+    not be reversible by changing one variable back. Empty is the default and
+    means every workload — copilot included — keeps using
+    :attr:`provider`, so an unset deployment behaves exactly as it did before
+    this field existed. See ``arie.llm.factory.copilot_config``."""
+
+    copilot_model: str = field(default_factory=lambda: os.getenv("COPILOT_LLM_MODEL", "").strip())
+    """Model for the copilot override. Ignored unless
+    :attr:`copilot_provider` is set. Empty means "the override provider's own
+    default model" (:data:`arie.llm.bedrock_provider.DEFAULT_BEDROCK_MODEL` for
+    Bedrock) rather than :attr:`model`, because :attr:`model` names a model of
+    the *global* provider and would be meaningless — and unpriceable — on a
+    different vendor."""
+
+    bedrock_region: str = field(
+        default_factory=lambda: os.getenv("BEDROCK_REGION", "us-east-1").strip()
+    )
+    """AWS region for ``bedrock-runtime``. Separate from any other AWS setting
+    because model availability is regional: a guardrail and a foundation model
+    must live in the same region as the client calling them."""
+
+    bedrock_guardrail_id: str = field(
+        default_factory=lambda: os.getenv("BEDROCK_GUARDRAIL_ID", "").strip()
+    )
+    """The guardrail applied to customer-authored input. Empty disables
+    guardrailing entirely — which is a *development* convenience (it makes the
+    provider exercisable against a bare model), never a production posture."""
+
+    bedrock_guardrail_version: str = field(
+        default_factory=lambda: os.getenv("BEDROCK_GUARDRAIL_VERSION", "1").strip()
+    )
+    """Defaults to the immutable numbered version, not ``DRAFT``.
+
+    ``DRAFT`` is mutable: an edit in the AWS console changes what production
+    enforces with no deploy, no review and no audit trail. Version ``1`` was
+    cut on 2026-09-23 from the DRAFT that the guardrail suite validated — 2
+    topics, 6 content filters, 10 PII entities, no regexes — and cannot change
+    afterwards. ``DRAFT`` remains selectable via the environment for iterating
+    on policy changes, which is the only thing it should ever be used for."""
+
+    bedrock_guarded_labels: tuple[str, ...] = field(
+        default_factory=lambda: tuple(
+            part.strip().lower()
+            for part in os.getenv("BEDROCK_GUARDED_LABELS", "question").split(",")
+            if part.strip()
+        )
+    )
+    """Which ``arie.llm.structured.UntrustedBlock`` labels are submitted to the
+    guardrail, by slug.
+
+    Default ``("question",)`` — the customer's own words, which is the only
+    content in an Ask ARIE prompt that an attacker authors. ARIE's evidence
+    block is deliberately **not** guarded: it is tenant-scoped data this
+    organization is already authorized to read, and the guardrail's PII policy
+    would ``ANONYMIZE`` the contact names and email addresses that answering
+    the question depends on. Guarding it would not make ARIE safer; it would
+    make ARIE wrong. See ``arie.llm.bedrock_provider`` for how the selection is
+    applied, and note that an empty selection suppresses ``guardrailConfig``
+    altogether rather than falling back to guarding everything."""
+
+    agentcore_runtime_url: str = field(
+        default_factory=lambda: os.getenv("AGENTCORE_RUNTIME_URL", "").strip()
+    )
+    """The Decision Copilot Runtime's HTTPS invocation URL.
+
+    Configuration rather than a constructed ARN path: the URL embeds the
+    runtime ARN and an endpoint qualifier, and a deployment that redeploys the
+    runtime should change one variable rather than a code path."""
+
+    agentcore_token_url: str = field(
+        default_factory=lambda: os.getenv("AGENTCORE_TOKEN_URL", "").strip()
+    )
+    """Cognito's ``/oauth2/token`` endpoint for the machine-to-machine client."""
+
+    agentcore_client_id: str = field(
+        default_factory=lambda: os.getenv("AGENTCORE_CLIENT_ID", "").strip()
+    )
+    agentcore_client_secret: str = field(
+        default_factory=lambda: os.getenv("AGENTCORE_CLIENT_SECRET", "")
+    )
+    """The M2M client secret. Not an AWS credential: it mints tokens for exactly
+    one resource server and grants nothing else in the account. It is still a
+    long-lived secret and belongs in the platform's encrypted variable store,
+    never in the repository. Deliberately not ``.strip()``-ed — trimming a
+    secret would silently change it."""
+
+    agentcore_scope: str = field(
+        default_factory=lambda: os.getenv("AGENTCORE_SCOPE", "arie-copilot/invoke").strip()
+    )
+
     @property
     def configured(self) -> bool:
         """True when a real model can actually be called.
@@ -338,6 +436,17 @@ class IntelligenceConfig:
             return True
         if self.provider == "none":
             return False
+        if self.provider == "agentcore":
+            # The Runtime holds the AWS credentials; this side needs only the
+            # M2M client secret, so "configured" means the client is wired.
+            return bool(self.agentcore_runtime_url and self.agentcore_client_secret)
+        if self.provider == "bedrock":
+            # No API key: boto3 resolves credentials from the ambient chain
+            # (instance role, env, AWS_PROFILE). "Configured" here means "a
+            # provider can be constructed"; whether the chain actually yields
+            # usable credentials is discovered on the first call and arrives as
+            # a transport failure, which every caller already degrades on.
+            return True
         return bool(self.api_key)
 
 

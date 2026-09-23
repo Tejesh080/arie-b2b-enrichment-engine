@@ -31,6 +31,7 @@ service = [
     "pyjwt[crypto]>=2.8",  # [crypto] pulls in `cryptography`, required for ES256 (Supabase's current signing-key algorithm)
     "python-multipart>=0.0.9",  # required by FastAPI for UploadFile/form parsing (POST /batches)
     "stripe>=11.0",  # Productization M6 — the only module that imports this is arie.billing.stripe_gateway
+    "boto3>=1.35",  # Amazon Bedrock Converse — imported only by arie.llm.bedrock_provider, and only when LLM_PROVIDER/COPILOT_LLM_PROVIDER selects it
 ]
 dev = [
     "pytest>=8.2",
@@ -71,12 +72,28 @@ ignore = ["E501"]  # line length handled by formatter
 
 [tool.mypy]
 python_version = "3.11"
+# The Decision Copilot Runtime is deployed as a container, not as part of the
+# `arie` package, so its `app` module is not importable from `src/`. Adding its
+# directory here means it is type-checked like everything else rather than
+# waived with an `ignore_missing_imports` override — the runtime holds the
+# Bedrock call for a customer-facing feature and deserves the same bar.
+mypy_path = "services/copilot-runtime"
 strict = true
 warn_return_any = true
 disallow_untyped_defs = true
 # Third-party libs without stubs
 [[tool.mypy.overrides]]
 module = ["sklearn.*", "scipy.*", "matplotlib.*"]
+ignore_missing_imports = true
+
+# boto3 ships no py.typed marker. The alternative is boto3-stubs, which is a
+# very large dev dependency for the one module that imports boto3
+# (arie.llm.bedrock_provider) — and that module already holds the client
+# behind `Any` so it can be substituted by a stub in tests, so the stubs would
+# type a seam that is deliberately untyped. Scoped to boto3 alone rather than
+# weakening strictness anywhere else.
+[[tool.mypy.overrides]]
+module = ["boto3", "boto3.*", "botocore", "botocore.*"]
 ignore_missing_imports = true
 
 # numpy ships .pyi stubs using 3.12-only `type` statements, which mypy cannot
@@ -93,6 +110,7 @@ addopts = "-q --strict-markers"
 markers = [
     "integration: requires a live database (skipped by default in CI)",
     "slow: long-running benchmark tests",
+    "live_aws: calls real Amazon Bedrock and costs real money (opt in with ARIE_LIVE_AWS_TESTS=1)",
 ]
 # Only arie_mcp's own tests (tests/mcp/) contain async test functions — the
 # rest of this codebase is synchronous. "auto" scopes itself to whatever a
