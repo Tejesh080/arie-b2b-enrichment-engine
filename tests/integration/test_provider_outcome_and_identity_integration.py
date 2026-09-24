@@ -23,8 +23,14 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from psycopg_pool import ConnectionPool
-from tests.integration.conftest import IngestCleanup, source_for
+from tests.integration.conftest import (
+    HARNESS_HEADERS,
+    IngestCleanup,
+    harness_auth_context,
+    source_for,
+)
 
+from arie.auth import AuthContext
 from arie.config import HunterConfig, LiveOutcomeCacheConfig
 from arie.core.types import LeadStatus, ProviderStatus
 from arie.evalgen.schema import EvalLead
@@ -37,6 +43,18 @@ from arie.providers.live_hunter import HunterEnrichmentProvider
 from arie.tenancy import LEGACY_ORGANIZATION_ID as ORG
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture
+def test_auth_context() -> AuthContext:
+    """This module ingests, so it authenticates as a machine credential.
+
+    That is what lets it send `HARNESS_HEADERS` and mark its own leads
+    `integration_test` rather than relying on the `production` default. See
+    `tests/integration/conftest.harness_auth_context`.
+    """
+    return harness_auth_context()
+
 
 _TEST_WORKER_ID = "provider-outcome-identity-it"
 _HUNTER_COST = 0.0049
@@ -157,7 +175,7 @@ def _ingest(
     }
     if full_name is not None:
         payload["full_name"] = full_name
-    response = api_client.post("/leads", json=payload)
+    response = api_client.post("/leads", json=payload, headers=HARNESS_HEADERS)
     assert response.status_code == 201
     body: dict[str, Any] = response.json()
     cleanup.lead_ids.append(uuid.UUID(body["lead_id"]))
@@ -464,7 +482,9 @@ def test_a_provider_miss_never_fabricates_person_evidence(
     assert HUNTER not in sources.values()
 
     snapshot = _snapshot(db_conn, body["lead_id"])
-    assert snapshot.get("identity_findings", []) == [], "a miss has nothing to compare -- no finding"
+    assert snapshot.get("identity_findings", []) == [], (
+        "a miss has nothing to compare -- no finding"
+    )
     assert "title_seniority" in snapshot.get("unknown", [])
 
 

@@ -74,7 +74,11 @@ def check_and_notify_usage(
         usage = get_usage_against_limits(conn, organization_id=organization_id, now=now)
         metrics = [
             ("leads", usage.leads_used, usage.leads_limit),
-            ("modeled_spend", usage.modeled_spend_used_usd, usage.modeled_spend_limit_usd),
+            (
+                "estimated_live_spend",
+                usage.estimated_live_spend_used_usd,
+                usage.estimated_live_spend_limit_usd,
+            ),
         ]
         triggers: list[tuple[str, str, float, float]] = []
         for metric, used, limit in metrics:

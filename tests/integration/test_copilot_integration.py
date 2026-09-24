@@ -87,8 +87,11 @@ def make_decided_lead(
             )
             person_id = cur.fetchone()[0]  # type: ignore[index]
             cur.execute(
-                "INSERT INTO leads (person_id, company_id, organization_id, source, status) "
-                "VALUES (%s, %s, %s, 'test', %s) RETURNING lead_id",
+                # Production explicitly: these rows stand in for a customer's
+                # own leads, and this suite's database defaults to
+                # `integration_test`, which the product surfaces exclude.
+                "INSERT INTO leads (person_id, company_id, organization_id, source, status,"
+                " data_class) VALUES (%s, %s, %s, 'test', %s, 'production') RETURNING lead_id",
                 (person_id, company_id, organization_id, status),
             )
             lead_id: UUID = cur.fetchone()[0]  # type: ignore[index]

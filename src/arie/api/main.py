@@ -26,7 +26,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
@@ -36,6 +36,7 @@ from fastapi import (
     Depends,
     FastAPI,
     Form,
+    Header,
     HTTPException,
     Query,
     Request,
@@ -175,6 +176,7 @@ from arie.config import DATABASE, FRONTEND, OBSERVABILITY
 from arie.copilot_service import answer_lead_query, answer_list_query
 from arie.credential_resolver import resolve_provider_credential
 from arie.dashboard import load_dashboard
+from arie.data_class import LeadDataClass, assignable_by_caller
 from arie.discovery import repository as discovery_repository
 from arie.discovery.orchestrator import list_opportunities, run_discovery
 from arie.evidence.store import PostgresEvidenceStore
@@ -980,8 +982,43 @@ def register_routes(app: FastAPI) -> None:
         response: Response,
         state: StateDep,
         auth: AuthDep,
+        x_arie_data_class: Annotated[str | None, Header()] = None,
     ) -> IngestLeadResponse:
+        """Ingest one lead.
+
+        `X-ARIE-Data-Class` is the trusted path a test harness, canary or load
+        generator uses to mark its own writes as non-production. Three rules
+        make it safe:
+
+        * it is a **header**, not a request field, so `IngestLeadRequest` — the
+          body every frontend and customer integration sends — has no way to
+          express it at all;
+        * it requires an **API key**. A signed-in session cannot use it, so no
+          amount of browser tampering reclassifies anybody's leads;
+        * it can only ever mark data as *non*-production
+          (`arie.data_class.assignable_by_caller` refuses `production`), so the
+          vocabulary moves one way. Nothing can claim to be a customer's data.
+
+        Omitting it yields `production`, which is how an ordinary lead is
+        created and the only way one ever is.
+        """
         _require_scope(auth, "leads:write")
+        data_class = LeadDataClass.PRODUCTION
+        if x_arie_data_class is not None:
+            if auth.auth_method != "api_key":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        "X-ARIE-Data-Class requires an API key. A signed-in session always "
+                        "creates production leads."
+                    ),
+                )
+            try:
+                data_class = assignable_by_caller(x_arie_data_class)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+                ) from exc
         with _transaction(state.pool) as conn:
             try:
                 enforce_lead_quota(
@@ -995,7 +1032,10 @@ def register_routes(app: FastAPI) -> None:
                 conn,
                 resolver=state.resolver,
                 queue=state.queue,
-                command=payload.to_command(organization_id=auth.organization_id),
+                command=replace(
+                    payload.to_command(organization_id=auth.organization_id),
+                    data_class=data_class,
+                ),
             )
             conn.commit()
 
@@ -2175,9 +2215,12 @@ def register_routes(app: FastAPI) -> None:
             leads_used=usage.leads_used,
             leads_limit=usage.leads_limit,
             leads_remaining=usage.leads_remaining,
-            modeled_spend_used_usd=usage.modeled_spend_used_usd,
-            modeled_spend_limit_usd=usage.modeled_spend_limit_usd,
-            modeled_spend_remaining_usd=usage.modeled_spend_remaining_usd,
+            estimated_live_spend_used_usd=usage.estimated_live_spend_used_usd,
+            estimated_live_spend_limit_usd=usage.estimated_live_spend_limit_usd,
+            estimated_live_spend_remaining_usd=usage.estimated_live_spend_remaining_usd,
+            actual_spend_usd=usage.actual_spend_usd,
+            estimated_live_cost_usd=usage.estimated_live_cost_usd,
+            modelled_spend_usd=usage.modelled_spend_usd,
             max_csv_rows_per_upload=usage.max_csv_rows_per_upload,
             period_start=usage.period_start,
             period_end=usage.period_end,

@@ -81,12 +81,16 @@ class ArieClient:
             raise DemoApiError(f"GET {path} failed: {exc}") from exc
         return self._parse(path, response)
 
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post(
+        self, path: str, payload: dict[str, Any], headers: dict[str, str] | None = None
+    ) -> dict[str, Any]:
         try:
             with httpx.Client(
                 base_url=self.base_url, timeout=self.request_timeout_s, transport=self.transport
             ) as client:
-                response = client.post(path, json=payload, headers=self._headers())
+                response = client.post(
+                    path, json=payload, headers={**self._headers(), **(headers or {})}
+                )
         except httpx.HTTPError as exc:
             raise DemoApiError(f"POST {path} failed: {exc}") from exc
         return self._parse(path, response)
@@ -122,7 +126,12 @@ class ArieClient:
     # ------------------------------------------------------------ writes --
 
     def post_lead(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post("/leads", payload)
+        """A demo lead is never a customer's lead.
+
+        The header is only honoured for an API key, which is what the demo
+        authenticates with; a session-authenticated caller could not set it
+        and would (correctly) create production data."""
+        return self._post("/leads", payload, headers={"X-ARIE-Data-Class": "integration_test"})
 
     def submit_review_decision(
         self,

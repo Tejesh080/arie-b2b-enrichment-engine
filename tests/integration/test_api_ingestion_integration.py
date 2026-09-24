@@ -20,9 +20,16 @@ from typing import Any
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
-from tests.integration.conftest import IngestCleanup, authorize_app, source_for
+from tests.integration.conftest import (
+    HARNESS_HEADERS,
+    IngestCleanup,
+    authorize_app,
+    harness_auth_context,
+    source_for,
+)
 
 from arie.api.main import AppState, create_app
+from arie.auth import AuthContext
 from arie.config import POLICY
 from arie.core.types import LeadStatus
 from arie.jobs.queue import EnqueuedJob, PostgresJobQueue
@@ -30,6 +37,17 @@ from arie.providers.catalog import total_catalog_cost
 from arie.statemachine.transitions import job_type_for
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture
+def test_auth_context() -> AuthContext:
+    """This module ingests, so it authenticates as a machine credential.
+
+    That is what lets it send `HARNESS_HEADERS` and mark its own leads
+    `integration_test` rather than relying on the `production` default. See
+    `tests/integration/conftest.harness_auth_context`.
+    """
+    return harness_auth_context()
 
 
 def _identity(cleanup: IngestCleanup) -> tuple[str, str]:
@@ -69,7 +87,7 @@ def test_post_lead_creates_identity_lead_event_and_job(
 ) -> None:
     domain, email = _identity(cleanup_ingest)
 
-    response = api_client.post("/leads", json=_payload(email, domain))
+    response = api_client.post("/leads", json=_payload(email, domain), headers=HARNESS_HEADERS)
 
     assert response.status_code == 201
     body = response.json()
@@ -142,8 +160,8 @@ def test_redelivering_the_same_record_creates_no_second_lead_or_job(
     domain, email = _identity(cleanup_ingest)
     payload = _payload(email, domain)
 
-    first = api_client.post("/leads", json=payload)
-    second = api_client.post("/leads", json=payload)
+    first = api_client.post("/leads", json=payload, headers=HARNESS_HEADERS)
+    second = api_client.post("/leads", json=payload, headers=HARNESS_HEADERS)
 
     assert first.status_code == 201
     assert first.json()["created"] is True
@@ -191,7 +209,7 @@ def test_redelivering_after_the_job_dead_letters_requeues_it(
     domain, email = _identity(cleanup_ingest)
     payload = _payload(email, domain)
 
-    first = api_client.post("/leads", json=payload)
+    first = api_client.post("/leads", json=payload, headers=HARNESS_HEADERS)
     assert first.status_code == 201
     lead_id = uuid.UUID(first.json()["lead_id"])
     job_id = uuid.UUID(first.json()["job_id"])
@@ -209,7 +227,7 @@ def test_redelivering_after_the_job_dead_letters_requeues_it(
 
     # Upstream redelivers the exact same webhook — the only signal it has
     # that this lead needs processing.
-    second = api_client.post("/leads", json=payload)
+    second = api_client.post("/leads", json=payload, headers=HARNESS_HEADERS)
 
     assert second.status_code == 200
     assert second.json()["created"] is False, "same lead, not a duplicate"
@@ -233,8 +251,8 @@ def test_lead_without_external_ref_is_not_deduplicated(
     payload = _payload(email, domain)
     del payload["external_ref"]
 
-    first = api_client.post("/leads", json=payload)
-    second = api_client.post("/leads", json=payload)
+    first = api_client.post("/leads", json=payload, headers=HARNESS_HEADERS)
+    second = api_client.post("/leads", json=payload, headers=HARNESS_HEADERS)
 
     assert first.status_code == 201
     assert second.status_code == 201
@@ -263,8 +281,8 @@ def test_second_contact_at_a_known_company_reuses_the_company(
     colleague = f"grace@{domain}"
     cleanup_ingest.emails.append(colleague)
 
-    first = api_client.post("/leads", json=_payload(email, domain))
-    second = api_client.post("/leads", json=_payload(colleague, domain))
+    first = api_client.post("/leads", json=_payload(email, domain), headers=HARNESS_HEADERS)
+    second = api_client.post("/leads", json=_payload(colleague, domain), headers=HARNESS_HEADERS)
 
     for response in (first, second):
         cleanup_ingest.lead_ids.append(uuid.UUID(response.json()["lead_id"]))
@@ -282,7 +300,9 @@ def test_freemail_sender_resolves_by_company_name_not_by_email_domain(
     cleanup_ingest.emails.append(email)
     cleanup_ingest.company_names.append(company_name.lower())
 
-    response = api_client.post("/leads", json=_payload(email, None, company_name=company_name))
+    response = api_client.post(
+        "/leads", json=_payload(email, None, company_name=company_name), headers=HARNESS_HEADERS
+    )
 
     assert response.status_code == 201
     cleanup_ingest.lead_ids.append(uuid.UUID(response.json()["lead_id"]))
@@ -311,7 +331,7 @@ def test_budget_cap_comes_from_policy_config_not_the_stale_column_default(
     """
     domain, email = _identity(cleanup_ingest)
 
-    response = api_client.post("/leads", json=_payload(email, domain))
+    response = api_client.post("/leads", json=_payload(email, domain), headers=HARNESS_HEADERS)
     lead_id = uuid.UUID(response.json()["lead_id"])
     cleanup_ingest.lead_ids.append(lead_id)
 
@@ -331,7 +351,9 @@ def test_explicit_budget_cap_is_honoured(
 ) -> None:
     domain, email = _identity(cleanup_ingest)
 
-    response = api_client.post("/leads", json=_payload(email, domain, budget_usd_cap="2.75"))
+    response = api_client.post(
+        "/leads", json=_payload(email, domain, budget_usd_cap="2.75"), headers=HARNESS_HEADERS
+    )
     lead_id = uuid.UUID(response.json()["lead_id"])
     cleanup_ingest.lead_ids.append(lead_id)
 
@@ -368,7 +390,7 @@ def test_get_lead_returns_status_and_a_zero_cost_rollup(
     """A freshly ingested lead has spent nothing — and `v_lead_cost` must say
     zero rather than returning no row, or the API would 404 a lead that exists."""
     domain, email = _identity(cleanup_ingest)
-    created = api_client.post("/leads", json=_payload(email, domain))
+    created = api_client.post("/leads", json=_payload(email, domain), headers=HARNESS_HEADERS)
     lead_id = created.json()["lead_id"]
     cleanup_ingest.lead_ids.append(uuid.UUID(lead_id))
 
@@ -471,10 +493,14 @@ def test_failure_during_ingestion_rolls_back_everything_including_identity(
     external_ref = f"crm-{uuid.uuid4().hex[:10]}"
     broken = replace(app_state, queue=_ExplodingQueue(app_state.pool))
     broken_app = create_app(state=broken)
-    authorize_app(broken_app)
+    authorize_app(broken_app, harness_auth_context())
 
     with TestClient(broken_app, raise_server_exceptions=False) as client:
-        response = client.post("/leads", json=_payload(email, domain, external_ref=external_ref))
+        response = client.post(
+            "/leads",
+            json=_payload(email, domain, external_ref=external_ref),
+            headers=HARNESS_HEADERS,
+        )
 
     assert response.status_code == 500
 
@@ -507,12 +533,12 @@ def test_a_rolled_back_request_can_simply_be_retried(
     payload = _payload(email, domain, external_ref=external_ref)
     broken = replace(app_state, queue=_ExplodingQueue(app_state.pool))
     broken_app = create_app(state=broken)
-    authorize_app(broken_app)
+    authorize_app(broken_app, harness_auth_context())
 
     with TestClient(broken_app, raise_server_exceptions=False) as client:
-        assert client.post("/leads", json=payload).status_code == 500
+        assert client.post("/leads", json=payload, headers=HARNESS_HEADERS).status_code == 500
 
-    retry = api_client.post("/leads", json=payload)
+    retry = api_client.post("/leads", json=payload, headers=HARNESS_HEADERS)
 
     assert retry.status_code == 201
     assert retry.json()["created"] is True

@@ -163,7 +163,11 @@ def _run_through_api(
     }
 
     with httpx.Client(base_url=base_url, timeout=10.0) as client:
-        response = client.post("/leads", json=payload)
+        # This script runs against a real deployment. Without this header its
+        # leads land as `production` and are counted in the customer's own
+        # dashboards, review queue and spend — which is exactly how one
+        # organization ended up with 193 fixtures among 194 leads.
+        response = client.post("/leads", json=payload, headers={"X-ARIE-Data-Class": "canary"})
         response.raise_for_status()
         ingested = response.json()
         lead_id = ingested["lead_id"]

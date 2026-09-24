@@ -33,7 +33,7 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from psycopg_pool import ConnectionPool
-from tests.integration.conftest import IngestCleanup
+from tests.integration.conftest import IngestCleanup, harness_auth_context
 from tests.integration.test_live_multi_provider_integration import (
     _abstract_open,
     _abstract_provider,
@@ -55,6 +55,7 @@ from tests.integration.test_live_multi_provider_integration import (
     runtime as runtime,
 )
 
+from arie.auth import AuthContext
 from arie.config import HunterConfig, LiveBudgetConfig
 from arie.core.types import LeadStatus
 from arie.jobs.handlers import SimulatedEnrichmentRuntime, build_handlers
@@ -71,6 +72,15 @@ from arie.providers.live_hunter import HunterEnrichmentProvider
 
 pytestmark = pytest.mark.integration
 
+
+@pytest.fixture
+def test_auth_context() -> AuthContext:
+    """This module ingests through `_ingest`, so it authenticates as a machine
+    credential and marks its leads `integration_test`. See
+    `tests/integration/conftest.harness_auth_context`."""
+    return harness_auth_context()
+
+
 _HUNTER_COST = 0.005
 
 
@@ -84,7 +94,11 @@ def _hunter_provider(
 
 
 def _hunter_person(
-    title: str, *, seniority: str | None = None, role: str | None = None, domain: str = "northwind.test"
+    title: str,
+    *,
+    seniority: str | None = None,
+    role: str | None = None,
+    domain: str = "northwind.test",
 ) -> dict[str, Any]:
     employment: dict[str, Any] = {"name": "Northwind", "title": title, "domain": domain}
     if seniority is not None:

@@ -28,8 +28,14 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from psycopg_pool import ConnectionPool
-from tests.integration.conftest import IngestCleanup, source_for
+from tests.integration.conftest import (
+    HARNESS_HEADERS,
+    IngestCleanup,
+    harness_auth_context,
+    source_for,
+)
 
+from arie.auth import AuthContext
 from arie.config import ApolloPersonConfig, LiveBudgetConfig, LiveProviderConfig
 from arie.core.types import LeadStatus
 from arie.evalgen.schema import EvalLead
@@ -46,6 +52,18 @@ from arie.providers.live_apollo import APOLLO_PROVIDER_NAME as APOLLO
 from arie.providers.live_apollo import ApolloPersonEnrichmentProvider
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture
+def test_auth_context() -> AuthContext:
+    """This module ingests, so it authenticates as a machine credential.
+
+    That is what lets it send `HARNESS_HEADERS` and mark its own leads
+    `integration_test` rather than relying on the `production` default. See
+    `tests/integration/conftest.harness_auth_context`.
+    """
+    return harness_auth_context()
+
 
 _TEST_WORKER_ID = "live-multi-provider-it"
 
@@ -211,7 +229,7 @@ def _ingest(
     }
     if full_name is not None:
         payload["full_name"] = full_name
-    response = api_client.post("/leads", json=payload)
+    response = api_client.post("/leads", json=payload, headers=HARNESS_HEADERS)
     assert response.status_code == 201
     body: dict[str, Any] = response.json()
     cleanup.lead_ids.append(uuid.UUID(body["lead_id"]))

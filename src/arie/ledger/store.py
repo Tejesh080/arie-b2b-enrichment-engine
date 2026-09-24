@@ -41,6 +41,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from arie.core.types import EntityType, ProviderStatus
+from arie.ledger.cost_basis import CostBasis
 from arie.ledger.pricing import ModelTier, model_call_cost_usd, price_for, usd
 from arie.observability.tracing import get_tracer, traced
 
@@ -70,11 +71,11 @@ _RECORD_MODEL_CALL = """
     INSERT INTO model_calls (
         organization_id, lead_id, model, tier, purpose, escalated_from,
         prompt_tokens, completion_tokens, cost_usd, latency_ms, idempotency_key,
-        provider, batch_id, actual_cost_usd
+        provider, batch_id, actual_cost_usd, cost_basis
     ) VALUES (
         %(organization_id)s, %(lead_id)s, %(model)s, %(tier)s, %(purpose)s, %(escalated_from)s,
         %(prompt_tokens)s, %(completion_tokens)s, %(cost_usd)s, %(latency_ms)s,
-        %(idempotency_key)s, %(provider)s, %(batch_id)s, %(actual_cost_usd)s
+        %(idempotency_key)s, %(provider)s, %(batch_id)s, %(actual_cost_usd)s, %(cost_basis)s
     )
     ON CONFLICT (idempotency_key) DO UPDATE
         SET idempotency_key = model_calls.idempotency_key
@@ -89,11 +90,11 @@ _RECORD_MODEL_CALL_UNKEYED = """
     INSERT INTO model_calls (
         organization_id, lead_id, model, tier, purpose, escalated_from,
         prompt_tokens, completion_tokens, cost_usd, latency_ms,
-        provider, batch_id, actual_cost_usd
+        provider, batch_id, actual_cost_usd, cost_basis
     ) VALUES (
         %(organization_id)s, %(lead_id)s, %(model)s, %(tier)s, %(purpose)s, %(escalated_from)s,
         %(prompt_tokens)s, %(completion_tokens)s, %(cost_usd)s, %(latency_ms)s,
-        %(provider)s, %(batch_id)s, %(actual_cost_usd)s
+        %(provider)s, %(batch_id)s, %(actual_cost_usd)s, %(cost_basis)s
     )
     RETURNING call_id, cost_usd
 """
@@ -285,8 +286,16 @@ class PostgresCostLedger:
         provider: str | None = None,
         batch_id: UUID | None = None,
         actual_cost_usd: float | Decimal | None = None,
+        cost_basis: str | None = None,
     ) -> LedgerWrite:
         """Record one model call, pricing it from token counts.
+
+        `cost_basis` (0044) says what `cost_usd` *is*, using
+        `arie.ledger.cost_basis`' vocabulary. Defaulted rather than required
+        so no call site breaks: `None` resolves to `SIMULATED_CATALOGUE` for a
+        model priced at zero (the `fake-llm` test double) and
+        `MODELLED_LIST_PRICE` otherwise, which is what every real DeepSeek and
+        Bedrock call is — the vendors report tokens, not dollars.
 
         `tier` is looked up from ``MODEL_PRICES`` rather than accepted from the
         caller: it is what ``v_model_escalation`` divides by, so letting a call
@@ -318,6 +327,13 @@ class PostgresCostLedger:
         """
         price = price_for(model)
         tier: ModelTier = price.tier
+        resolved_basis = cost_basis or (
+            # A model priced at zero in `MODEL_PRICES` is the test double, not
+            # a bargain: no vendor was called, so nothing was priced.
+            str(CostBasis.SIMULATED_CATALOGUE)
+            if price.usd_per_1m_input_tokens == 0 and price.usd_per_1m_output_tokens == 0
+            else str(CostBasis.MODELLED_LIST_PRICE)
+        )
         resolved_cost = (
             usd(cost_usd)
             if cost_usd is not None
@@ -340,6 +356,7 @@ class PostgresCostLedger:
             "provider": provider,
             "batch_id": batch_id,
             "actual_cost_usd": None if actual_cost_usd is None else usd(actual_cost_usd),
+            "cost_basis": resolved_basis,
         }
 
         with traced(

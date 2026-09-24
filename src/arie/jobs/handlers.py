@@ -110,6 +110,7 @@ from arie.identity.validation import (
     ReturnedIdentity,
     validate_identity,
 )
+from arie.ledger.cost_basis import CostBasis, is_real_provider_call
 from arie.ledger.store import PostgresCostLedger
 from arie.live.budget import LiveSpendGuard
 from arie.live.cooldown import PROVIDER_UNAVAILABLE, ProviderCooldownGuard
@@ -514,6 +515,12 @@ class _DurableCallLedger(CallLedger):
             organization_id=self._organization_id,
             lead_id=self._lead_id,
             cache_hit=cache_hit,
+            # Every price on this path comes from the simulated catalogue,
+            # whose own docstring says "Every parameter here is an assumption".
+            # Saying so on the row is what stops `arie.usage` from adding it to
+            # money — see `arie.ledger.cost_basis`. A cache hit still records
+            # no basis: nothing was called, so nothing was priced.
+            cost_basis=None if cache_hit else str(CostBasis.SIMULATED_CATALOGUE),
         )
 
 
@@ -1664,14 +1671,29 @@ def _ledger_live_call(
     the test/smoke-script injection path (the default), or
     ``arie.live.provider_availability.CREDENTIAL_SOURCE_ORGANIZATION`` when
     the caller resolved this provider from an organization's own BYOK
-    credential. None of today's adapters report a vendor-stated billed cost
-    on ``result.raw`` (see migration 0028's own docstring), so
-    ``actual_cost_usd`` is always ``None`` here — never computed, only ever
-    passed through if a future adapter starts reporting one.
+    credential.
+
+    **``actual_cost_usd`` is money, and is recorded as such.** An adapter that
+    reports a vendor-stated figure has it passed through. An adapter that
+    reports ``credits_consumed`` instead records **0.0**, not ``None``: a
+    credit-metered call draws down a pre-paid allowance, so no marginal money
+    was billed for it, and 0.0 says that where ``None`` would only say "we did
+    not look". The call is still a real provider call —
+    `arie.ledger.cost_basis.is_real_provider_call` reads the *basis*, never
+    the dollar figure, which is why a free-credit call correctly reports
+    ``real_provider_call=true`` alongside ``actual_spend_usd=0``.
     """
     error_kind = result.raw.get("error_kind")
     credits = result.raw.get("credits_consumed")
     cost_basis = result.raw.get("cost_basis")
+    vendor_billed = result.raw.get("vendor_billed_usd")
+    actual_cost_usd: float | None = None
+    if isinstance(vendor_billed, int | float):
+        actual_cost_usd = float(vendor_billed)
+    elif credits is not None and is_real_provider_call(
+        cost_basis if isinstance(cost_basis, str) else None
+    ):
+        actual_cost_usd = 0.0
     cost_ledger.record_provider_call(
         idempotency_key=_live_idempotency_key(job_id, provider_name, ref),
         provider=provider_name,
@@ -1687,6 +1709,7 @@ def _ledger_live_call(
         credits_used=credits if isinstance(credits, int | float) else None,
         cost_basis=cost_basis if isinstance(cost_basis, str) else None,
         credential_source=credential_source,
+        actual_cost_usd=actual_cost_usd,
     )
 
 

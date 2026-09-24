@@ -36,6 +36,7 @@ from psycopg.types.json import Jsonb
 
 from arie.config import POLICY
 from arie.core.types import LeadStatus
+from arie.data_class import LeadDataClass
 from arie.identity.resolver import IdentityResolver
 from arie.jobs.queue import PostgresJobQueue
 from arie.observability.tracing import get_tracer, inject_trace_context, traced
@@ -68,10 +69,10 @@ _TRACER = get_tracer("arie.api.ingest")
 _INSERT_LEAD = """
     INSERT INTO leads (
         organization_id, person_id, company_id, source, external_ref, budget_usd_cap, is_shadow,
-        batch_id
+        batch_id, data_class
     )
     VALUES (%(organization_id)s, %(person_id)s, %(company_id)s, %(source)s, %(external_ref)s,
-            %(budget_usd_cap)s, %(is_shadow)s, %(batch_id)s)
+            %(budget_usd_cap)s, %(is_shadow)s, %(batch_id)s, %(data_class)s)
     ON CONFLICT (organization_id, source, external_ref) WHERE external_ref IS NOT NULL
         DO UPDATE SET updated_at = now()
     RETURNING lead_id, status, version, is_shadow, (xmax = 0) AS created
@@ -105,6 +106,18 @@ class LeadIngestCommand:
     row; ``None`` for every ordinary ``POST /leads`` call. See
     ``_INSERT_LEAD``'s comment for why this is never overwritten on a
     conflict."""
+
+    data_class: LeadDataClass = LeadDataClass.PRODUCTION
+    """Provenance (migration 0042). Defaults to ``PRODUCTION`` and there is no
+    request field that changes it: ``arie.api.schemas.IngestLeadRequest`` does
+    not carry one, so an ordinary authenticated user's lead is a production
+    lead by construction.
+
+    A machine credential may *downgrade* its own writes by sending the
+    ``X-ARIE-Data-Class`` header, which `arie.data_class.assignable_by_caller`
+    refuses to parse as ``production``. The vocabulary only moves one way, so
+    no harness can talk its way into a customer's numbers — which is exactly
+    how 193 of one organization's 194 leads came to be counted as real."""
 
 
 @dataclass(frozen=True)
@@ -186,6 +199,7 @@ def ingest_lead(
                     "budget_usd_cap": budget_cap,
                     "is_shadow": command.is_shadow,
                     "batch_id": command.batch_id,
+                    "data_class": str(command.data_class),
                 },
             )
             lead_row = cur.fetchone()

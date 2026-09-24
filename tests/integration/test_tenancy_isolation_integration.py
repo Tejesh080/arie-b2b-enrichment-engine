@@ -25,11 +25,18 @@ import jwt
 import psycopg
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from tests.integration.conftest import IngestCleanup
+from tests.integration.conftest import (
+    HARNESS_HEADERS,
+    IngestCleanup,
+    authorize_app,
+    harness_auth_context,
+)
 
 from arie.api.main import AppState, create_app
 from arie.approval.workflow import request_review
+from arie.auth import AuthContext
 from arie.config import SupabaseAuthConfig
 from arie.core.types import Evidence, LeadStatus, ProviderStatus
 from arie.evidence.store import PostgresEvidenceStore
@@ -39,6 +46,18 @@ from arie.live.outcome_cache import ProviderOutcomeGuard
 from arie.tenancy import LEGACY_ORGANIZATION_ID
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture
+def test_auth_context() -> AuthContext:
+    """This module ingests, so it authenticates as a machine credential.
+
+    That is what lets it send `HARNESS_HEADERS` and mark its own leads
+    `integration_test` rather than relying on the `production` default. See
+    `tests/integration/conftest.harness_auth_context`.
+    """
+    return harness_auth_context()
+
 
 NOW = datetime(2026, 8, 16, 12, 0, 0, tzinfo=UTC)
 
@@ -245,7 +264,10 @@ def test_submit_review_decision_returns_404_for_a_review_in_a_different_organiza
 
 
 def test_two_organizations_can_reuse_the_same_source_and_external_ref(
-    api_client: TestClient, api_client_org_b: TestClient, cleanup_ingest: IngestCleanup
+    api_client: TestClient,
+    api_client_org_b: TestClient,
+    other_org: UUID,
+    cleanup_ingest: IngestCleanup,
 ) -> None:
     """The composite unique constraint (`0015_...sql`): two organizations'
     upstream CRMs legitimately reuse the same (source, external_ref) pair, and
@@ -255,8 +277,14 @@ def test_two_organizations_can_reuse_the_same_source_and_external_ref(
     payload_a = {"source": "shared-crm", "email": f"a@{domain_a}", "external_ref": external_ref}
     payload_b = {"source": "shared-crm", "email": f"b@{domain_b}", "external_ref": external_ref}
 
-    resp_a = api_client.post("/leads", json=payload_a)
-    resp_b = api_client_org_b.post("/leads", json=payload_b)
+    resp_a = api_client.post("/leads", json=payload_a, headers=HARNESS_HEADERS)
+    # `api_client_org_b` authenticates as a session (other tests in this suite
+    # need it to, for the session-only organization routes), and a session may
+    # not mark its writes non-production. Re-authorize this one client as the
+    # machine credential a harness actually is, for this test only.
+    assert isinstance(api_client_org_b.app, FastAPI)
+    authorize_app(api_client_org_b.app, harness_auth_context(other_org))
+    resp_b = api_client_org_b.post("/leads", json=payload_b, headers=HARNESS_HEADERS)
 
     assert resp_a.status_code == 201
     assert resp_b.status_code == 201

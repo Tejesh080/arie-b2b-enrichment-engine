@@ -56,6 +56,7 @@ import httpx
 
 from arie.config import LIVE_PROVIDER, LiveProviderConfig
 from arie.core.types import Entity, EntityType, ProviderResult, ProviderStatus
+from arie.ledger.cost_basis import CostBasis
 from arie.live.rate_limit import MinIntervalPacer
 from arie.normalization.contract import NormalizationReport, normalize_provider_fields
 
@@ -345,6 +346,14 @@ class AbstractCompanyEnrichmentProvider:
         raw: dict[str, Any] = {"provider": self.name, "entity": entity.canonical_key}
         if error_kind is not None:
             raw["error_kind"] = error_kind
+        if cost_usd > 0.0:
+            # Abstract's response states no per-call price. `cost_usd_per_call`
+            # is derived from the Standard plan's list rate ($99 / 60,000
+            # requests), so what this row carries is a *list-price equivalent*
+            # for a real call — not money the vendor billed. Saying which of
+            # the two it is, on the row, is what keeps `arie.usage` from adding
+            # an estimate to actual spend; see `arie.ledger.cost_basis`.
+            raw["cost_basis"] = str(CostBasis.MODELLED_LIST_PRICE)
         if normalization is not None:
             # Always, not only on failure. The raw->canonical pair is the whole
             # audit trail for a mapping decision: "Abstract said 'Computer

@@ -173,7 +173,7 @@ def _ctx(**overrides: object) -> ResearchAuthorizationContext:
         estimated_cost_usd=Decimal("0.01"),
         lead_spent_usd=Decimal("0.10"),
         lead_budget_cap_usd=Decimal("0.50"),
-        org_modeled_spend_remaining_usd=Decimal("10.00"),
+        org_live_spend_remaining_usd=Decimal("10.00"),
     )
     base.update(overrides)
     return ResearchAuthorizationContext(**base)  # type: ignore[arg-type]
@@ -244,7 +244,7 @@ def test_over_budget_lead_cap_is_refused() -> None:
 
 
 def test_over_budget_org_modeled_spend_is_refused() -> None:
-    decision = authorize_research(_ctx(org_modeled_spend_remaining_usd=Decimal("0.00")))
+    decision = authorize_research(_ctx(org_live_spend_remaining_usd=Decimal("0.00")))
     assert decision.reason_code is ResearchReasonCode.OVER_BUDGET
 
 

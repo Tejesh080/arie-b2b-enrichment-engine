@@ -62,7 +62,7 @@ def test_limits_endpoint_reports_sensible_defaults(api_client: TestClient) -> No
     body = response.json()
     assert body["leads_limit"] == 5000
     assert body["max_csv_rows_per_upload"] == 200
-    assert body["modeled_spend_limit_usd"] == 50.0
+    assert body["estimated_live_spend_limit_usd"] == 50.0
     assert body["leads_used"] <= body["leads_limit"]
     assert body["leads_remaining"] == body["leads_limit"] - body["leads_used"]
 

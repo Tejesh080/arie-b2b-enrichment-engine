@@ -405,12 +405,24 @@ _SELECT_BATCH = """
     WHERE batch_id = %(batch_id)s AND organization_id = %(organization_id)s
 """
 
+# A batch whose leads are all non-production (migration 0042) is a harness's
+# upload, not the customer's, so the org-wide listing -- and the dashboard's
+# "Recent batch", which reads it -- leaves it out. A batch with no leads at all
+# (every row rejected) is still the customer's own action and stays listed.
+# Nothing is hidden from an audit: `GET /batches/{id}` still opens any batch.
 _SELECT_BATCHES_FOR_ORG = """
-    SELECT batch_id, organization_id, filename, total_rows, accepted_rows, rejected_rows,
-           created_by_user_id, created_at
-    FROM lead_batches
-    WHERE organization_id = %(organization_id)s
-    ORDER BY created_at DESC
+    SELECT b.batch_id, b.organization_id, b.filename, b.total_rows, b.accepted_rows,
+           b.rejected_rows, b.created_by_user_id, b.created_at
+    FROM lead_batches b
+    WHERE b.organization_id = %(organization_id)s
+      AND (
+          NOT EXISTS (SELECT 1 FROM leads l WHERE l.batch_id = b.batch_id)
+          OR EXISTS (
+              SELECT 1 FROM leads l
+              WHERE l.batch_id = b.batch_id AND l.data_class = 'production'
+          )
+      )
+    ORDER BY b.created_at DESC
     LIMIT %(limit)s OFFSET %(offset)s
 """
 

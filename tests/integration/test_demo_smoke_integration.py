@@ -49,7 +49,7 @@ from psycopg_pool import ConnectionPool
 from scripts.demo.client import ArieClient
 from scripts.demo.corpus import select_demo_corpus
 from scripts.demo.scenarios import run_scenario_a, run_scenario_b
-from tests.integration.conftest import IngestCleanup, authorize_app
+from tests.integration.conftest import IngestCleanup, authorize_app, harness_auth_context
 
 from arie.api.main import AppState, create_app
 from arie.evalgen.schema import EvalLead
@@ -93,7 +93,9 @@ def live_server(app_state: AppState) -> Iterator[str]:
     read back off the running server's socket once it's listening.
     """
     app = create_app(state=app_state)
-    authorize_app(app)
+    # The demo client is a harness: it authenticates as a machine
+    # credential so its leads are marked, not counted as a customer's.
+    authorize_app(app, harness_auth_context())
     config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)

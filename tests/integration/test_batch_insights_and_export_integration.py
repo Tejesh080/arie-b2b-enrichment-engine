@@ -105,8 +105,12 @@ def add_batch_row(
             )
             person_id = cur.fetchone()[0]  # type: ignore[index]
             cur.execute(
-                "INSERT INTO leads (person_id, company_id, organization_id, source, status, batch_id) "
-                "VALUES (%s, %s, %s, 'test', %s, %s) RETURNING lead_id",
+                # Production explicitly: a batch's insights are a customer's
+                # own numbers, and this suite's database defaults to
+                # `integration_test`.
+                "INSERT INTO leads (person_id, company_id, organization_id, source, status,"
+                " batch_id, data_class)"
+                " VALUES (%s, %s, %s, 'test', %s, %s, 'production') RETURNING lead_id",
                 (person_id, company_id, organization_id, status, batch_id),
             )
             lead_id = cur.fetchone()[0]  # type: ignore[index]

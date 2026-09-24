@@ -440,7 +440,7 @@ def build_research_plan(
         estimated_cost_usd=cost,
         lead_spent_usd=ledger_cost.total_cost_usd,
         lead_budget_cap_usd=_lead_budget_cap(conn, lead_id),
-        org_modeled_spend_remaining_usd=Decimal(str(usage.modeled_spend_remaining_usd)),
+        org_live_spend_remaining_usd=Decimal(str(usage.estimated_live_spend_remaining_usd)),
     )
     decision = authorize_research(ctx)
 
@@ -593,7 +593,7 @@ def execute_research(
         estimated_cost_usd=cost,
         lead_spent_usd=ledger_cost.total_cost_usd,
         lead_budget_cap_usd=_lead_budget_cap(conn, lead_id),
-        org_modeled_spend_remaining_usd=Decimal(str(usage.modeled_spend_remaining_usd)),
+        org_live_spend_remaining_usd=Decimal(str(usage.estimated_live_spend_remaining_usd)),
     )
     decision = authorize_research(ctx)
     if not decision.approved:

@@ -243,6 +243,7 @@ class _RecordingLedger(PostgresCostLedger):
         idempotency_key: str | None = None,
         cost_usd: float | Decimal | None = None,
         provider: str | None = None,
+        cost_basis: str | None = None,
         batch_id: UUID | None = None,
         actual_cost_usd: float | Decimal | None = None,
     ) -> LedgerWrite:

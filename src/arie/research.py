@@ -266,7 +266,12 @@ class ResearchAuthorizationContext:
     estimated_cost_usd: Decimal
     lead_spent_usd: Decimal
     lead_budget_cap_usd: Decimal
-    org_modeled_spend_remaining_usd: Decimal
+    org_live_spend_remaining_usd: Decimal
+    """What is left of the organization's *operational* live-spend allowance
+    (`arie.limits`). Renamed from `org_modeled_spend_remaining_usd`: it was
+    never modelled spend that mattered here, and gating research on simulated
+    catalogue prices was how one organization exhausted a month's allowance on
+    test fixtures."""
 
 
 @dataclass(frozen=True)
@@ -351,7 +356,7 @@ def authorize_research(ctx: ResearchAuthorizationContext) -> ResearchDecision:
         return _refuse(ResearchReasonCode.ENTITLEMENT_BLOCKED)
     if ctx.lead_spent_usd + ctx.estimated_cost_usd > ctx.lead_budget_cap_usd:
         return _refuse(ResearchReasonCode.OVER_BUDGET)
-    if ctx.org_modeled_spend_remaining_usd < ctx.estimated_cost_usd:
+    if ctx.org_live_spend_remaining_usd < ctx.estimated_cost_usd:
         return _refuse(ResearchReasonCode.OVER_BUDGET)
     if ctx.execution_mode != SIMULATED:
         # Part S: live execution stays plan-only in this slice — existing

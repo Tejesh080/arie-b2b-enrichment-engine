@@ -23,9 +23,16 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind, StatusCode
 from psycopg_pool import ConnectionPool
-from tests.integration.conftest import IngestCleanup, authorize_app, source_for
+from tests.integration.conftest import (
+    HARNESS_HEADERS,
+    IngestCleanup,
+    authorize_app,
+    harness_auth_context,
+    source_for,
+)
 
 from arie.api.main import AppState, create_app
+from arie.auth import AuthContext
 from arie.config import ObservabilityConfig
 from arie.core.types import LeadStatus
 from arie.jobs.queue import PostgresJobQueue
@@ -33,6 +40,17 @@ from arie.jobs.worker import JobContext, JobHandler, run_worker_cycle
 from arie.statemachine.transitions import job_type_for, next_status
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture
+def test_auth_context() -> AuthContext:
+    """This module ingests, so it authenticates as a machine credential.
+
+    That is what lets it send `HARNESS_HEADERS` and mark its own leads
+    `integration_test` rather than relying on the `production` default. See
+    `tests/integration/conftest.harness_auth_context`.
+    """
+    return harness_auth_context()
 
 
 def _compute_score_job_type() -> str:
@@ -116,7 +134,7 @@ def test_ingestion_stores_the_requests_trace_context_on_the_job(
 ) -> None:
     domain, email = _identity(cleanup_ingest)
 
-    response = api_client.post("/leads", json=_payload(email, domain))
+    response = api_client.post("/leads", json=_payload(email, domain), headers=HARNESS_HEADERS)
     lead_id = uuid.UUID(response.json()["lead_id"])
     cleanup_ingest.lead_ids.append(lead_id)
 
@@ -151,7 +169,7 @@ def test_worker_processing_continues_the_trace_that_enqueued_the_job(
     """
     domain, email = _identity(cleanup_ingest)
 
-    response = api_client.post("/leads", json=_payload(email, domain))
+    response = api_client.post("/leads", json=_payload(email, domain), headers=HARNESS_HEADERS)
     lead_id = uuid.UUID(response.json()["lead_id"])
     job_id = uuid.UUID(response.json()["job_id"])
     cleanup_ingest.lead_ids.append(lead_id)
@@ -203,11 +221,11 @@ def test_http_server_span_and_worker_span_share_one_trace(
     )
     domain, email = _identity(cleanup_ingest)
     app = create_app(state=app_state)
-    authorize_app(app)
+    authorize_app(app, harness_auth_context())
 
     try:
         with TestClient(app) as client:
-            response = client.post("/leads", json=_payload(email, domain))
+            response = client.post("/leads", json=_payload(email, domain), headers=HARNESS_HEADERS)
 
         lead_id = uuid.UUID(response.json()["lead_id"])
         job_id = uuid.UUID(response.json()["job_id"])
@@ -322,7 +340,7 @@ def test_a_failing_job_produces_an_error_span_in_the_requests_trace(
     became a dead letter.
     """
     domain, email = _identity(cleanup_ingest)
-    response = api_client.post("/leads", json=_payload(email, domain))
+    response = api_client.post("/leads", json=_payload(email, domain), headers=HARNESS_HEADERS)
     lead_id = uuid.UUID(response.json()["lead_id"])
     job_id = uuid.UUID(response.json()["job_id"])
     cleanup_ingest.lead_ids.append(lead_id)
@@ -357,7 +375,7 @@ def test_the_lead_is_untouched_when_its_job_fails(
     the job's completion commit together or not at all.
     """
     domain, email = _identity(cleanup_ingest)
-    response = api_client.post("/leads", json=_payload(email, domain))
+    response = api_client.post("/leads", json=_payload(email, domain), headers=HARNESS_HEADERS)
     lead_id = uuid.UUID(response.json()["lead_id"])
     job_id = uuid.UUID(response.json()["job_id"])
     cleanup_ingest.lead_ids.append(lead_id)

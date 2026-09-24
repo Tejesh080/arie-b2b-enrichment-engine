@@ -114,6 +114,7 @@ _SELECT_EVIDENCE_SNAPSHOTS = """
     FROM decision_receipts dr
     JOIN leads l ON l.lead_id = dr.lead_id
     WHERE l.batch_id = %(batch_id)s AND l.organization_id = %(organization_id)s
+      AND l.data_class = 'production'
 """
 
 _SELECT_PROVIDER_ACTIVITY = """

@@ -1124,15 +1124,29 @@ class UsageAgainstLimitsResponse(BaseModel):
     leads_used: int
     leads_limit: int
     leads_remaining: int
-    modeled_spend_used_usd: float
-    modeled_spend_limit_usd: float
-    modeled_spend_remaining_usd: float
     max_csv_rows_per_upload: int
     period_start: datetime
     period_end: datetime
     plan: str
     members_used: int
     members_limit: int
+
+    # --- the operational allowance -----------------------------------------
+    estimated_live_spend_used_usd: float
+    """Live-service usage this period, at list/credit-equivalent prices. This
+    is what the allowance gates — not billed money, which reads zero for a
+    free tier, a pre-paid credit, or a vendor that reports no charge."""
+    estimated_live_spend_limit_usd: float
+    estimated_live_spend_remaining_usd: float
+
+    # --- the three cost concepts, never mixed ------------------------------
+    actual_spend_usd: float
+    """Confirmed marginal money billed. Financial reporting only."""
+    estimated_live_cost_usd: float
+    """Economic cost of real provider and model calls, free-tier included.
+    Same figure as `estimated_live_spend_used_usd`."""
+    modelled_spend_usd: float
+    """Simulated catalogue and evaluation cost. Consumes no allowance."""
 
 
 # --------------------------------------------------------------- CSV batches --

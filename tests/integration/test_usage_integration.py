@@ -37,8 +37,10 @@ def _insert_lead(
     lead_id = uuid.uuid4()
     with db_conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO leads (lead_id, source, organization_id, status, created_at) "
-            "VALUES (%s, 'usage-it', %s, %s, %s)",
+            # Production explicitly: usage reports a customer's own activity,
+            # and this suite's database defaults to `integration_test`.
+            "INSERT INTO leads (lead_id, source, organization_id, status, created_at,"
+            " data_class) VALUES (%s, 'usage-it', %s, %s, %s, 'production')",
             (lead_id, organization_id, status, created_at),
         )
     db_conn.commit()

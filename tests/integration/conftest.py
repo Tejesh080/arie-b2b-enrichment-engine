@@ -355,6 +355,64 @@ def authorize_app(app: FastAPI, auth_context: AuthContext | None = None) -> Auth
     return context
 
 
+@pytest.fixture(scope="session", autouse=True)
+def harness_data_class_default(migrated_database_direct: str) -> None:
+    """Flip the *test* database's `leads.data_class` default to a harness class.
+
+    Production defaults to `production` because that is right for a real
+    customer's ingest. Nothing in this suite is a real customer, and a test
+    that INSERTs into `leads` directly cannot send the `X-ARIE-Data-Class`
+    header that HTTP ingest uses. Rather than repeat a column in ~18 seed
+    helpers and hope the nineteenth remembers, the guarantee is structural:
+    on this database, forgetting produces `integration_test`.
+
+    Only ever applied to `TEST_DATABASE_URL`, which `migrated_database`'s own
+    guards have already proved is not production.
+    """
+    with psycopg.connect(migrated_database_direct) as conn:
+        with conn.cursor() as cur:
+            # A DDL default cannot take a bind parameter (Postgres cannot
+            # infer its type), so the constant is interpolated -- it is this
+            # module's own literal, never anything a caller supplied.
+            cur.execute(
+                f"ALTER TABLE leads ALTER COLUMN data_class SET DEFAULT '{HARNESS_DATA_CLASS}'"
+            )
+        conn.commit()
+
+
+HARNESS_DATA_CLASS = "integration_test"
+"""What every writer in this suite marks its leads as.
+
+`leads.data_class` defaults to `production`, and that default is for real
+customers. A test that relies on it puts fixtures into the same aggregates a
+customer reads — which is how one organization came to hold 193 fixtures
+among 194 leads. Tests that ingest over HTTP send `HARNESS_HEADERS`; tests
+that INSERT directly set the column themselves.
+"""
+
+HARNESS_HEADERS = {"X-ARIE-Data-Class": HARNESS_DATA_CLASS}
+"""Only honoured for an API-key caller, and it can never say `production` —
+see `arie.data_class.assignable_by_caller`. A module whose tests ingest with
+this must override `test_auth_context` with `harness_auth_context`."""
+
+
+def harness_auth_context(organization_id: UUID | None = None) -> AuthContext:
+    """A machine credential, which is what a test harness actually is.
+
+    Ingesting as a *session* would be a lie about the caller and would (quite
+    correctly) be refused the `X-ARIE-Data-Class` header, since in production
+    a session is a signed-in human's browser.
+    """
+    return AuthContext(
+        organization_id=organization_id or LEGACY_ORGANIZATION_ID,
+        auth_method="api_key",
+        api_key_id=uuid.uuid4(),
+        scopes=frozenset(
+            {"leads:read", "leads:write", "reviews:read", "reviews:write", "batches:read"}
+        ),
+    )
+
+
 @pytest.fixture
 def test_auth_context() -> AuthContext:
     """The identity `api_client` authenticates every request as, by default.

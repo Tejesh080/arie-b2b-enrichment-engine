@@ -364,7 +364,7 @@ def execute_buyer_search(
 
     usage = get_usage_against_limits(conn, organization_id=organization_id, now=now)
     estimated_cost = Decimal(str(HUNTER.domain_search_cost_usd_per_call))
-    if Decimal(str(usage.modeled_spend_remaining_usd)) < estimated_cost:
+    if Decimal(str(usage.estimated_live_spend_remaining_usd)) < estimated_cost:
         return BuyerSearchOutcome(best=None, alternates=(), provider_called=False)
 
     idempotency_key = f"buyer_search:{lead_id}:hunter_domain_search"

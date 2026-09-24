@@ -6,10 +6,26 @@ reuses `arie.usage.get_usage_summary` for the calendar-month lead/spend
 totals — never a second, independently-computed count that could drift
 from what `GET /usage` itself reports.
 
-Modeled spend, never billed spend — the same distinction
-`arie.usage.UsageSummary`/`arie.ledger.pricing` already draw. A
-`max_modeled_spend_usd_per_month` ceiling bounds ARIE's own modelled-cost
-arithmetic, not a real vendor invoice.
+**The ceiling is operational, and it gates estimated live cost.** It used to
+gate `UsageSummary.total_cost_usd`, which folded the simulated catalogue's
+fictional prices in with everything else — one audited organization had
+"spent" $50.33 against a $50.00/month ceiling entirely on test fixtures priced
+from a benchmark assumption.
+
+It deliberately does **not** gate `actual_spend_usd`. A guard on confirmed
+billed money fails open precisely when spending is least visible: a vendor that
+reports no per-call charge, a free tier, and a pre-paid credit all leave actual
+spend at zero while real requests keep going out. Estimated live cost prices
+the *work* rather than the invoice, so it stays meaningful in all three cases.
+Actual spend is financial reporting; simulated cost is evaluation reporting;
+neither is a budget. See `arie.ledger.cost_basis` for the three concepts.
+
+**Technical debt, stated.** The column behind the ceiling is still
+`organizations.max_modeled_spend_usd_per_month` (migration 0026). It is
+surfaced as `estimated_live_spend_limit_usd`, which is what it now means.
+Renaming a column with live consumers is a separate, riskier change than
+correcting what is compared against it; the API name is the one that has to be
+right today, and it is.
 """
 
 from __future__ import annotations
@@ -57,12 +73,38 @@ class UsageAgainstLimits:
     leads_used: int
     leads_limit: int
     leads_remaining: int
-    modeled_spend_used_usd: float
-    modeled_spend_limit_usd: float
-    modeled_spend_remaining_usd: float
     max_csv_rows_per_upload: int
     period_start: datetime
     period_end: datetime
+
+    # --- the operational allowance ----------------------------------------
+    #
+    # Gated on estimated live cost, not on money. A guard on confirmed billed
+    # money fails open exactly when spending is least visible: a vendor that
+    # reports no per-call charge, a free tier, and a pre-paid credit all leave
+    # `actual_spend_usd` at zero while real requests keep going out. Estimated
+    # live cost prices the work rather than the invoice.
+    estimated_live_spend_used_usd: float = 0.0
+    """Live-service usage this period, at list/credit-equivalent prices."""
+    estimated_live_spend_limit_usd: float = 0.0
+    """The operational ceiling. Backed by
+    `organizations.max_modeled_spend_usd_per_month`, whose column name is now
+    wrong — see this module's docstring for the technical-debt note."""
+    estimated_live_spend_remaining_usd: float = 0.0
+
+    # --- the three cost concepts, never mixed ------------------------------
+    actual_spend_usd: float = 0.0
+    """Confirmed marginal money billed. **Financial reporting only**, never a
+    guard. Zero is a real answer for a free-credit call; an unknown charge
+    contributes nothing rather than being guessed at."""
+    estimated_live_cost_usd: float = 0.0
+    """The economic cost of using live services: real provider *and* model
+    calls at list/credit-equivalent prices, including free-tier and
+    credit-funded ones. Same figure as `estimated_live_spend_used_usd`, in the
+    cost breakdown rather than the used/limit/remaining triple."""
+    modelled_spend_usd: float = 0.0
+    """Simulated catalogue and evaluation cost. Reporting only; it consumes no
+    allowance of any kind."""
 
 
 _SELECT_LIMITS = """
@@ -141,15 +183,26 @@ def get_usage_against_limits(
     usage = get_usage_summary(
         conn, organization_id=organization_id, from_at=period_start, to_at=period_end
     )
+    spend_remaining = max(
+        0.0, limits.max_modeled_spend_usd_per_month - usage.estimated_live_cost_usd
+    )
     return UsageAgainstLimits(
         leads_used=usage.leads_processed,
         leads_limit=limits.max_leads_per_month,
         leads_remaining=max(0, limits.max_leads_per_month - usage.leads_processed),
-        modeled_spend_used_usd=usage.total_cost_usd,
-        modeled_spend_limit_usd=limits.max_modeled_spend_usd_per_month,
-        modeled_spend_remaining_usd=max(
-            0.0, limits.max_modeled_spend_usd_per_month - usage.total_cost_usd
-        ),
+        # The monetary allowance gates money, and nothing else. It used to
+        # read `total_cost_usd`, which folded the simulated catalogue's
+        # fictional prices in with everything else: one audited organization
+        # had "spent" $50.33 against a $50.00/month ceiling entirely on test
+        # fixtures priced from a benchmark assumption. Simulated work is still
+        # reported — under `modelled_spend_usd` — it simply cannot exhaust a
+        # real budget.
+        estimated_live_spend_used_usd=usage.estimated_live_cost_usd,
+        estimated_live_spend_limit_usd=limits.max_modeled_spend_usd_per_month,
+        estimated_live_spend_remaining_usd=spend_remaining,
+        actual_spend_usd=usage.actual_spend_usd,
+        estimated_live_cost_usd=usage.estimated_live_cost_usd,
+        modelled_spend_usd=usage.modelled_spend_usd,
         max_csv_rows_per_upload=limits.max_csv_rows_per_upload,
         period_start=period_start,
         period_end=period_end,

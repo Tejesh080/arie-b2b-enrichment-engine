@@ -161,6 +161,7 @@ _SELECT_ORG_LEAD_POOL = """
         LIMIT 1
     ) ind ON true
     WHERE l.organization_id = %(organization_id)s
+      AND l.data_class = 'production'
     ORDER BY l.created_at DESC
     LIMIT %(limit)s
 """
@@ -193,6 +194,7 @@ _SELECT_LEADS_BY_COMPANY_NAME = """
         LIMIT 1
     ) ind ON true
     WHERE l.organization_id = %(organization_id)s AND c.name ILIKE %(pattern)s
+      AND l.data_class = 'production'
     ORDER BY l.created_at DESC
     LIMIT %(limit)s
 """
